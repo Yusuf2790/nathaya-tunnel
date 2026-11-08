@@ -1,0 +1,167 @@
+#!/bin/bash
+# Keep the upstream ### username YYYY-MM-DD ... database format.
+set +x
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+[[ $EUID -eq 0 ]] || { echo 'Administrator privileges required.' >&2; exit 1; }
+umask 077
+exec 9>/run/nathaya-exp.lock
+flock -n 9 || exit 0
+TODAY=$(date +%Y-%m-%d)
+TODAY_EPOCH=$(date -d "$TODAY" +%s) || exit 1
+EXPIRED_USERS=""
+TOTAL_EXPIRED=0
+FAILED=0
+NATHAYA_BASE=/opt/nathaya
+# Shared presentation/transport only; it alone reads optional notification config.
+# telegram.sh exports telegram_send_message(message) and its compatibility alias.
+if [[ -r "$NATHAYA_BASE/modules/common/telegram.sh" ]]; then
+    source "$NATHAYA_BASE/modules/common/telegram.sh"
+fi
+if ! declare -F nathaya_account_send_html >/dev/null &&
+        [[ -r "$NATHAYA_BASE/modules/common/account-presentation.sh" ]]; then
+    source "$NATHAYA_BASE/modules/common/account-presentation.sh"
+fi
+
+send_notification() {
+    [[ -n $EXPIRED_USERS || $FAILED != 0 ]] || return 0
+    if ! declare -F telegram_send_message >/dev/null ||
+            ! declare -F nathaya_account_send_html >/dev/null ||
+            ! declare -F nathaya_account_html_field >/dev/null; then
+        echo 'Expiry: shared Nathaya notification/presentation helper is unavailable.' >&2
+        return 1
+    fi
+    local message status='Processed; inactive protocol units were not started.'
+    [[ $FAILED == 0 ]] || status='Manual review required: a deletion or service update failed.'
+    message="&#128640; <b>NATHAYA TUNNEL</b>
+<b>ACCOUNT EXPIRY PROCESSING</b>
+
+━━━━━━━━━━━━━━━━━━━━
+<b>ACCOUNT INFORMATION</b>
+━━━━━━━━━━━━━━━━━━━━
+$(nathaya_account_html_field 'Checked' "$TODAY")
+$(nathaya_account_html_field 'Removed' "$TOTAL_EXPIRED")
+$(nathaya_account_html_field 'Status' "$status")
+$(nathaya_account_html_field 'Details' "$EXPIRED_USERS")
+
+━━━━━━━━━━━━━━━━━━━━
+<i>Nathaya Tunnel | Version 1.0.0</i>"
+    # Shared HTML paging/escaping and credential handling; no second send path.
+    nathaya_account_send_html "$message" || {
+        echo 'Expiry notification could not be sent.' >&2
+        return 1
+    }
+}
+
+record_expired() {
+    EXPIRED_USERS+="👤 User     : $1
+🔑 Service  : $2
+📆 Expired  : $3
+━━━━━━━━━━━━━━━━━━━━━━
+"
+    TOTAL_EXPIRED=$((TOTAL_EXPIRED + 1))
+}
+
+check_and_remove() {
+    local file=$1 service=$2 config=$3 logdir=$4 unit=$5
+    shift 5
+    local files=("$@") line user exp exp_epoch suffix state changed=0
+    local row='^###[[:space:]]+([a-zA-Z0-9_-]+)[[:space:]]+([0-9]{4}-[0-9]{2}-[0-9]{2})([[:space:]]|$)'
+    [[ -f $file && -f $config && ! -L $file && ! -L $config ]] || return 0
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ $line =~ $row ]] || continue
+        user=${BASH_REMATCH[1]}
+        exp=${BASH_REMATCH[2]}
+        exp_epoch=$(date -d "$exp" +%s 2>/dev/null) || continue
+        [[ $exp_epoch -le $TODAY_EPOCH ]] || continue
+        # Strict character/date validation above makes these literal sed markers.
+        if ! sed -i "/^### $user $exp\([[:space:]]\|$\)/,/^},{/d" "$config"; then
+            echo "Expiry: failed to edit $service configuration." >&2
+            FAILED=1
+            continue
+        fi
+        changed=1
+        if ! sed -i "/^### $user $exp\([[:space:]]\|$\)/d" "$file"; then
+            echo "Expiry: failed to edit $service database; review configuration consistency." >&2
+            FAILED=1
+            continue
+        fi
+        if [[ -d $logdir ]]; then
+            if ! rm -f -- "$logdir/log-create-${user}.log"; then
+                echo "Expiry: failed to remove $service account log." >&2
+                FAILED=1
+            fi
+            for suffix in "${files[@]}"; do
+                if ! rm -f -- "$logdir/${user}-${suffix}.json"; then
+                    echo "Expiry: failed to remove $service account export." >&2
+                    FAILED=1
+                fi
+            done
+        fi
+        record_expired "$user" "$service" "$exp"
+    done < "$file"
+    # Only the affected native instance, and only when already active. Never
+    # start disabled/inactive instances or restart the generic xray/SSH services.
+    [[ $changed == 1 ]] || return 0
+    if ! state=$(systemctl show --property=ActiveState --value "$unit"); then
+        echo "Expiry: cannot determine $service state; administrator review required." >&2
+        FAILED=1
+        return 0
+    fi
+    case "$state" in
+        active)
+            if ! systemctl restart "$unit" || ! systemctl is-active --quiet "$unit"; then
+                echo "Expiry: failed to restart $service; administrator review required." >&2
+                FAILED=1
+            fi
+            ;;
+        inactive) : ;;
+        failed)
+            echo "Expiry: $service is failed; not started, administrator review required." >&2
+            FAILED=1
+            ;;
+        *)
+            echo "Expiry: $service is transitioning; restart skipped, administrator review required." >&2
+            FAILED=1
+            ;;
+    esac
+}
+
+check_and_remove /etc/xray/vmess/.vmess.db VMESS /etc/xray/vmess/config.json /etc/xray/vmess vmess@config.service non tls grpc
+check_and_remove /etc/xray/vless/.vless.db VLESS /etc/xray/vless/config.json /etc/xray/vless vless@config.service non tls grpc
+check_and_remove /etc/xray/trojan/.trojan.db TROJAN /etc/xray/trojan/config.json /etc/xray/trojan trojan@config.service non tls grpc
+check_and_remove /etc/xray/shadowsocks/.shadowsocks.db SHADOWSOCKS /etc/xray/shadowsocks/config.json /etc/xray/shadowsocks shadowsocks@config.service non tls grpc
+
+row='^###[[:space:]]+([a-zA-Z0-9_-]+)[[:space:]]+([0-9]{4}-[0-9]{2}-[0-9]{2})([[:space:]]|$)'
+if [[ -f /etc/ssh/.ssh.db && ! -L /etc/ssh/.ssh.db ]]; then
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ $line =~ $row ]] || continue
+        user=${BASH_REMATCH[1]}
+        exp=${BASH_REMATCH[2]}
+        exp_epoch=$(date -d "$exp" +%s 2>/dev/null) || continue
+        [[ $exp_epoch -le $TODAY_EPOCH ]] || continue
+        uid=$(id -u -- "$user" 2>/dev/null) || uid=''
+        if [[ $uid == 0 ]]; then
+            echo 'Expiry: refusing to delete a UID 0 account.' >&2
+            FAILED=1
+            continue
+        fi
+        if [[ -n $uid ]] && ! userdel -f -- "$user" 2>/dev/null; then
+            echo 'Expiry: failed to remove an SSH account; database entry retained.' >&2
+            FAILED=1
+            continue
+        fi
+        if ! sed -i "/^### $user $exp\([[:space:]]\|$\)/d" /etc/ssh/.ssh.db; then
+            echo 'Expiry: failed to update the SSH database.' >&2
+            FAILED=1
+            continue
+        fi
+        if ! rm -f -- "/etc/xray/log-createssh-${user}.log"; then
+            echo 'Expiry: failed to remove an SSH account log.' >&2
+            FAILED=1
+        fi
+        record_expired "$user" SSH "$exp"
+    done < /etc/ssh/.ssh.db
+fi
+# Unix account expiry/removal does not require restarting remote SSH access.
+send_notification || FAILED=1
+exit "$FAILED"

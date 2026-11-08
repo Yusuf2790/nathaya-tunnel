@@ -1,0 +1,12 @@
+#!/bin/bash
+# Installed entry point; shared UI modules live outside /usr/bin.
+[[ "${NATHAYA_UI_ACTION:-0}" == 1 ]] && exit 0
+NATHAYA_BASE="${NATHAYA_BASE:-/opt/nathaya}"
+if [[ ! -r "$NATHAYA_BASE/modules/common/runtime-ui.sh" ]]; then
+    printf 'UI Nathaya belum terpasang di %s/modules. Perbarui instalasi.\n' "$NATHAYA_BASE" >&2
+    exit 1
+fi
+source "$NATHAYA_BASE/modules/common/runtime-ui.sh" || exit 1
+
+source "$NATHAYA_BASE/modules/menu/protocol.sh" || exit 1
+nathaya_protocol_loop vmess

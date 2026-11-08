@@ -1,0 +1,265 @@
+import socket, threading, select, signal, sys, time, getopt
+
+# Listen
+LISTENING_ADDR = '0.0.0.0'
+if sys.argv[1:]:
+    LISTENING_PORTS = [int(port) for port in sys.argv[1].split(',')]
+else:
+    LISTENING_PORTS = [10015]
+# Passwd
+# Authentication is performed by the SSH/OpenVPN backend, never by a blank proxy password.
+
+# CONST
+BUFLEN = 4096 * 4
+TIMEOUT = 60
+DEFAULT_HOSTS = ['127.0.0.1:109', '127.0.0.1:2223', '127.0.0.1:2222', '127.0.0.1:1194']
+# Fixed upstreams only. Do not resolve client-controlled names or accept other ports.
+ALLOWED_TARGETS = {value: ('127.0.0.1', int(value.rsplit(':', 1)[1])) for value in DEFAULT_HOSTS}
+ALLOWED_TARGETS.update({'localhost:' + str(port): ('127.0.0.1', port) for port in (109, 2223, 2222, 1194)})
+RESPONSE = 'HTTP/1.1 101 Switching Protocol\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: foo\r\n\r\n'
+
+class Server(threading.Thread):
+    def __init__(self, host, ports):
+        threading.Thread.__init__(self)
+        self.running = False
+        self.host = host
+        self.ports = ports
+        self.threads = []
+        self.threadsLock = threading.Lock()
+        self.logLock = threading.Lock()
+
+    def run(self):
+        self.socs = []
+        for port in self.ports:
+            soc = socket.socket(socket.AF_INET)
+            soc.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            soc.settimeout(2)
+            soc.bind((self.host, port))
+            soc.listen(0)
+            self.socs.append(soc)
+        self.running = True
+
+        try:
+            while self.running:
+                for soc in self.socs:
+                    try:
+                        c, addr = soc.accept()
+                        c.setblocking(1)
+                    except socket.timeout:
+                        continue
+
+                    conn = ConnectionHandler(c, self, addr)
+                    self.addConn(conn)
+                    conn.start()
+        finally:
+            self.running = False
+            for soc in self.socs:
+                soc.close()
+
+    def printLog(self, log):
+        self.logLock.acquire()
+        print(log)
+        self.logLock.release()
+
+    def addConn(self, conn):
+        try:
+            self.threadsLock.acquire()
+            if self.running:
+                self.threads.append(conn)
+        finally:
+            self.threadsLock.release()
+
+    def removeConn(self, conn):
+        try:
+            self.threadsLock.acquire()
+            if conn in self.threads:
+                self.threads.remove(conn)
+        finally:
+            self.threadsLock.release()
+
+    def close(self):
+        try:
+            self.running = False
+            self.threadsLock.acquire()
+
+            threads = list(self.threads)
+            for c in threads:
+                c.close()
+        finally:
+            self.threadsLock.release()
+
+
+class ConnectionHandler(threading.Thread):
+    def __init__(self, socClient, server, addr):
+        threading.Thread.__init__(self)
+        self.clientClosed = False
+        self.targetClosed = True
+        self.client = socClient
+        self.client_buffer = ''
+        self.pending = b''
+        self.server = server
+        self.log = 'Connection: ' + str(addr)
+
+    def close(self):
+        try:
+            if not self.clientClosed:
+                self.client.shutdown(socket.SHUT_RDWR)
+                self.client.close()
+        except:
+            pass
+        finally:
+            self.clientClosed = True
+
+        try:
+            if not self.targetClosed:
+                self.target.shutdown(socket.SHUT_RDWR)
+                self.target.close()
+        except:
+            pass
+        finally:
+            self.targetClosed = True
+
+    def run(self):
+        try:
+            self.client.settimeout(10)
+            data = b''
+            while b'\r\n\r\n' not in data:
+                block = self.client.recv(BUFLEN - len(data))
+                if not block:
+                    raise ValueError('Incomplete request')
+                data += block
+                if len(data) >= BUFLEN and b'\r\n\r\n' not in data:
+                    raise ValueError('Headers too large')
+            headers, self.pending = data.split(b'\r\n\r\n', 1)
+            self.client_buffer = headers.decode('latin-1')
+            hostPort = self.findHeader(self.client_buffer, 'X-Real-Host')
+            if not hostPort:
+                request = self.client_buffer.split('\r\n', 1)[0].split()
+                request_path = request[1].split('?', 1)[0] if len(request) > 1 else ''
+                # Keep the SSH fallback and the explicit OpenVPN WS path.
+                hostPort = '127.0.0.1:1194' if request_path.rstrip('/') in ('/openvpn', '/ovpn') else DEFAULT_HOSTS[0]
+            if hostPort not in ALLOWED_TARGETS:
+                raise PermissionError('Upstream not permitted')
+            split = self.findHeader(self.client_buffer, 'X-Split')
+            if split and not self.pending:
+                self.client.recv(BUFLEN)
+            self.method_CONNECT(hostPort)
+        except PermissionError:
+            self.client.sendall(b'HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n')
+        except (ValueError, UnicodeError):
+            self.client.sendall(b'HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n')
+        except Exception:
+            self.server.printLog(self.log + ' - connection closed or upstream unavailable')
+        finally:
+            # Never send a second 101 response, especially after rejecting a target.
+            self.close()
+            self.server.removeConn(self)
+
+    def findHeader(self, head, header):
+        values = []
+        for line in head.split('\r\n')[1:]:
+            name, separator, value = line.partition(':')
+            if separator and name.strip().lower() == header.lower():
+                values.append(value.strip())
+        if len(values) > 1:
+            raise ValueError('Duplicate routing header')
+        return values[0] if values else ''
+
+    def connect_target(self, host):
+        address = ALLOWED_TARGETS.get(host)
+        if address is None:
+            raise PermissionError('Upstream not permitted')
+        self.target = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.targetClosed = False
+        self.target.settimeout(10)
+        self.target.connect(address)
+
+    def method_CONNECT(self, path):
+        self.log += ' - CONNECT ' + path
+
+        self.connect_target(path)
+        self.client.sendall(RESPONSE.encode())
+        if self.pending:
+            self.target.sendall(self.pending)
+            self.pending = b''
+        self.client_buffer = ''
+
+        self.server.printLog(self.log)
+        self.doCONNECT()
+
+    def doCONNECT(self):
+        socs = [self.client, self.target]
+        count = 0
+        error = False
+        while True:
+            count += 1
+            (recv, _, err) = select.select(socs, [], socs, 3)
+            if err:
+                error = True
+            if recv:
+                for in_ in recv:
+                    try:
+                        data = in_.recv(BUFLEN)
+                        if data:
+                            if in_ is self.target:
+                                self.client.sendall(data)
+                            else:
+                                while data:
+                                    byte = self.target.send(data)
+                                    data = data[byte:]
+
+                            count = 0
+                        else:
+                            error = True
+                            break
+                    except:
+                        error = True
+                        break
+            if count == TIMEOUT:
+                error = True
+            if error:
+                break
+
+
+def print_usage():
+    print('Usage: proxy.py -p <port1,port2,...>')
+    print('       proxy.py -b <bindAddr> -p <port1,port2,...>')
+    print('       proxy.py -b 0.0.0.0 -p 80,443')
+
+def parse_args(argv):
+    global LISTENING_ADDR
+    global LISTENING_PORTS
+    
+    try:
+        opts, args = getopt.getopt(argv, "hb:p:", ["bind=", "port="])
+    except getopt.GetoptError:
+        print_usage()
+        sys.exit(2)
+    for opt, arg in opts:
+        if opt == '-h':
+            print_usage()
+            sys.exit()
+        elif opt in ("-b", "--bind"):
+            LISTENING_ADDR = arg
+        elif opt in ("-p", "--port"):
+            LISTENING_PORTS = [int(port) for port in arg.split(',')]
+
+
+def main(host=LISTENING_ADDR, ports=LISTENING_PORTS):
+    print("\n:-------PythonProxy-------:\n")
+    print("Listening addr: " + LISTENING_ADDR)
+    print("Listening ports: " + ', '.join(map(str, LISTENING_PORTS)) + "\n")
+    print(":-------------------------:\n")
+    server = Server(LISTENING_ADDR, LISTENING_PORTS)
+    server.start()
+    while True:
+        try:
+            time.sleep(2)
+        except KeyboardInterrupt:
+            print('Stopping...')
+            server.close()
+            break
+
+#######    parse_args(sys.argv[1:])
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,382 @@
+#!/bin/bash
+
+# Shared presentation and optional Telegram transport installed by Nathaya.
+if [[ -r /opt/nathaya/modules/common/telegram.sh ]]; then
+    source /opt/nathaya/modules/common/telegram.sh
+fi
+if ! declare -F nathaya_account_render >/dev/null; then
+    printf '%s\n' 'Nathaya account presentation module is not installed.' >&2
+    exit 1
+fi
+NATHAYA_ACCOUNT_ACTION=create
+NATHAYA_ACCOUNT_PROTOCOL=TROJAN
+
+# Values below are the upstream connection/display data; formatting is shared.
+nathaya_account_data() {
+    nathaya_account_add 'SERVER INFORMATION' 'CITY' "${city:-}"
+    nathaya_account_add 'SERVER INFORMATION' 'Host' "${domain:-}"
+    nathaya_account_add 'SERVER INFORMATION' 'IP' "${ip:-${IP:-Tidak diketahui}}"
+    nathaya_account_add 'ACCOUNT INFORMATION' 'User' "${user:-}"
+    nathaya_account_add 'ACCOUNT INFORMATION' 'User ID' "${uuid:-}"
+    nathaya_account_add 'ACCOUNT INFORMATION' 'Expired' "${exp:-}"
+    nathaya_account_add 'CONNECTION INFORMATION' 'Port TLS' "443"
+    nathaya_account_add 'CONNECTION INFORMATION' 'Port non TLS' "80, 8080"
+    nathaya_account_add 'CONNECTION INFORMATION' 'Port DNS' "443, 53"
+    nathaya_account_add 'CONNECTION INFORMATION' 'Port GRPC' "443"
+    nathaya_account_add 'CONNECTION INFORMATION' 'AlterId' "0"
+    nathaya_account_add 'CONNECTION INFORMATION' 'Security' "auto"
+    nathaya_account_add 'CONNECTION INFORMATION' 'Network' "WS or gRPC"
+    nathaya_account_add 'CONNECTION INFORMATION' 'Path' "/whatever/trojan"
+    nathaya_account_add 'CONNECTION INFORMATION' 'ServiceName' "trojan-grpc"
+    nathaya_account_add 'CONNECTION INFORMATION' 'Public Key' "${pubkey:-}"
+    nathaya_account_add 'CONNECTION LINKS' 'TLS Link' "${trojan_tls:-}"
+    nathaya_account_add 'CONNECTION LINKS' 'NTLS Link' "${trojan_non:-}"
+    nathaya_account_add 'CONNECTION LINKS' 'GRPC Link' "${trojan_grpc:-}"
+    nathaya_account_add 'CONNECTION LINKS' 'OpenClash Format' "https://${domain:-}:81/trojan-${user:-}.txt"
+}
+
+# Color definitions
+red=$'\033[1;31m'
+green=$'\033[1;32m'
+yellow=$'\033[38;5;208m'
+reset=$'\033[0m'
+# Valid Script
+ipsaya=$(curl -sS ipv4.icanhazip.com)
+data_server=$(curl -v --insecure --silent https://google.com/ 2>&1 | grep Date | sed -e 's/< Date: //')
+date_list=$(date +"%Y-%m-%d" -d "$data_server")
+
+# Variables
+ip=$(wget -qO- ipv4.icanhazip.com)
+srv_date=$(curl -v --insecure --silent https://google.com/ 2>&1 | grep Date | sed -e 's/< Date: //')
+date=$(date +"%Y-%m-%d" -d "$srv_date")
+ip_url="https://ip.yha.my.id/ip"
+city=$(cat /etc/xray/city 2>/dev/null || echo "Unknown city")
+pubkey=$(cat /etc/slowdns/server.pub 2>/dev/null || echo "Pubkey not available")
+domain=$(cat /etc/xray/domain 2>/dev/null || hostname -f)
+
+clear
+
+# User data input
+nathaya_account_header "CREATE TROJAN"
+
+while true; do
+    read -r -p "   Name: " user
+    nathaya_account_require_username "$user" || exit 1
+    if [[ ${#user} -lt 3 || ! "$user" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_-]*$ ]]; then
+        printf "\033[1A\033[0J"
+        echo -e "${red}   Nama tidak boleh kurang dari 3 karakter dan hanya boleh mengandung huruf, angka, garis bawah, dan tanda hubung.${reset}"
+        continue
+    fi
+    if grep -q "^### $user " /etc/xray/trojan/config.json; then
+        random_number=$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 5)
+        user="${random_number}${user}"
+        echo -e "${yellow}   Nama sudah digunakan, menggunakan $user${reset}"
+        break
+    else
+        break
+    fi
+done
+
+uuid=$(cat /proc/sys/kernel/random/uuid)
+echo -e "   User ID     : ${uuid}"
+until [[ $duration =~ ^[0-9]+$ ]]; do
+    read -r -p "   Masa aktif (hari): " duration
+    if [[ -z "$duration" ]]; then
+        echo -e "${red}Masa aktif tidak boleh kosong. Silakan coba lagi.${reset}"
+    fi
+done
+until [[ $quota =~ ^[0-9]+$ ]]; do
+    read -r -p "   Kuota (GB): " quota
+    if [[ -z "$quota" ]]; then
+        echo -e "${red}Kuota tidak boleh kosong. Silakan coba lagi.${reset}"
+    fi
+done
+until [[ $ip_limit =~ ^[0-9]+$ ]]; do
+    read -r -p "   Batas Pengguna (IP): " ip_limit
+    if [[ -z "$ip_limit" ]]; then
+        echo -e "${red}Batas Pengguna tidak boleh kosong. Silakan coba lagi.${reset}"
+    fi
+done
+
+# Function to send Telegram notification
+
+# Account creation process
+exp=$(date -d "$duration days" +"%Y-%m-%d %H:%M:%S")
+exp_date=$(date -d "$duration days" +"%Y-%m-%d")
+if [ ! -f "/etc/xray/trojan/config.json" ]; then
+    echo "Configuration file not found. Creating new file..."
+    echo '{"inbounds": []}' >/etc/xray/trojan/config.json
+fi
+
+if ! sed -i '/#trojan$/a\### '"$user $exp_date"'\
+},{"id": "'""$uuid""'","email": "'""$user""'"' /etc/xray/trojan/config.json; then
+    echo -e "${red}Failed to add user to config.json${reset}"
+    send_telegram_notification "error" "$user" "Failed to add user to config.json"
+    exit 1
+fi
+if ! sed -i '/#trojangrpc$/a\### '"$user $exp_date"'\
+},{"id": "'""$uuid""'","email": "'""$user""'"' /etc/xray/trojan/config.json; then
+    echo -e "${red}Failed to add user to config.json (GRPC)${reset}"
+    send_telegram_notification "error" "$user" "Failed to add user to config.json (GRPC)"
+    exit 1
+fi
+
+# Create configuration files
+cat >/etc/xray/trojan/$user-tls.json <<EOF
+{
+    "v": "2",
+    "ps": "$user WS (CDN) TLS",
+    "add": "${domain}",
+    "port": "443",
+    "id": "${uuid}",
+    "aid": "0",
+    "net": "ws",
+    "path": "/whatever/trojan",
+    "type": "none",
+    "host": "${domain}",
+    "tls": "tls"
+}
+EOF
+
+# Check if TLS configuration file was created successfully
+if [ ! -f "/etc/xray/trojan/$user-tls.json" ]; then
+    echo -e "${red}Failed to create TLS configuration file${reset}"
+    send_telegram_notification "error" "$user" "Failed to create TLS configuration file"
+    exit 1
+fi
+
+cat >/etc/xray/trojan/$user-non.json <<EOF
+{
+    "v": "2",
+    "ps": "$user WS (CDN) NTLS",
+    "add": "${domain}",
+    "port": "80",
+    "id": "${uuid}",
+    "aid": "0",
+    "net": "ws",
+    "path": "/whatever/trojan",
+    "type": "none",
+    "host": "${domain}",
+    "tls": "none"
+}
+EOF
+
+# Check if Non-TLS configuration file was created successfully
+if [ ! -f "/etc/xray/trojan/$user-non.json" ]; then
+    echo -e "${red}Failed to create Non-TLS configuration file${reset}"
+    send_telegram_notification "error" "$user" "Failed to create Non-TLS configuration file"
+    exit 1
+fi
+
+cat >/etc/xray/trojan/$user-grpc.json <<EOF
+{
+    "v": "2",
+    "ps": "$user (SNI) GRPC",
+    "add": "${domain}",
+    "port": "443",
+    "id": "${uuid}",
+    "aid": "0",
+    "net": "grpc",
+    "path": "trojan-grpc",
+    "type": "none",
+    "host": "${domain}",
+    "tls": "tls"
+}
+EOF
+
+# Check if GRPC configuration file was created successfully
+if [ ! -f "/etc/xray/trojan/$user-grpc.json" ]; then
+    echo -e "${red}Failed to create GRPC configuration file${reset}"
+    send_telegram_notification "error" "$user" "Failed to create GRPC configuration file"
+    exit 1
+fi
+
+# Create configuration file for OpenClash
+cat >/var/www/html/trojan-$user.txt <<-END
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Format Trojan WS (CDN)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+- name: trojan-$user-WS (CDN)
+  type: trojan
+  server: ${domain}
+  port: 443
+  uuid: ${uuid}
+  alterId: 0
+  cipher: auto
+  udp: true
+  tls: true
+  skip-cert-verify: true
+  servername: ${domain}
+  network: ws
+  ws-opts:
+    path: /whatever/trojan
+    headers:
+      Host: ${domain}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Format Trojan WS (CDN) Non TLS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+- name: trojan-$user-WS (CDN) Non TLS
+  type: trojan
+  server: ${domain}
+  port: 80
+  uuid: ${uuid}
+  alterId: 0
+  cipher: auto
+  udp: true
+  tls: false
+  skip-cert-verify: false
+  servername: ${domain}
+  network: ws
+  ws-opts:
+    path: /whatever/trojan
+    headers:
+      Host: ${domain}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Format trojan gRPC (SNI)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+- name: trojan-$user-gRPC (SNI)
+  server: ${domain}
+  port: 443
+  type: trojan
+  uuid: ${uuid}
+  alterId: 0
+  cipher: auto
+  network: grpc
+  tls: true
+  servername: ${domain}
+  skip-cert-verify: true
+  grpc-opts:
+    grpc-service-name: trojan-grpc
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Trojan Account Links
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TLS Link : trojan://${uuid}@${domain}:443?path=%2Fwhatever%2Ftrojan&security=tls&host=${domain}&type=ws&sni=${domain}#${user}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Non-TLS Link : trojan://${uuid}@${domain}:80?path=%2Fwhatever%2Ftrojan&security=none&host=${domain}&type=ws#${user}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+GRPC Link : trojan://${uuid}@${domain}:443?mode=gun&security=tls&type=grpc&serviceName=trojan-grpc&sni=${domain}#${user}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+END
+
+# Check if OpenClash configuration file was created successfully
+if [ ! -f "/var/www/html/trojan-$user.txt" ]; then
+    echo -e "${red}Failed to create OpenClash configuration file${reset}"
+    send_telegram_notification "error" "$user" "Failed to create OpenClash configuration file"
+    exit 1
+fi
+
+# Generate trojan links
+trojan_tls="trojan://${uuid}@${domain}:443?path=%2Fwhatever%2Ftrojan&security=tls&host=${domain}&type=ws&sni=${domain}#${user}"
+trojan_non="trojan://${uuid}@${domain}:80?path=%2Fwhatever%2Ftrojan&security=none&host=${domain}&type=ws#${user}"
+trojan_grpc="trojan://${uuid}@${domain}:443?mode=gun&security=tls&type=grpc&serviceName=trojan-grpc&sni=${domain}#${user}"
+
+# Restart service
+if ! systemctl restart trojan@config; then
+    echo -e "${red}Failed to restart trojan service${reset}"
+    send_telegram_notification "error" "$user" "Failed to restart trojan service"
+    exit 1
+fi
+
+# Send success notification to Telegram
+send_telegram_notification "success" "$user"
+
+# Exception if configuration file doesn't exist
+if [ ! -f "/etc/xray/trojan/config.json" ]; then
+    echo "Warning: trojan configuration file not found. Creating new file..."
+    mkdir -p /etc/xray/trojan
+    echo '{"inbounds": []}' >/etc/xray/trojan/config.json
+    systemctl restart trojan@config
+fi
+
+# Create directory if it doesn't exist
+if [ ! -d "/etc/xray/trojan" ]; then
+    echo "Directory /etc/xray/trojan not found. Creating directory..."
+    mkdir -p /etc/xray/trojan
+    if [ $? -ne 0 ]; then
+        echo "Failed to create directory /etc/xray/trojan. Make sure you have sufficient permissions."
+        send_telegram_notification "error" "$user" "Failed to create directory /etc/xray/trojan"
+        exit 1
+    fi
+fi
+
+# Exception if configuration file doesn't exist
+if [ ! -f "/etc/xray/trojan/config.json" ]; then
+    echo "trojan configuration file not found. Creating new file..."
+    echo '{"inbounds": []}' >/etc/xray/trojan/config.json
+    if [ $? -ne 0 ]; then
+        echo "Failed to create trojan configuration file. Make sure you have sufficient permissions."
+        send_telegram_notification "error" "$user" "Failed to create trojan configuration file"
+        exit 1
+    fi
+fi
+
+# Set default values if empty
+ip_limit=${ip_limit:-0}
+quota=${quota:-0}
+
+# Convert Quota to bytes
+quota_bytes=$((${quota} * 1024 * 1024 * 1024))
+
+# Save quota and IP limit data
+if [[ ${quota} != "0" ]]; then
+    echo "${quota_bytes}" >/etc/xray/trojan/${user}
+    echo "${ip_limit}" >/etc/xray/trojan/${user}IP
+fi
+
+# Update database
+db_file="/etc/xray/trojan/.trojan.db"
+temp_file="/etc/xray/trojan/.trojan.db.tmp"
+
+# Exception if database file doesn't exist
+if [ ! -f "$db_file" ]; then
+    echo "Warning: trojan database file not found. Creating new file..."
+    touch "$db_file"
+fi
+
+# Remove old entry if exists
+grep -v "^### ${user} " "$db_file" >"$temp_file"
+mv "$temp_file" "$db_file"
+
+# Add new entry
+echo "### ${user} ${exp_date} ${uuid}" >>"$db_file"
+
+# Save original log
+{
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "Xray/Trojan Account    "
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "remarks      : ${user}"
+    echo "host_server  : ${domain}"    
+    echo "location     : $city"
+    echo "location     : $kota"
+    echo "port_tls     : 443"
+    echo "port_nontls  : 80, 8080"
+    echo "port_dns     : 443, 53"
+    echo "port_grpc    : 443"
+    echo "alterid      : 0"
+    echo "security     : auto"
+    echo "network      : WS or gRPC"
+    echo "path         : /whatever/trojan"
+    echo "servicename  : trojan-grpc"
+    echo "user_id      : ${uuid}"
+    echo "public_key   : ${pubkey}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "tls_link     : ${trojan_tls}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "ntls_link    : ${trojan_non}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "grpc_link    : ${trojan_grpc}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "openclash_format : https://${domain}:81/trojan-$user.txt"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "expires_on   : $exp"
+    echo ""
+} >> /etc/xray/trojan/log-create-${user}.log
+
+clear
+nathaya_account_render terminal

@@ -1,0 +1,198 @@
+#!/bin/bash
+
+# Shared presentation and optional Telegram transport installed by Nathaya.
+if [[ -r /opt/nathaya/modules/common/telegram.sh ]]; then
+    source /opt/nathaya/modules/common/telegram.sh
+fi
+if ! declare -F nathaya_account_render >/dev/null; then
+    printf '%s\n' 'Nathaya account presentation module is not installed.' >&2
+    exit 1
+fi
+NATHAYA_ACCOUNT_ACTION=renew
+NATHAYA_ACCOUNT_PROTOCOL=SHADOWSOCKS
+
+# A failed step may follow a successful write; never report a completed renewal.
+nathaya_renew_fail() {
+    local message="$1"
+    printf '%s\n' "$message" >&2
+    send_telegram_notification "error" "$user" "$message"
+    nathaya_account_render terminal error "$message"
+    exit 1
+}
+
+# Validate the existing rows in place; never reconstruct transport clients.
+# Reused after writes with the new expiry to catch a successful sed no-op.
+nathaya_renew_state_valid() {
+    local protocol="${NATHAYA_ACCOUNT_PROTOCOL,,}" field=password
+    [[ "$protocol" != vmess && "$protocol" != vless ]] || field=id
+    awk -v user="$user" -v ws="$1" -v grpc="$2" -v expected="$3" -v field="$field" '
+    function date_valid(value, parts, y, m, d, days) {
+        if (value !~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/) return 0
+        split(value, parts, "-"); y=parts[1]+0; m=parts[2]+0; d=parts[3]+0
+        if (y < 1 || m < 1 || m > 12) return 0
+        days=(m == 2 ? 28 + (y%4 == 0 && (y%100 != 0 || y%400 == 0)) :
+            (m == 4 || m == 6 || m == 9 || m == 11 ? 30 : 31))
+        return d >= 1 && d <= days
+    }
+    function time_valid(value, parts) {
+        if (value !~ /^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]$/) return 0
+        split(value, parts, ":")
+        return parts[1]+0 < 24 && parts[2]+0 < 60 && parts[3]+0 < 60
+    }
+    FILENAME == ARGV[1] {
+        if ($1 == "###" && $2 == user) {
+            db_count++
+            if ($0 !~ ("^### " user " " expected "([[:space:]]|$)") || !date_valid($3) || $3 != expected ||
+                (NF != 4 && !(NF == 5 && time_valid($4)))) bad=1
+        }
+        next
+    }
+    /^#[^#]/ {
+        section=""
+        if ($0 == ws) { ws_markers++; section="ws" }
+        if ($0 == grpc) { grpc_markers++; section="grpc" }
+        next
+    }
+    /^[[:space:]]*\]/ { section="" }
+    $1 == "###" && $2 == user {
+        count++
+        if (section == "ws") ws_count++
+        else if (section == "grpc") grpc_count++
+        else bad=1
+        if ($0 !~ ("^### " user " " expected "([[:space:]]|$)") || !date_valid($3) || $3 != expected ||
+            (NF != 3 && !(NF == 4 && time_valid($4)))) bad=1
+        if ((getline) <= 0) { bad=1; next }
+        if ($0 !~ ("\"" field "\"[[:space:]]*:[[:space:]]*\"[^\"]+\"") ||
+            $0 !~ ("\"email\"[[:space:]]*:[[:space:]]*\"" user "\"") ||
+            (field == "password" && ws == "#ssws" &&
+             $0 !~ /"method"[[:space:]]*:[[:space:]]*"[^"]+"/)) bad=1
+    }
+    END { exit (bad || db_count != 1 || count != 2 || ws_count != 1 || grpc_count != 1 ||
+                ws_markers != 1 || grpc_markers != 1) }
+    ' "/etc/xray/$protocol/.$protocol.db" "/etc/xray/$protocol/config.json"
+}
+
+# Valid Script
+ipsaya=$(curl -sS ipv4.icanhazip.com)
+data_server=$(curl -v --insecure --silent https://google.com/ 2>&1 | grep Date | sed -e 's/< Date: //')
+date_list=$(date +"%Y-%m-%d" -d "$data_server")
+
+
+    
+# colors
+red=$'\033[1;31m'
+green=$'\033[1;32m'
+yellow=$'\033[38;5;208m'
+blue=$'\033[1;36m'
+purple=$'\033[1;36m'
+cyan=$'\033[1;36m'
+white=$'\033[1;37m'
+reset=$'\033[0m'
+# variables
+domain=$(cat /etc/xray/domain 2>/dev/null || hostname -f)
+clear
+nathaya_account_header "RENEW SHADOWSOCKS"
+
+account_count=$(grep -c -E "^### " "/etc/xray/shadowsocks/.shadowsocks.db")
+if [[ ${account_count} == '0' ]]; then
+    echo ""
+    echo "  Tidak ada data pengguna yang tersedia"
+    echo ""
+    exit 0
+fi
+
+# Prompt for username directly
+read -rp "Masukkan nama pengguna: " user || exit 1
+nathaya_account_require_username "$user" || exit 1
+
+# Check if user exists
+if ! grep -qE "^### $user " "/etc/xray/shadowsocks/.shadowsocks.db"; then
+    echo ""
+    echo "Nama pengguna tidak ditemukan"
+    echo ""
+    exit 1
+fi
+
+# Get current expiration date and password
+exp=$(grep -E "^### $user " "/etc/xray/shadowsocks/.shadowsocks.db" | cut -d ' ' -f 3)
+password=$(nathaya_account_db_secret "/etc/xray/shadowsocks/.shadowsocks.db" "$user")
+[[ -n "$password" ]] || { printf '%s\n' 'Credential database tidak valid; renewal dihentikan.' >&2; exit 1; }
+
+clear
+echo -e "${yellow}Memperbarui akun Shadowsocks $user${reset}"
+echo ""
+
+# Read expiration date from database
+old_exp=$(grep -E "^### $user " "/etc/xray/shadowsocks/.shadowsocks.db" | cut -d ' ' -f 3)
+nathaya_renew_state_valid '#ssws' '#ssgrpc' "$old_exp" ||
+    nathaya_renew_fail 'Client WS/gRPC, tanggal atau database tidak valid; renewal dihentikan sebelum perubahan.'
+
+# Calculate remaining active days
+days_left=$((($(date -d "$old_exp" +%s) - $(date +%s)) / 86400))
+
+echo "Sisa masa aktif: $days_left hari"
+
+while true; do
+    read -r -p "Tambahkan masa aktif (hari): " active_days || exit 1
+    if [[ "$active_days" =~ ^[0-9]+$ ]]; then
+        break
+    else
+    echo "Input harus berupa angka positif."
+    fi
+done
+
+while true; do
+    read -r -p "Batas kuota (GB, 0 untuk tanpa batas): " quota || exit 1
+    if [[ "$quota" =~ ^[0-9]+$ ]]; then
+        break
+    else
+    echo "Input harus berupa angka positif atau 0."
+    fi
+done
+
+while true; do
+    read -r -p "Batas perangkat (IP, 0 untuk tanpa batas): " ip_limit || exit 1
+    if [[ "$ip_limit" =~ ^[0-9]+$ ]]; then
+        break
+    else
+    echo "Input harus berupa angka positif atau 0."
+    fi
+done
+
+# Validate existing state before changing any account files.
+new_exp=$(date -d "$old_exp +${active_days} days" +"%Y-%m-%d") ||
+    nathaya_renew_fail 'Tanggal kedaluwarsa tidak valid; renewal dihentikan.'
+credential=$(nathaya_account_db_secret "/etc/xray/shadowsocks/.shadowsocks.db" "$user")
+[[ -n "$credential" ]] || nathaya_renew_fail 'Credential database tidak valid; renewal dihentikan.'
+
+# Quota and IP limits are independent; missing quota and IP=0 mean unlimited.
+if [[ $quota != "0" ]]; then
+    quota_bytes=$((quota * 1024 * 1024 * 1024))
+    printf '%s\n' "$quota_bytes" >"/etc/xray/shadowsocks/${user}" ||
+        nathaya_renew_fail 'Gagal menyimpan renewal. Perubahan sebelumnya mungkin sudah tersimpan; periksa status akun sebelum mencoba lagi.'
+else
+    rm -f "/etc/xray/shadowsocks/${user}" ||
+        nathaya_renew_fail 'Gagal menyimpan renewal. Perubahan sebelumnya mungkin sudah tersimpan; periksa status akun sebelum mencoba lagi.'
+fi
+printf '%s\n' "$ip_limit" >"/etc/xray/shadowsocks/${user}IP" ||
+    nathaya_renew_fail 'Gagal menyimpan renewal. Perubahan sebelumnya mungkin sudah tersimpan; periksa status akun sebelum mencoba lagi.'
+
+# Update only the expiry token. Keep existing WS/gRPC clients, passwords,
+# methods and historic database timestamp/credential fields unchanged.
+sed -i -E "s/^(### $user )[0-9]{4}-[0-9]{2}-[0-9]{2}([[:space:]]|$)/\\1$new_exp\\2/" "/etc/xray/shadowsocks/config.json" ||
+    nathaya_renew_fail 'Gagal menyimpan renewal. Perubahan sebelumnya mungkin sudah tersimpan; periksa status akun sebelum mencoba lagi.'
+sed -i -E "s/^(### $user )[0-9]{4}-[0-9]{2}-[0-9]{2}([[:space:]]|$)/\\1$new_exp\\2/" "/etc/xray/shadowsocks/.shadowsocks.db" ||
+    nathaya_renew_fail 'Gagal menyimpan renewal. Perubahan sebelumnya mungkin sudah tersimpan; periksa status akun sebelum mencoba lagi.'
+
+# Assert one updated expiry per transport and one unchanged-format database row.
+nathaya_renew_state_valid '#ssws' '#ssgrpc' "$new_exp" ||
+    nathaya_renew_fail 'Gagal memverifikasi renewal. Perubahan sebelumnya mungkin sudah tersimpan; periksa status akun sebelum mencoba lagi.'
+
+# Restart is part of renewal success, not a best-effort follow-up.
+if ! systemctl restart shadowsocks@config >/dev/null 2>&1; then
+    nathaya_renew_fail 'Gagal memulai ulang layanan. Perubahan akun mungkin sudah tersimpan; layanan belum berhasil dimulai ulang.'
+fi
+
+clear
+send_telegram_notification "success" "$user"
+nathaya_account_render terminal

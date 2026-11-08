@@ -157,3 +157,55 @@ draw_nathaya_header() {
 
     draw_box_bottom "$width" "$CYAN"
 }
+
+# Shared, bounded rows for dashboards and every protocol menu.
+# Fold untrusted system text as data; never interpret embedded terminal escapes.
+nathaya_plain_text() {
+    printf '%s' "$1" | LC_ALL=C tr -d '\000-\010\013-\037\177' | tr '\t\n\r' '   '
+}
+
+nathaya_box_row() {
+    local width="$1" text line
+    text=$(nathaya_plain_text "$2")
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        printf '%b│%b %-*s %b│%b\n' "$CYAN" "$WHITE" "$((width - 4))" "$line" "$CYAN" "$RESET"
+    done < <(printf '%s\n' "$text" | fold -s -w "$((width - 4))")
+}
+
+nathaya_field() {
+    nathaya_box_row "$1" "$(printf '%-10s: %s' "$2" "$3")"
+}
+
+nathaya_status_row() {
+    local width="$1" label="$2" state="$3" color="$RED" text
+    [[ "$state" == ON ]] && color="$GREEN"
+    text=$(printf '%-18s: ● %s' "$label" "$state")
+    printf '%b│%b %-*s %b│%b\n' "$CYAN" "$color" "$((width - 4))" "$text" "$CYAN" "$RESET"
+}
+
+nathaya_menu_item() {
+    local width="$1" number="$2" label="$3" line first=1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if (( first )); then
+            printf '%b│ %b%2s. %b%-*s %b│%b\n' "$CYAN" "$ORANGE" "$number" "$WHITE" "$((width - 8))" "$line" "$CYAN" "$RESET"
+            first=0
+        else
+            printf '%b│     %b%-*s %b│%b\n' "$CYAN" "$WHITE" "$((width - 8))" "$line" "$CYAN" "$RESET"
+        fi
+    done < <(nathaya_plain_text "$label" | fold -s -w "$((width - 8))")
+}
+
+nathaya_show_menu() {
+    local title="$1" width index=1 label
+    shift
+    width=$(get_width)
+    [[ -t 1 ]] && clear
+    draw_nathaya_header "$width"
+    draw_section_title "$title" "$width"
+    for label in "$@"; do
+        nathaya_menu_item "$width" "$index" "$label"
+        ((index++))
+    done
+    draw_box_bottom "$width"
+    printf '  %bz.%b Kembali\n  %bx.%b Exit\n\n' "$ORANGE" "$RESET" "$ORANGE" "$RESET"
+}

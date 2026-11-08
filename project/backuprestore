@@ -1,0 +1,401 @@
+#!/bin/bash
+# Nathaya Tunnel: local-only, root-only backups. No network transfers.
+set +x
+set -euo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+umask 077
+
+usage() {
+    cat <<'HELP'
+Usage (root only; private paths under /root, never a web directory):
+  backuprestore backup /root/PRIVATE/backup.tar.gz
+  backuprestore backup-dir /root/PRIVATE
+  backuprestore restore /root/PRIVATE/backup.tar.gz [--confirm-privileged-overwrite]
+  backuprestore server /root/PRIVATE
+Backups are retained locally, mode 0600. Existing archives are never overwritten.
+Restore accepts only SSH/accounts, the four native Xray protocol trees, OpenVPN,
+Let's Encrypt, TLS keys and Nathaya metadata/notification configuration.
+These archives contain private keys and credentials: never publish or send them.
+It overwrites privileged configuration; take a separate backup first.
+Private data restores as root:root, directories 0700 and files 0600 (passwd/group
+remain 0644). Services are NEVER started/restarted automatically.
+In-tree OpenVPN/Let's Encrypt file links are backed up as regular snapshots;
+restore still refuses existing destination links. Review those locally first.
+For the web UI, supply NATHAYA_BACKUP_SECRET (32+ characters) at runtime,
+or enter it at the hidden prompt. Connect using an SSH local port forward
+and HTTP Basic username 'admin'. The UI binds only to 127.0.0.1:5000.
+HELP
+}
+
+[[ $EUID -eq 0 ]] || { echo 'Administrator privileges required.' >&2; exit 1; }
+[[ $# -ge 2 && -n $2 ]] || { usage; exit 1; }
+action=$1
+archive_path=$2
+case "$action" in
+    backup|backup-dir|check-directory|server) [[ $# -eq 2 ]] || { usage; exit 1; } ;;
+    restore)
+        [[ $# -le 3 ]] || { usage; exit 1; }
+        if [[ ${3:-} != --confirm-privileged-overwrite ]]; then
+            [[ $# -eq 2 && -t 0 ]] || { echo 'Explicit privileged-overwrite confirmation required.' >&2; exit 1; }
+            read -r -p 'Overwrite accounts, VPN/TLS private state and notification credentials? Type RESTORE: ' answer
+            [[ $answer == RESTORE ]] || exit 1
+        fi
+        ;;
+    *) usage; exit 1 ;;
+esac
+
+if [[ $action == server ]]; then
+    "$0" check-directory "$archive_path"
+    if [[ -z ${NATHAYA_BACKUP_SECRET:-} ]]; then
+        [[ -t 0 ]] || { echo 'Set a runtime admin secret first.' >&2; exit 1; }
+        read -r -s -p 'Admin runtime secret (32+ characters): ' NATHAYA_BACKUP_SECRET
+        printf '\n'
+    fi
+    [[ ${#NATHAYA_BACKUP_SECRET} -ge 32 ]] || { echo 'Admin secret is too short.' >&2; exit 1; }
+    export NATHAYA_BACKUP_SECRET
+    exec node /usr/bin/backuprestore.js "$archive_path"
+fi
+
+# Manual, bounded extraction with Python 3 on the supported Ubuntu host.
+# Never use tar.extract/extractall or trust archive ownership/permissions.
+exec /usr/bin/python3 - "$action" "$archive_path" <<'PY'
+import datetime
+import fcntl
+import os
+import re
+import resource
+import secrets
+import shutil
+import stat
+import sys
+import tarfile
+import tempfile
+
+MAX_ARCHIVE = 512 * 1024 * 1024
+MAX_FILE = 256 * 1024 * 1024
+MAX_TOTAL = 1024 * 1024 * 1024
+MAX_ENTRIES = 20000
+TREES = ('etc/ssh', 'etc/xray/vmess', 'etc/xray/vless',
+         'etc/xray/trojan', 'etc/xray/shadowsocks',
+         'etc/openvpn', 'etc/letsencrypt')
+FILES = ('etc/passwd', 'etc/group', 'etc/shadow', 'etc/gshadow',
+         'etc/gerhanatunnel.txt', 'etc/haproxy/yha.pem',
+         'etc/xray/xray.crt', 'etc/xray/xray.key',
+         'etc/xray/domain', 'etc/xray/city', 'etc/xray/isp',
+         'root/.vars', 'etc/nathaya-tunnel/config.conf')
+DIRECTORIES = ('etc', 'etc/xray', 'etc/haproxy', 'etc/nathaya-tunnel', 'root')
+PRIVATE_DIRECTORIES = TREES + ('etc/xray', 'etc/haproxy', 'etc/nathaya-tunnel', 'root')
+NOFOLLOW = os.O_NOFOLLOW
+
+
+class PolicyError(ValueError):
+    pass
+
+
+def private_directory(value, create=False):
+    if not value.startswith('/root/') or any(p in ('', '.', '..') for p in value.split('/')[1:]):
+        raise PolicyError('Use an explicit private path below /root.')
+    current = '/root'
+    for part in [''] + value.split('/')[2:]:
+        if part:
+            current += '/' + part
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError:
+            if not create:
+                raise
+            os.mkdir(current, 0o700)
+            info = os.lstat(current)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o077:
+            raise PolicyError('Archive directories must be root-owned, mode 0700, without links.')
+    return current
+
+
+def archive_location(value, create=False):
+    parent, name = os.path.split(value)
+    if not name or name in ('.', '..') or any(ord(c) < 32 for c in name):
+        raise PolicyError('Invalid archive path.')
+    private_directory(parent, create)
+    return value
+
+
+def allowed(name, directory):
+    if name in DIRECTORIES:
+        return directory
+    if name in FILES:
+        return not directory
+    if any(name == tree or name.startswith(tree + '/') for tree in TREES):
+        return directory or name not in TREES
+    return (not directory and name.startswith('etc/xray/')
+            and '/' not in name[len('etc/xray/'):] and name.endswith('.log'))
+
+
+def canonical(member, layout):
+    name = member.name.rstrip('/') if member.isdir() else member.name
+    parts = name.split('/')
+    if (not name or len(name) > 512 or '\\' in name
+            or any(ord(c) < 32 or ord(c) == 127 for c in name)
+            or any(p in ('', '.', '..') for p in parts)):
+        raise PolicyError('Unsafe archive path.')
+    if layout in ('etc', 'root'):
+        mapped = name
+    else:
+        if parts[0] != layout:
+            raise PolicyError('Mixed archive layouts.')
+        if len(parts) == 1 and member.isdir():
+            return None
+        tail = '/'.join(parts[1:])
+        top = parts[1] if len(parts) > 1 else ''
+        if top in ('vmess', 'vless', 'trojan', 'shadowsocks') or (len(parts) == 2 and top.endswith('.log')):
+            mapped = 'etc/xray/' + tail
+        elif top in ('ssh', 'passwd', 'group', 'shadow', 'gshadow', 'gerhanatunnel.txt'):
+            mapped = 'etc/' + tail
+        else:
+            raise PolicyError('Unknown legacy archive entry.')
+    if not allowed(mapped, member.isdir()):
+        raise PolicyError('Unknown archive entry.')
+    return mapped
+
+
+def backup_source(name):
+    source = '/' + name
+    info = os.lstat(source)
+    if stat.S_ISLNK(info.st_mode):
+        # Certbot live/*.pem and OpenVPN PKI aliases are commonly file links.
+        # Snapshot only regular targets confined to their own approved tree;
+        # never put a link in the archive or weaken the restore link guard.
+        tree = next((t for t in ('etc/openvpn', 'etc/letsencrypt')
+                     if name.startswith(t + '/')), None)
+        if tree is None:
+            raise PolicyError('Backup contains an unsupported link; review it locally.')
+        resolved = os.path.realpath(source, strict=True)
+        if not resolved.startswith('/' + tree + '/'):
+            raise PolicyError('Backup link leaves its private tree; review it locally.')
+        source, info = resolved, os.lstat(resolved)
+        if not stat.S_ISREG(info.st_mode):
+            raise PolicyError('Only in-tree regular-file links can be snapshotted.')
+    return source, info
+
+
+def backup(destination):
+    archive_location(destination, True)
+    fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW, 0o600)
+    try:
+        count, total = 0, 0
+        with os.fdopen(fd, 'wb') as output, tarfile.open(fileobj=output, mode='w:gz') as archive:
+            sources = list(TREES) + list(FILES)
+            if os.path.isdir('/etc/xray'):
+                sources += ['etc/xray/' + name for name in sorted(os.listdir('/etc/xray')) if name.endswith('.log')]
+            pending = list(reversed(sources))
+            while pending:
+                name = pending.pop()
+                try:
+                    source, info = backup_source(name)
+                except FileNotFoundError:
+                    # Not every protocol is installed on every server.
+                    if name in sources:
+                        continue
+                    raise
+                # Reject names our own restore policy would not accept.
+                probe = tarfile.TarInfo(name)
+                probe.type = tarfile.DIRTYPE if stat.S_ISDIR(info.st_mode) else tarfile.REGTYPE
+                canonical(probe, 'etc')
+                count += 1
+                if count > MAX_ENTRIES:
+                    raise PolicyError('Too many backup entries.')
+                if stat.S_ISDIR(info.st_mode):
+                    if not allowed(name, True):
+                        raise PolicyError('Unknown backup directory.')
+                    item = tarfile.TarInfo(name)
+                    item.type, item.mode, item.mtime = tarfile.DIRTYPE, info.st_mode & 0o777, info.st_mtime
+                    archive.addfile(item)
+                    pending.extend(name + '/' + child for child in reversed(sorted(os.listdir(source))))
+                elif stat.S_ISREG(info.st_mode):
+                    total += info.st_size
+                    if not allowed(name, False) or info.st_size > MAX_FILE or total > MAX_TOTAL:
+                        raise PolicyError('Backup size or entry policy exceeded.')
+                    with os.fdopen(os.open(source, os.O_RDONLY | NOFOLLOW), 'rb') as data:
+                        actual = os.fstat(data.fileno())
+                        if not stat.S_ISREG(actual.st_mode) or (actual.st_dev, actual.st_ino, actual.st_size) != (info.st_dev, info.st_ino, info.st_size):
+                            raise PolicyError('Backup source changed; retry while services are quiet.')
+                        item = tarfile.TarInfo(name)
+                        item.size, item.mode, item.mtime = actual.st_size, actual.st_mode & 0o777, actual.st_mtime
+                        archive.addfile(item, data)
+                else:
+                    raise PolicyError('Backup contains a link or special file; resolve it locally first.')
+            if not count:
+                raise PolicyError('No backup data found.')
+        if os.stat(destination).st_size > MAX_ARCHIVE:
+            raise PolicyError('Compressed archive exceeds policy limit.')
+    except BaseException:
+        os.unlink(destination)
+        raise
+    print('Local backup retained (0600).')
+
+
+def destination_info(name):
+    # Preflight the complete set before writing any privileged destination.
+    current = ''
+    for index, part in enumerate(name.split('/')):
+        current += '/' + part
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(info.st_mode):
+            raise PolicyError('Restore destination contains a link.')
+        if index < len(name.split('/')) - 1 and not stat.S_ISDIR(info.st_mode):
+            raise PolicyError('Restore parent is not a directory.')
+        if index == len(name.split('/')) - 1 and not (stat.S_ISDIR(info.st_mode) or (stat.S_ISREG(info.st_mode) and info.st_nlink == 1)):
+            raise PolicyError('Unsafe restore destination.')
+
+
+def directory_fd(parts):
+    # Directory FDs prevent symlink races while creating/replacing files.
+    fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        current = ''
+        for part in parts:
+            current = current + '/' + part if current else part
+            private = any(current == tree or current.startswith(tree + '/')
+                          for tree in PRIVATE_DIRECTORIES)
+            created = False
+            try:
+                os.mkdir(part, 0o755, dir_fd=fd)
+                created = True
+            except FileExistsError:
+                pass
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | NOFOLLOW, dir_fd=fd)
+            if private:
+                os.fchown(child, 0, 0)
+                os.fchmod(child, 0o700)
+            elif created:
+                # Only structural parents (for example /etc) are public.
+                os.fchmod(child, 0o755)
+            os.close(fd)
+            fd = child
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def install_file(stage, name):
+    parts = name.split('/')
+    parent = directory_fd(parts[:-1])
+    temporary = '.nathaya-restore-' + secrets.token_hex(12)
+    try:
+        try:
+            old = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            old = None
+        if old and (not stat.S_ISREG(old.st_mode) or old.st_nlink != 1):
+            raise PolicyError('Refusing a non-regular restore destination.')
+        # Never inherit public/www-data permissions for DBs, keys or credentials.
+        # passwd/group alone must remain readable by ordinary Unix programs.
+        uid, gid = 0, 0
+        mode = 0o644 if name in ('etc/passwd', 'etc/group') else 0o600
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW, 0o600, dir_fd=parent)
+        with os.fdopen(fd, 'wb') as output, open(os.path.join(stage, name), 'rb') as data:
+            shutil.copyfileobj(data, output, 1024 * 1024)
+            os.fchown(output.fileno(), uid, gid)
+            os.fchmod(output.fileno(), mode)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, parts[-1], src_dir_fd=parent, dst_dir_fd=parent)
+    finally:
+        try:
+            os.unlink(temporary, dir_fd=parent)
+        except FileNotFoundError:
+            pass
+        os.close(parent)
+
+
+def restore(source):
+    archive_location(source)
+    fd = os.open(source, os.O_RDONLY | NOFOLLOW)
+    with os.fdopen(fd, 'rb') as data:
+        info = os.fstat(data.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o077 or info.st_nlink != 1 or info.st_size > MAX_ARCHIVE:
+            raise PolicyError('Use a root-owned, mode 0600 regular archive within size limits.')
+        with tempfile.TemporaryDirectory(prefix='.nathaya-restore-', dir='/root') as stage:
+            names, directories, total, count, layout = set(), set(), 0, 0, None
+            with tarfile.open(fileobj=data, mode='r:gz') as archive:
+                for member in archive:
+                    count += 1
+                    if count > MAX_ENTRIES or member.size < 0 or member.size > MAX_FILE:
+                        raise PolicyError('Archive limit exceeded.')
+                    if not (member.isdir() or member.type in (tarfile.REGTYPE, tarfile.AREGTYPE)) or member.issparse():
+                        raise PolicyError('Links, devices, sparse and other special entries are forbidden.')
+                    if layout is None:
+                        layout = member.name.split('/')[0]
+                        if layout not in ('etc', 'root') and not re.fullmatch(r'(?:\d{1,3}\.){3}\d{1,3}-\d{8}', layout):
+                            raise PolicyError('Unknown archive layout.')
+                    name = canonical(member, layout)
+                    if name is None:
+                        continue
+                    if name in names:
+                        raise PolicyError('Duplicate archive entry.')
+                    names.add(name)
+                    if member.isdir():
+                        if member.size:
+                            raise PolicyError('Invalid directory size.')
+                        directories.add(name)
+                        continue
+                    total += member.size
+                    if total > MAX_TOTAL:
+                        raise PolicyError('Unpacked archive exceeds policy limit.')
+                    target = os.path.join(stage, name)
+                    os.makedirs(os.path.dirname(target), mode=0o700, exist_ok=True)
+                    with archive.extractfile(member) as content, open(target, 'xb') as output:
+                        remaining = member.size
+                        while remaining:
+                            block = content.read(min(1024 * 1024, remaining))
+                            if not block:
+                                raise PolicyError('Truncated archive.')
+                            output.write(block)
+                            remaining -= len(block)
+            files = names - directories
+            if not files:
+                raise PolicyError('Archive has no restorable files.')
+            for name in names:
+                for index in range(1, len(name.split('/'))):
+                    if '/'.join(name.split('/')[:index]) in files:
+                        raise PolicyError('Conflicting archive paths.')
+                destination_info(name)
+                if os.path.lexists('/' + name) and os.path.isdir('/' + name) != (name in directories):
+                    raise PolicyError('Destination type conflict.')
+            for name in sorted(directories, key=lambda p: (p.count('/'), p)):
+                os.close(directory_fd(name.split('/')))
+            for name in sorted(files):
+                install_file(stage, name)
+    print('Restore files written; original archive retained. Private state is root-only (0700/0600).')
+    print('No services started or restarted. Review service access, TLS/link layout and configuration manually.')
+
+
+try:
+    os.umask(0o077)
+    # Bound malicious gzip/PAX metadata parsing as well as payload extraction.
+    resource.setrlimit(resource.RLIMIT_AS, (1024 * 1024 * 1024, 1024 * 1024 * 1024))
+    resource.setrlimit(resource.RLIMIT_CPU, (300, 300))
+    lock = os.open('/run/nathaya-backuprestore.lock', os.O_CREAT | os.O_RDWR | NOFOLLOW, 0o600)
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    action, value = sys.argv[1:]
+    if action == 'check-directory':
+        private_directory(value, True)
+    elif action == 'backup-dir':
+        private_directory(value, True)
+        filename = 'nathaya-' + datetime.datetime.utcnow().strftime('%Y%m%dT%H%M%SZ') + '-' + secrets.token_hex(4) + '.tar.gz'
+        backup(os.path.join(value, filename))
+    elif action == 'backup':
+        backup(value)
+    elif action == 'restore':
+        restore(value)
+except Exception as error:
+    # Do not echo archive-controlled paths, file contents or credentials.
+    if isinstance(error, PolicyError):
+        print(str(error), file=sys.stderr)
+    else:
+        print('Backup/restore failed; check private path, permissions, space, archive and lock.', file=sys.stderr)
+    sys.exit(1)
+PY

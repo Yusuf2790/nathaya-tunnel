@@ -1,0 +1,197 @@
+#!/bin/bash
+
+# Shared presentation and optional Telegram transport installed by Nathaya.
+if [[ -r /opt/nathaya/modules/common/telegram.sh ]]; then
+    source /opt/nathaya/modules/common/telegram.sh
+fi
+if ! declare -F nathaya_account_render >/dev/null; then
+    printf '%s\n' 'Nathaya account presentation module is not installed.' >&2
+    exit 1
+fi
+NATHAYA_ACCOUNT_ACTION=trial
+NATHAYA_ACCOUNT_PROTOCOL=VLESS
+
+# Values below are the upstream connection/display data; formatting is shared.
+nathaya_account_data() {
+    nathaya_account_add 'SERVER INFORMATION' 'CITY' "${city:-}"
+    nathaya_account_add 'SERVER INFORMATION' 'Host' "${domain:-}"
+    nathaya_account_add 'SERVER INFORMATION' 'IP' "${ip:-${IP:-Tidak diketahui}}"
+    nathaya_account_add 'ACCOUNT INFORMATION' 'User' "${user:-}"
+    nathaya_account_add 'ACCOUNT INFORMATION' 'User ID' "${uuid:-}"
+    nathaya_account_add 'ACCOUNT INFORMATION' 'Expired' "${exp:-}"
+    nathaya_account_add 'SERVER INFORMATION' 'Host XrayDNS' "${ns_domain:-}"
+    nathaya_account_add 'CONNECTION INFORMATION' 'TLS Port' "443"
+    nathaya_account_add 'CONNECTION INFORMATION' 'Non-TLS Port' "80, 8080"
+    nathaya_account_add 'CONNECTION INFORMATION' 'DNS Port' "443, 53"
+    nathaya_account_add 'CONNECTION INFORMATION' 'GRPC Port' "443"
+    nathaya_account_add 'CONNECTION INFORMATION' 'Security' "auto"
+    nathaya_account_add 'CONNECTION INFORMATION' 'Network' "WS or gRPC"
+    nathaya_account_add 'CONNECTION INFORMATION' 'Path' "/whatever/vless"
+    nathaya_account_add 'CONNECTION INFORMATION' 'ServiceName' "vless-grpc"
+    nathaya_account_add 'CONNECTION INFORMATION' 'Public Key' "${pubkey:-}"
+    nathaya_account_add 'CONNECTION LINKS' 'TLS Link' "${vless_tls:-}"
+    nathaya_account_add 'CONNECTION LINKS' 'NTLS Link' "${vless_non:-}"
+    nathaya_account_add 'CONNECTION LINKS' 'GRPC Link' "${vless_grpc:-}"
+}
+
+# Valid Script
+ipsaya=$(curl -sS ipv4.icanhazip.com)
+data_server=$(curl -v --insecure --silent https://google.com/ 2>&1 | grep Date | sed -e 's/< Date: //')
+date_list=$(date +"%Y-%m-%d" -d "$data_server")
+
+
+    
+
+# Colors
+red=$'\033[1;31m'
+green=$'\033[1;32m'
+yellow=$'\033[38;5;208m'
+blue=$'\033[1;36m'
+purple=$'\033[1;36m'
+cyan=$'\033[1;36m'
+white=$'\033[1;37m'
+reset=$'\033[0m'
+# Function to print rainbow text
+print_rainbow() {
+    if [[ -t 1 ]]; then printf '\033[1;36m'; fi
+    printf '%s\n' "$1"
+    if [[ -t 1 ]]; then printf '\033[0m'; fi
+}
+
+# Function to send Telegram notification
+
+# Variables
+ip=$(wget -qO- ipv4.icanhazip.com)
+srv_date=$(curl -v --insecure --silent https://google.com/ 2>&1 | grep Date | sed -e 's/< Date: //')
+date=$(date +"%Y-%m-%d" -d "$srv_date")
+ip_url="https://ip.yha.my.id/ip"
+city=$(cat /etc/xray/city 2>/dev/null || echo "Unknown city")
+pubkey=$(cat /etc/slowdns/server.pub 2>/dev/null || echo "Pubkey not available")
+ns_domain=$(cat /etc/xray/dns 2>/dev/null || echo "NS domain not set")
+domain=$(cat /etc/xray/domain 2>/dev/null || hostname -f)
+uuid=$(cat /proc/sys/kernel/random/uuid)
+
+# Loading animation
+echo ""
+echo -ne "${yellow}Preparing Premium Account${reset}"
+for i in {1..2}; do
+    for j in ⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏; do
+        echo -ne "\r${yellow}Preparing Premium Account $j${reset}"
+        sleep 0.1
+    done
+done
+echo -ne "\r${yellow}Premium Account Ready to be created!${reset}\n"
+sleep 1
+clear
+# User data input
+print_rainbow "╭━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+print_rainbow "                     NATHAYA TUNNEL  "
+print_rainbow "                     Input xray/vless account deps"
+print_rainbow "                         Enter User Data       "
+print_rainbow "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+
+# Generate random username
+user=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 8 | head -n 1)
+nathaya_account_require_username "$user" || exit 1
+
+echo "   Username : $user"
+until [[ $duration =~ ^[0-9]+$ ]]; do
+    read -r -p "   Active period (minutes): " duration
+    if [[ -z "$duration" ]]; then
+        echo -e "${red}   Active period cannot be empty${reset}"
+    fi
+done
+
+# Account creation process
+expiration=$(date -d "+$duration minutes" +"%Y-%m-%d %H:%M:%S")
+exp=$(date -d "+$duration minutes" +"%Y-%m-%d %H:%M:%S")
+if [ ! -f "/etc/xray/vless/config.json" ]; then
+    echo "Configuration file not found. Creating new file..."
+    echo '{"inbounds": []}' > /etc/xray/vless/config.json
+fi
+
+if ! sed -i '/#vless$/a\### '"$user $exp"'\
+},{"id": "'""$uuid""'","email": "'""$user""'"' /etc/xray/vless/config.json; then
+    echo -e "${red}Failed to add VLESS WS user to configuration file${reset}"
+    send_telegram_notification "error" "$user" "$duration" "Failed to add VLESS WS user to configuration file"
+    exit 1
+fi
+
+if ! sed -i '/#vlessgrpc$/a\### '"$user $exp"'\
+},{"id": "'""$uuid""'","email": "'""$user""'"' /etc/xray/vless/config.json; then
+    echo -e "${red}Failed to add VLESS gRPC user to configuration file${reset}"
+    send_telegram_notification "error" "$user" "$duration" "Failed to add VLESS gRPC user to configuration file"
+    exit 1
+fi
+
+# Create configuration files
+cat >/etc/xray/$user-tls.json <<EOF
+{
+    "v": "2",
+    "ps": "$user WS (CDN) TLS",
+    "add": "${domain}",
+    "port": "443",
+    "id": "${uuid}",
+    "aid": "0",
+    "net": "ws",
+    "path": "/whatever/vless",
+    "type": "none",
+    "host": "${domain}",
+    "tls": "tls"
+}
+EOF
+
+cat >/etc/xray/$user-non.json <<EOF
+{
+    "v": "2",
+    "ps": "$user WS (CDN) NTLS",
+    "add": "${domain}",
+    "port": "80",
+    "id": "${uuid}",
+    "aid": "0",
+    "net": "ws",
+    "path": "/whatever/vless",
+    "type": "none",
+    "host": "${domain}",
+    "tls": "none"
+}
+EOF
+
+cat >/etc/xray/$user-grpc.json <<EOF
+{
+    "v": "2",
+    "ps": "$user (SNI) GRPC",
+    "add": "${domain}",
+    "port": "443",
+    "id": "${uuid}",
+    "aid": "0",
+    "net": "grpc",
+    "path": "vless-grpc",
+    "type": "none",
+    "host": "${domain}",
+    "tls": "tls"
+}
+EOF
+
+tmux new-session -d -s "trial_vless_$user" "trial trialvl $user $duration"
+# Generate Vless links
+vless_tls="vless://${uuid}@${domain}:443?path=/whatever/vless&security=tls&encryption=none&host=${domain}&type=ws#${user}-WS-TLS"
+vless_non="vless://${uuid}@${domain}:80?path=/whatever/vless&encryption=none&host=${domain}&type=ws#${user}-WS-NTLS"
+vless_grpc="vless://${uuid}@${domain}:443?mode=gun&security=tls&encryption=none&type=grpc&serviceName=vless-grpc&sni=${domain}#${user}-gRPC"
+
+# Send success notification with complete information
+send_telegram_notification "success" "$user" "$duration"
+
+# Restart service
+if ! systemctl restart vless@config > /dev/null 2>&1; then
+    echo -e "${red}Failed to restart vless service. Please check system logs for more information.${reset}"
+    send_telegram_notification "error" "$user" "$duration" "Failed to restart vless service"
+    exit 1
+fi
+
+
+clear
+nathaya_account_render terminal
+read -n 1 -s -r -p "Press [ Enter ] to back on menu"
+menu

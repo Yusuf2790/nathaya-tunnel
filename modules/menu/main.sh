@@ -1,32 +1,51 @@
 #!/bin/bash
 
-# NATHAYA_BASE diwarisi dari menu.sh.
-
-source "$NATHAYA_BASE/modules/common/ui.sh"
-
 show_main_menu() {
-    clear
-    local width
-    width=$(get_width)
-
-    draw_nathaya_header
-    draw_section_title "MAIN MENU" "$width"
-
-    printf "  ${ORANGE}1.${RESET} ${WHITE}SSH${RESET}\n"
-    printf "  ${ORANGE}2.${RESET} ${WHITE}VMESS${RESET}\n"
-    printf "  ${ORANGE}3.${RESET} ${WHITE}VLESS${RESET}\n"
-    printf "  ${ORANGE}4.${RESET} ${WHITE}TROJAN${RESET}\n"
-    printf "  ${ORANGE}5.${RESET} ${WHITE}SETUP BOT${RESET}\n"
-    printf "  ${ORANGE}6.${RESET} ${WHITE}FEATURES${RESET}\n"
-    printf "  ${ORANGE}7.${RESET} ${WHITE}SET BANNER${RESET}\n"
-    printf "  ${ORANGE}8.${RESET} ${WHITE}CHECK BANDWIDTH${RESET}\n"
-    printf "  ${ORANGE}9.${RESET} ${WHITE}CHECK SERVICES${RESET}\n"
-    printf "  ${ORANGE}10.${RESET} ${WHITE}MENU DOMAIN${RESET}\n"
-
-    draw_box_bottom "$width" "$CYAN" "$RESET"
-
-    printf "  ${ORANGE}z.${RESET} ${WHITE}KEMBALI KE DASHBOARD${RESET}\n"
-    printf "  ${RED}x.${RESET} ${WHITE}EXIT${RESET}\n"
-    printf "\n"
+    nathaya_show_menu "MAIN MENU" "SSH" "VMESS" "VLESS" "TROJAN" "SETUP BOT" "FEATURES" "SET BANNER" "CHECK BANDWIDTH" "CHECK SERVICES" "MENU DOMAIN" "SHADOWSOCKS"
 }
 
+main_menu_loop() {
+    local choice status
+    while true; do
+        show_main_menu
+        read -r -p "  Pilih menu: " choice || return 0
+        choice=$(nathaya_normalize_choice "$choice")
+        status=0
+        case "$choice" in
+            1) nathaya_run_command menussh; status=$? ;;
+            2) nathaya_run_command menuvmess; status=$? ;;
+            3) nathaya_run_command menuvless; status=$? ;;
+            4) nathaya_run_command menutrojan; status=$? ;;
+            5) nathaya_features_section telegram; status=$? ;;
+            6) nathaya_run_action features; status=$? ;;
+            7) nathaya_features_section banner; status=$? ;;
+            8) nathaya_features_section bandwidth; status=$? ;;
+            9) nathaya_features_section services; status=$? ;;
+            10) domain_menu_loop; status=$? ;;
+            11) nathaya_run_command menushadowsocks; status=$? ;;
+            z|0) return 0 ;;
+            x|exit|keluar) return 100 ;;
+            *) printf '\n  Pilihan tidak valid.\n'; pause_return; continue ;;
+        esac
+        (( status == 100 )) && return 100
+        (( status != 0 )) && pause_return
+    done
+}
+
+dashboard_loop() {
+    local choice status
+    while true; do
+        [[ -t 1 ]] && clear
+        draw_dashboard_info
+        read -r choice || return 0
+        case "${choice,,}" in
+            menu)
+                main_menu_loop
+                status=$?
+                (( status == 100 )) && return 0
+                ;;
+            x|exit|keluar) return 0 ;;
+            *) printf '\n  Ketik menu atau x.\n'; pause_return ;;
+        esac
+    done
+}

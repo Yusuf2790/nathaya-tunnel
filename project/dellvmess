@@ -1,0 +1,162 @@
+#!/bin/bash
+
+# Shared presentation and optional Telegram transport installed by Nathaya.
+if [[ -r /opt/nathaya/modules/common/telegram.sh ]]; then
+    source /opt/nathaya/modules/common/telegram.sh
+fi
+if ! declare -F nathaya_account_render >/dev/null; then
+    printf '%s\n' 'Nathaya account presentation module is not installed.' >&2
+    exit 1
+fi
+NATHAYA_ACCOUNT_ACTION=delete
+NATHAYA_ACCOUNT_PROTOCOL=VMESS
+
+# Valid Script
+ipsaya=$(curl -sS ipv4.icanhazip.com)
+data_server=$(curl -v --insecure --silent https://google.com/ 2>&1 | grep Date | sed -e 's/< Date: //')
+date_list=$(date +"%Y-%m-%d" -d "$data_server")
+
+
+    
+# colors
+red=$'\033[1;31m'
+green=$'\033[1;32m'
+yellow=$'\033[38;5;208m'
+blue=$'\033[1;36m'
+purple=$'\033[1;36m'
+cyan=$'\033[1;36m'
+white=$'\033[1;37m'
+reset=$'\033[0m'
+# Function to print rainbow text
+print_rainbow() {
+    if [[ -t 1 ]]; then printf '\033[1;36m'; fi
+    printf '%s\n' "$1"
+    if [[ -t 1 ]]; then printf '\033[0m'; fi
+}
+
+# Function to send Telegram notification
+
+# variables
+domain=$(cat /etc/xray/domain 2>/dev/null || hostname -f)
+clear
+nathaya_account_header "DELETE VMESS"
+
+account_count=$(grep -c -E "^### " "/etc/xray/vmess/.vmess.db")
+if [[ ${account_count} == '0' ]]; then
+    echo ""
+    echo "  Tidak ada akun untuk dihapus!"
+    echo ""
+    exit 0
+fi
+
+while true; do
+    echo -e "${yellow}Pilihan:${reset}"
+    echo -e "${green}1) Berdasarkan nomor${reset}"
+    echo -e "${green}2) Ketik username secara manual${reset}"
+    read -r -p "Pilih [ 1-2 ] atau [ x ] untuk batal: " delete_choice
+    
+    if [[ $delete_choice == "1" || $delete_choice == "2" ]]; then
+        break
+    elif [[ $delete_choice =~ ^[xX]$ ]]; then
+        echo -e "${yellow}Batal menghapus akun. Kembali ke menu...${reset}"
+        menuvmess
+        exit 0
+    else
+        echo -e "${red}Pilihan tidak valid! Silakan pilih 1 atau 2.${reset}"
+        echo -e "${yellow}Tekan Enter untuk mencoba lagi...${reset}"
+        read
+        clear
+        nathaya_account_header "DELETE VMESS"
+    fi
+done
+if [[ $delete_choice == "1" ]]; then
+clear
+        nathaya_account_header "DELETE VMESS"
+    echo " ╭────┬━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┬━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╮"
+    echo " │ no │ username           │     exp     │"
+    echo " ├────┼━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┼━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┤"
+    grep -E "^### " "/etc/xray/vmess/.vmess.db" | awk '{
+        cmd = "date -d \"" $3 "\" +%s"
+        cmd | getline exp_timestamp
+        close(cmd)
+        current_timestamp = systime()
+        days_left = int((exp_timestamp - current_timestamp) / 86400)
+        if (days_left < 0) days_left = 0
+        printf " │ %-2d │ %-18s │ %-11s │\n", NR, $2, days_left " days"
+    }'
+    echo " ╰────┴━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┴━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯"
+    
+fi
+
+case $delete_choice in
+    1)
+        until [[ ${account_number} -ge 1 && ${account_number} -le ${account_count} ]]; do
+            read -rp "Pilih nomor akun [1-${account_count}]: " account_number
+        done
+        user=$(grep -E "^### " "/etc/xray/vmess/.vmess.db" | cut -d ' ' -f 2 | sed -n "${account_number}p")
+        nathaya_account_require_username "$user" || exit 1
+        exp=$(grep -E "^### " "/etc/xray/vmess/.vmess.db" | cut -d ' ' -f 3 | sed -n "${account_number}p")
+        echo ""
+        nathaya_account_header "DELETE VMESS"
+        echo -e "Username     : ${green}$user${reset}"
+        echo -e "Expiry       : ${yellow}$exp${reset}"
+        echo ""
+        sleep 2
+        ;;
+    2)
+        while true; do
+            read -rp "Ketik username: " user
+            nathaya_account_require_username "$user" || exit 1
+            if grep -qE "^### $user " "/etc/xray/vmess/.vmess.db"; then
+                exp=$(grep -E "^### $user " "/etc/xray/vmess/.vmess.db" | cut -d ' ' -f 3)
+                echo -e "${green}Username ditemukan: $user (Expiry: $exp)${reset}"
+                break
+            else
+                echo -e "${red}Username '$user' tidak ditemukan!${reset}"
+                echo -e "${yellow}Silakan coba lagi atau tekan Ctrl+C untuk membatalkan.${reset}"
+                echo ""
+            fi
+        done
+        ;;
+    *)
+        echo -e "${red}Error: Pilihan tidak valid${reset}"
+        exit 1
+        ;;
+esac
+
+# Delete user from config and database
+if ! sed -i "/^### $user $exp/,/^},{/d" /etc/xray/vmess/config.json; then
+    echo "Error: Failed to remove user from config.json"
+    send_telegram_notification "error" "$user" "Failed to remove user from config.json"
+    exit 1
+fi
+
+if ! sed -i "/^### $user $exp/d" /etc/xray/vmess/.vmess.db; then
+    echo "Error: Failed to remove user from database"
+    send_telegram_notification "error" "$user" "Failed to remove user from database"
+    exit 1
+fi
+
+# Remove user files
+if [ -f "/etc/xray/vmess/log-create-${user}.log" ]; then
+    rm -f "/etc/xray/vmess/log-create-${user}.log"
+    rm -f "/etc/xray/vmess/${user}-non.json"
+    rm -f "/etc/xray/vmess/${user}-tls.json"
+    rm -f "/etc/xray/vmess/${user}-grpc.json"
+fi
+
+if ! systemctl restart vmess@config >/dev/null 2>&1; then
+    echo "Warning: Failed to restart vmess service. Please check system logs for more information."
+    echo "However, the account has been successfully removed from the database."
+    send_telegram_notification "error" "$user" "Failed to restart vmess service, but account deleted"
+else
+    # Send success notification
+    send_telegram_notification "success" "$user"
+fi
+
+clear
+nathaya_account_render terminal
+read -n 1 -s -r -p "Tekan [ Enter ] untuk kembali ke menu"
+menuvmess
+
+

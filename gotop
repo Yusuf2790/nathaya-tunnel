@@ -1,0 +1,10 @@
+#!/bin/bash
+# Monitoring command only: never upgrade the OS or download code from a menu.
+set -euo pipefail
+if [[ -x /usr/local/bin/gotop && /usr/local/bin/gotop -ef "$0" ]]; then
+    printf "%s\n" "Recursive gotop wrapper; use top." >&2
+    exit 1
+fi
+if [[ -x /usr/local/bin/gotop ]]; then exec /usr/local/bin/gotop "$@"; fi
+if command -v htop >/dev/null 2>&1; then exec htop "$@"; fi
+exec top "$@"

@@ -1,0 +1,207 @@
+#!/bin/bash
+
+# Shared presentation and optional Telegram transport installed by Nathaya.
+if [[ -r /opt/nathaya/modules/common/telegram.sh ]]; then
+    source /opt/nathaya/modules/common/telegram.sh
+fi
+if ! declare -F nathaya_account_render >/dev/null; then
+    printf '%s\n' 'Nathaya account presentation module is not installed.' >&2
+    exit 1
+fi
+NATHAYA_ACCOUNT_ACTION=create
+NATHAYA_ACCOUNT_PROTOCOL=SSH
+
+# Values below are the upstream connection/display data; formatting is shared.
+nathaya_account_data() {
+    nathaya_account_add 'SERVER INFORMATION' 'CITY' "${city:-}"
+    nathaya_account_add 'SERVER INFORMATION' 'Host' "${domain:-}"
+    nathaya_account_add 'SERVER INFORMATION' 'IP' "${ip:-}"
+    nathaya_account_add 'ACCOUNT INFORMATION' 'User' "${user:-}"
+    nathaya_account_add 'ACCOUNT INFORMATION' 'Pass' "${passwd:-}"
+    nathaya_account_add 'ACCOUNT INFORMATION' 'Expired' "${exp:-}"
+    nathaya_account_add 'CONNECTION INFORMATION' 'OpenSSH Port' "2222, 2223 (SSH administrator tetap)"
+    nathaya_account_add 'CONNECTION INFORMATION' 'UDP Custom Port' "2100"
+    nathaya_account_add 'CONNECTION INFORMATION' 'SlowDNS' "Tidak dipasang"
+    nathaya_account_add 'CONNECTION INFORMATION' 'Dropbear Port' "109, 143"
+    nathaya_account_add 'CONNECTION INFORMATION' 'SSH WS Port' "80, 8080"
+    nathaya_account_add 'CONNECTION INFORMATION' 'SSH SSL WS Port' "443"
+    nathaya_account_add 'CONNECTION INFORMATION' 'SSL/TLS Port' "443"
+    nathaya_account_add 'CONNECTION INFORMATION' 'OVPN SSL Port' "443"
+    nathaya_account_add 'CONNECTION INFORMATION' 'OVPN TCP Port' "1194"
+    nathaya_account_add 'CONNECTION INFORMATION' 'OVPN UDP Port' "2200"
+    nathaya_account_add 'CONNECTION INFORMATION' 'BadVPN UDP' "Loopback 7100, 7200, 7300"
+
+    nathaya_account_add 'PAYLOAD HTTP' 'Payload' "GET wss://BUG.COM/ HTTP/1.1[crlf]Host: ${domain:-}[crlf]Upgrade: websocket[crlf][crlf]"
+    nathaya_account_add 'CONNECTION LINKS' 'OpenVPN Profiles' "Minta operator mengirim profil dari /root/nathaya-clients secara privat"
+    nathaya_account_add 'CONNECTION LINKS' 'Account Delivery' "Simpan detail akun melalui kanal privat; tidak ada URL publik"
+}
+
+# Color definitions
+red=$'\033[1;31m'
+green=$'\033[1;32m'
+yellow=$'\033[38;5;208m'
+reset=$'\033[0m'
+# Valid Script
+ipsaya=$(curl -sS ipv4.icanhazip.com)
+data_server=$(curl -v --insecure --silent https://google.com/ 2>&1 | grep Date | sed -e 's/< Date: //')
+date_list=$(date +"%Y-%m-%d" -d "$data_server")
+
+# Variables
+ip=$(wget -qO- ipv4.icanhazip.com)
+city=$(cat /etc/xray/city 2>/dev/null || echo "Unknown city")
+pubkey=$(cat /etc/slowdns/server.pub 2>/dev/null || echo "Pubkey not available")
+domain=$(cat /etc/xray/domain 2>/dev/null || hostname -f)
+
+clear
+nathaya_account_header "CREATE SSH ACCOUNT"
+
+while true; do
+    read -r -p "   Name: " user
+    nathaya_account_require_username "$user" || exit 1
+    if [[ ${#user} -lt 3 || ! "$user" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_-]*$ ]]; then
+        printf "\033[1A\033[0J"
+        echo -e "${red}Nama tidak boleh kurang dari 3 karakter dan hanya boleh mengandung huruf, angka, garis bawah, dan tanda hubung.${reset}"
+        continue
+    fi
+    if grep -q "^### $user " /etc/ssh/.ssh.db; then
+        random_number=$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 5)
+        user="${random_number}${user}"
+        echo -e "${yellow}   Nama sudah digunakan, menggunakan$user${reset}"
+        break
+    else
+        break
+    fi
+done
+echo ""
+echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "   Username : $user"
+while true; do
+    read -r -p "   Password/UUID: " passwd
+    if [[ -z "$passwd" ]]; then
+        echo -e "${red}   Password/UUID tidak boleh kosong${reset}"
+    else
+        break
+    fi
+done
+
+while true; do
+    read -r -p "   Masa aktif (hari): " expired
+    if [[ -z "$expired" ]]; then
+        echo -e "${red}   Masa aktif tidak boleh kosong${reset}"
+    elif ! [[ $expired =~ ^[0-9]+$ ]]; then
+        echo -e "${red}   Masa aktif harus berupa angka${reset}"
+    elif [[ $expired -lt 1 ]]; then
+        echo -e "${red}   Masa aktif harus minimal 1 hari${reset}"
+    else
+        break
+    fi
+done
+
+while true; do
+    read -r -p "   Batas Pengguna (IP): " iplim
+    if [[ -z "$iplim" ]]; then
+        echo -e "${red}   Batas Pengguna (IP) tidak boleh kosong${reset}"
+    elif ! [[ $iplim =~ ^[0-9]+$ ]]; then
+        echo -e "${red}   Batas Pengguna (IP) harus berupa angka${reset}"
+    elif [[ $iplim -lt 1 ]]; then
+        echo -e "${red}   Batas Pengguna (IP) harus minimal 1${reset}"
+    else
+        break
+    fi
+done
+
+# Function to send Telegram notification
+
+# Account creation process
+exp=$(date -d "$expired days" +"%Y-%m-%d %H:%M:%S")
+if ! useradd -e $(date -d "$expired days" +"%Y-%m-%d") -s /bin/false -M $user; then
+    echo -e "${red}Failed to create user account${reset}"
+    send_telegram_notification "error" "$user" "Failed to create user account"
+    exit 1
+fi
+exp_system="$(chage -l $user | grep "Account expires" | awk -F": " '{print $2}')"
+if ! echo -e "$passwd\n$passwd\n" | passwd $user &>/dev/null; then
+    echo -e "${red}Failed to set user password${reset}"
+    send_telegram_notification "error" "$user" "Failed to set user password"
+    exit 1
+fi
+
+if [[ $iplim != "0" ]]; then
+    echo "${iplim}" >/etc/ssh/${user}
+fi
+echo "### ${user} ${exp}" >>/etc/ssh/.ssh.db
+
+# Send success notification to Telegram
+send_telegram_notification "success" "$user"
+
+# Create configuration file
+cat >/var/www/html/ssh-$user.txt <<END
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SSH OVPN Account Details
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Username         : $user
+Password         : $passwd
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+IP               : $ip
+Host             : $domain
+SlowDNS          : Tidak dipasang
+Location         : $city
+OpenSSH Port     : 2222, 2223 (SSH administrator tetap)
+UDP Custom Port  : 2100
+Dropbear Port    : 109, 143
+Dropbear WS Port : HTTP80/8080, HTTPS443
+SSH WS Port      : 80, 8080
+SSH SSL WS Port  : 443
+SSL/TLS Port     : 443
+OVPN WS SSL Port : 443
+OVPN SSL Port    : 443
+OVPN TCP Port    : 1194
+OVPN UDP Port    : 2200
+BadVPN UDP       : Loopback 7100, 7200, 7300
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WSS Payload: GET wss://BUG.COM/ HTTP/1.1[crlf]Host: $domain[crlf]Upgrade: websocket[crlf][crlf]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OpenVPN Profiles : Transfer privat dari /root/nathaya-clients
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Expiration       : $exp
+END
+
+
+
+# Save log
+{
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "SSH OVPN Account"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "Username         : $user"
+    echo "Password         : $passwd"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "IP               : $ip"
+    echo "Host             : $domain"    
+    echo "Location         : $city"
+    echo "OpenSSH Port     : 2222, 2223 (SSH administrator tetap)"
+    echo "UDP Custom Port  : 2100"
+    echo "SlowDNS          : Tidak dipasang"
+    echo "Dropbear Port    : 109, 143"
+    echo "SSH WS Port      : 80, 8080"
+    echo "SSH SSL WS Port  : 443"
+    echo "SSL/TLS Port     : 443"
+    echo "OVPN SSL Port    : 443"
+    echo "OVPN TCP Port    : 1194"
+    echo "OVPN UDP Port    : 2200"
+    echo "Squid Proxy      : Tidak dipasang"
+    echo "BadVPN UDP       : Loopback 7100, 7200, 7300"
+    echo "SlowDNS Key      : Tidak tersedia (receiver tidak dipasang)"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "WSS Payload      : GET wss://BUG.COM/ HTTP/1.1[crlf]Host: $domain[crlf]Upgrade: websocket[crlf][crlf]"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "OpenVPN Profiles : Transfer privat dari /root/nathaya-clients"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "Account Delivery : Kanal privat; tidak ada URL publik"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "Expiration       : $exp"
+    echo ""
+} >>/etc/xray/log-createssh-${user}.log
+
+clear
+nathaya_account_render terminal
