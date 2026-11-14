@@ -38,8 +38,7 @@ nt_os_maintenance() {
         nt_apt -y "$action" > "$NT_RUN/apt-$action.result" 2>&1
         if [[ "$NT_SSH_EXISTED" == 1 ]]; then /usr/sbin/sshd -t; nt_verify_preserved_ssh; fi
     done
-    NT_SSH_START_BEFORE="$(systemctl show ssh.service -p ExecMainStartTimestampMonotonic --value 2>/dev/null || true)"
-    NT_SOCKET_IDENTITY_BEFORE="$(systemctl show ssh.socket -p ActiveEnterTimestampMonotonic -p InvocationID -p Listen 2>/dev/null || true)"
+    nt_ssh_accept_post_os_identity || return 1
     NT_OS_MAINTENANCE=0
 }
 nt_dependencies() {

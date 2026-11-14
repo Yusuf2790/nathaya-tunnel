@@ -184,41 +184,156 @@ expect_fail nt_restore_policy
 grep -q 'administrator replacement' "$policy" || fail 'unrelated policy overwritten'
 NT_POLICY_ACTIVE=0
 
-# Read-only SSH state comparisons with fixture providers, never a real systemctl.
+# SSH preservation: strict fixture providers only, NEVER a real systemctl/worker.
 (
+    NT_SOURCE="$project" NT_RUN="$work/ssh-preserve" NT_OS_MAINTENANCE=0
+    mkdir -m 700 -- "$NT_RUN"
     nt_package_installed() { [[ "$1" == openssh-server ]]; }
-    service_state=active socket_state=inactive service_enabled=enabled socket_enabled=disabled
-    service_stamp=123 socket_identity=socket-one socket_listen='[::]:22 (Stream)'
-    NT_OS_MAINTENANCE=0  # identity preservation is mandatory outside explicit OS maintenance
-    nt_unit_active() { if [[ "$1" == ssh.service ]]; then printf '%s' "$service_state"; else printf '%s' "$socket_state"; fi; }
-    nt_unit_enabled() { if [[ "$1" == ssh.service ]]; then printf '%s' "$service_enabled"; else printf '%s' "$socket_enabled"; fi; }
+    service_state=active socket_state=active service_enabled=enabled socket_enabled=enabled
+    service_stamp=123 socket_stamp=321 socket_identity=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    socket_listen=$'0.0.0.0:22 (Stream)\n[::]:22 (Stream)\n'
+    query_fail='' query_partial='' fingerprint='fixture fingerprint'
     systemctl() {
-        case "$*" in
-            'show ssh.service -p ExecMainStartTimestampMonotonic --value') printf '%s' "$service_stamp" ;;
-            'show ssh.socket -p ActiveEnterTimestampMonotonic -p InvocationID -p Listen') printf '%s' "$socket_identity" ;;
-            'show ssh.socket -p Listen --value') printf '%s' "$socket_listen" ;;
-            *) fail 'unexpected systemctl mock request' ;;
+        [[ $# == 5 && "$1" == show && "$3" == -p && "$5" == --value ]] || fail 'unexpected systemctl mock request'
+        printf '%s\n' "$2/$4" >> "$NT_RUN/queries"
+        if [[ "$2/$4" == "$query_fail" ]]; then printf '%s' "$query_partial"; return 44; fi
+        case "$2/$4" in
+            ssh.service/ActiveState) printf '%s\n' "$service_state" ;;
+            ssh.socket/ActiveState) printf '%s\n' "$socket_state" ;;
+            ssh.service/UnitFileState) printf '%s\n' "$service_enabled" ;;
+            ssh.socket/UnitFileState) printf '%s\n' "$socket_enabled" ;;
+            ssh.service/ExecMainStartTimestampMonotonic) printf '%s\n' "$service_stamp" ;;
+            ssh.socket/ActiveEnterTimestampMonotonic) printf '%s\n' "$socket_stamp" ;;
+            ssh.socket/InvocationID) printf '%s\n' "$socket_identity" ;;
+            ssh.socket/Listen) printf '%s' "$socket_listen" ;;
+            *) fail 'unexpected systemctl property' ;;
         esac
     }
-    nt_ssh_config_fingerprint() { printf 'fixture fingerprint\n'; }
+    nt_ssh_config_fingerprint() { printf '%s\n' "$fingerprint"; }
     nt_ssh_config_fingerprint > "$NT_RUN/ssh-config-before"
     nt_ssh_snapshot
-    nt_verify_preserved_ssh
+    original_raw="$NT_SOCKET_LISTEN_BEFORE" original_identity="$NT_SOCKET_IDENTITY_BEFORE"
+    printf '%s' "$original_raw" > "$NT_RUN/expected.raw"
+    queries_before="$(wc -l < "$NT_RUN/queries")"
+    # Change the PROVIDER before persistence: persistence must not recollect it.
+    socket_listen=$'[::]:22 (Stream)\n0.0.0.0:22 (Stream)\n'
+    nt_ssh_persist_baseline
+    [[ "$(wc -l < "$NT_RUN/queries")" == "$queries_before" ]] || fail 'persistence recaptured baseline'
+    cmp -s -- "$NT_RUN/expected.raw" "$NT_RUN/ssh-listen-before.raw" || fail 'raw baseline/newlines changed'
+    (
+        # Model exactly the fork boundary, not nt_worker or setup's install main.
+        nt_ssh_assert_baseline
+        [[ "$NT_SOCKET_LISTEN_BEFORE" == "$original_raw" ]] || fail 'worker lost preflight listener'
+        nt_verify_preserved_ssh
+        printf 'inherited\n' > "$NT_RUN/worker-fixture"
+    )
+    [[ -f "$NT_RUN/worker-fixture" ]] || fail 'worker fixture did not verify'
+    cmp -s -- "$NT_RUN/ssh-listen-before.canonical.json" "$NT_RUN/ssh-listen-after-1.canonical.json" || fail 'order changed canonical set'
+    if cmp -s -- "$NT_RUN/ssh-listen-before.raw" "$NT_RUN/ssh-listen-after-1.raw"; then fail 'raw order fixture was not changed'; fi
+    NT_SSH_VERIFY_SEQ=1  # The fixture child has its own shell counter, like any fork.
+    socket_listen=$' \t[::]:22\t( Stream ) \n\t0.0.0.0:22   (Stream) \n\n'
+    nt_verify_preserved_ssh  # Equal whitespace AND identity outside maintenance.
     service_stamp=456
     expect_fail nt_verify_preserved_ssh
-    service_state=inactive socket_state=active
-    nt_ssh_snapshot
+    service_stamp=123
+    socket_identity=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    expect_fail nt_verify_preserved_ssh
+    socket_identity=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa socket_stamp=654
+    expect_fail nt_verify_preserved_ssh
+    socket_stamp=321
+
+    # OS may restart units, but must pass ALL guards before expected IDs advance.
+    NT_OS_MAINTENANCE=1
+    service_stamp=456 socket_stamp=654 socket_identity=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    nt_ssh_accept_post_os_identity
+    [[ "$NT_SSH_START_BEFORE" == 123 && "$NT_SOCKET_IDENTITY_BEFORE" == "$original_identity" ]] || fail 'OS overwrote original identity'
+    [[ "$NT_SSH_START_EXPECTED" == 456 && "$NT_SOCKET_IDENTITY_EXPECTED" != "$original_identity" ]] || fail 'post-OS identity not accepted'
+    NT_OS_MAINTENANCE=0
+    socket_listen="$original_raw"  # A second representation change after OS.
     nt_verify_preserved_ssh
-    socket_identity=socket-two
+    socket_identity=cccccccccccccccccccccccccccccccc
     expect_fail nt_verify_preserved_ssh
-    socket_identity=socket-one
-    socket_listen='[::]:2222 (Stream)'
+    socket_identity=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+
+    for socket_listen in \
+        '0.0.0.0:22 (Stream)' \
+        '[::]:22 (Stream)' \
+        '127.0.0.1:22 (Stream) [::]:22 (Stream)' \
+        '0.0.0.0:22 (Stream) [::1]:22 (Stream)' \
+        '0.0.0.0:22 (Datagram) [::]:22 (Stream)' \
+        '0.0.0.0:22 (Stream) [::]:22 (Stream) 127.0.0.1:23 (Stream)' \
+        '' '   ' 'unparsed data' \
+        '0.0.0.0:2222 (Stream) [::]:22 (Stream)'; do
+        expect_fail nt_verify_preserved_ssh
+    done
+    diff="$NT_RUN/ssh-listen-after-${NT_SSH_VERIFY_SEQ}.diff.json"
+    grep -Fq '"removed":[' "$diff" || fail 'missing removed-listener diagnostic'
+    grep -Fq '"added":[' "$diff" || fail 'missing added-listener diagnostic'
+    grep -Fq '"port":2222' "$diff" || fail 'missing changed-port diagnostic'
+    socket_listen="$original_raw"
+    for query_fail in ssh.socket/Listen ssh.service/ActiveState ssh.socket/ActiveState \
+        ssh.service/UnitFileState ssh.socket/UnitFileState ssh.service/ExecMainStartTimestampMonotonic \
+        ssh.socket/ActiveEnterTimestampMonotonic ssh.socket/InvocationID; do
+        query_partial=''
+        expect_fail nt_verify_preserved_ssh
+    done
+    query_fail=ssh.socket/Listen query_partial="$original_raw"
+    expect_fail nt_verify_preserved_ssh  # Valid-looking partial output, exit 44.
+    query_fail='' query_partial=''
+    socket_enabled=disabled
     expect_fail nt_verify_preserved_ssh
-    socket_listen='[::]:22 (Stream)'
-    socket_enabled=enabled
+    socket_enabled=enabled service_enabled=disabled
     expect_fail nt_verify_preserved_ssh
-    service_state=inactive socket_state=inactive
-    expect_fail nt_ssh_snapshot
+    service_enabled=enabled socket_state=inactive
+    expect_fail nt_verify_preserved_ssh
+    socket_state=active fingerprint='changed authentication/config fingerprint'
+    expect_fail nt_verify_preserved_ssh
+    fingerprint='fixture fingerprint'
+
+    # Lost/corrupt inherited values must FAIL, never become a fresh baseline.
+    ( unset NT_SOCKET_LISTEN_BEFORE; expect_fail nt_ssh_assert_baseline )
+    ( unset NT_SSH_BASELINE_READY; expect_fail nt_ssh_assert_baseline )
+    (
+        NT_SOCKET_LISTEN_BEFORE='127.0.0.1:2222 (Stream)'
+        NT_SOCKET_CANON_BEFORE="$(printf '%s' "$NT_SOCKET_LISTEN_BEFORE" | nt_ssh_listener_tool canonical-ssh-listeners)"
+        expect_fail nt_ssh_assert_baseline
+    )
+    ( socket_listen=''; expect_fail nt_ssh_snapshot; [[ "$NT_SSH_BASELINE_READY" == 0 ]]; expect_fail nt_ssh_persist_baseline )
+    ( query_fail=ssh.socket/Listen query_partial="$original_raw"; expect_fail nt_ssh_snapshot; [[ "$NT_SSH_BASELINE_READY" == 0 ]] )
+    ( socket_stamp=''; expect_fail nt_ssh_snapshot )
+    ( service_state=inactive socket_state=inactive; expect_fail nt_ssh_snapshot )
+    # A failed preservation check must also prevent post-OS identity acceptance.
+    (
+        NT_OS_MAINTENANCE=1 socket_listen='127.0.0.1:2222 (Stream)'
+        saved_expected="$NT_SOCKET_IDENTITY_EXPECTED" saved_start="$NT_SSH_START_EXPECTED"
+        expect_fail nt_ssh_accept_post_os_identity
+        [[ "$NT_SOCKET_IDENTITY_EXPECTED" == "$saved_expected" && "$NT_SSH_START_EXPECTED" == "$saved_start" ]] || fail 'failed OS guard accepted identity'
+    )
+    for dropped_service in inactive failed; do
+        (
+            NT_OS_MAINTENANCE=1 service_state="$dropped_service"
+            saved_expected="$NT_SOCKET_IDENTITY_EXPECTED" saved_start="$NT_SSH_START_EXPECTED"
+            expect_fail nt_ssh_accept_post_os_identity
+            [[ "$NT_SOCKET_IDENTITY_EXPECTED" == "$saved_expected" && "$NT_SSH_START_EXPECTED" == "$saved_start" ]] || fail 'inactive service advanced post-OS identities'
+        )
+    done
+    nt_ssh_assert_baseline
+    cmp -s -- "$NT_RUN/expected.raw" "$NT_RUN/ssh-listen-before.raw" || fail 'baseline raw overwritten'
+    [[ "$(stat -c %a -- "$NT_RUN")" == 700 ]] || fail 'SSH run directory not private'
+    for artifact in "$NT_RUN"/ssh-*; do
+        [[ "$(stat -c %a -- "$artifact")" == 600 ]] || fail 'SSH snapshot not private'
+    done
+    # Existing service-only admin still works; only INACTIVE socket may be empty.
+    (
+        NT_RUN="$work/ssh-service-only" socket_state=inactive socket_listen=''
+        mkdir -m 700 -- "$NT_RUN"
+        nt_ssh_config_fingerprint > "$NT_RUN/ssh-config-before"
+        nt_ssh_snapshot
+        nt_ssh_persist_baseline
+        nt_verify_preserved_ssh
+        service_stamp=789
+        expect_fail nt_verify_preserved_ssh
+    )
 )
 
 # Simulate a late code-copy failure: runtime contents still must be untouched.

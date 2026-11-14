@@ -202,6 +202,38 @@ class SourceContractTests(Isolated):
         self.assertLess(countdown.index("nt_can_reboot "), countdown.index("for ((remaining="))
         self.assertLess(countdown.index("    nt_finalize_success\n"), countdown.index("    systemctl reboot\n"))
 
+    def test_static_ssh_preflight_baseline_reaches_worker(self):
+        # No live worker/installer calls: inheritance is exercised by installer.sh.
+        setup = (REPO / "setup.sh").read_text()
+        main = setup.split("nt_setup_main() {\n", 1)[1]
+        self.assertLess(main.index("    nt_preflight\n"), main.index("    nt_ssh_persist_baseline\n"))
+        self.assertLess(main.index('NT_RUN="$(mktemp -d '), main.index("    nt_ssh_persist_baseline\n"))
+        fork = main.index('( NT_LOCK_HELD=1; nt_worker )')
+        self.assertLess(main.index("    nt_ssh_persist_baseline\n"), fork)
+        self.assertNotIn("nt_ssh_snapshot", main)
+        worker = setup.split("nt_worker() {\n", 1)[1].split("\nnt_setup_main() {", 1)[0]
+        self.assertLess(worker.index("    nt_ssh_assert_baseline\n"), worker.index("    nt_run_stage staging"))
+        self.assertLess(worker.index("    nt_ssh_assert_baseline\n"), worker.index("    NT_OS_MAINTENANCE=1"))
+        self.assertNotIn("nt_ssh_snapshot", worker)
+        self.assertIn("    nt_ssh_snapshot\n", (REPO / "installer/preflight.sh").read_text())
+        dependencies = (REPO / "installer/dependencies.sh").read_text()
+        self.assertNotIn("NT_SOCKET_IDENTITY_BEFORE=", dependencies)
+        self.assertNotIn("NT_SSH_START_BEFORE=", dependencies)
+        self.assertLess(dependencies.index("    nt_ssh_accept_post_os_identity || return 1"),
+                        dependencies.index("    NT_OS_MAINTENANCE=0"))
+        ssh = (REPO / "installer/openssh.sh").read_text()
+        identity = ssh.split("nt_ssh_read_identity() {\n", 1)[1].split("\nnt_ssh_snapshot()", 1)[0]
+        self.assertIn("nt_ssh_scalar_to ssh.socket ActiveEnterTimestampMonotonic", identity)
+        self.assertIn("nt_ssh_scalar_to ssh.socket InvocationID", identity)
+        self.assertNotIn("ssh.socket Listen", identity)
+        self.assertNotIn("-p Listen)", ssh)
+        differing = ssh.split("                if (( _nt_rc == 1 )); then\n", 1)[1].split("                else\n", 1)[0]
+        self.assertLess(differing.index('                    cat -- "$NT_RUN/$_nt_prefix.diff.json"'),
+                        differing.index('                    nt_error "Kumpulan listener'))
+        acceptance = ssh.split("nt_ssh_accept_post_os_identity() {\n", 1)[1].split("\n\nnt_openssh_keys()", 1)[0]
+        self.assertLess(acceptance.index("    nt_verify_preserved_ssh || return 1"),
+                        acceptance.index("    NT_SSH_START_EXPECTED="))
+
     def test_policy_never_accepts_runtime_or_secret_paths(self):
         for name in ("config/config.conf", "data/ssh/accounts.db", "logs/fixture.log",
                      "keys/fixture.key", "updater/secrets/fixture.json", "tools/fixture.pem"):

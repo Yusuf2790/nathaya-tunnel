@@ -18,7 +18,7 @@ for test in foundation.sh installer.sh expiry.sh full.sh; do
 done
 # -I isolates imports/environment; -B prevents import-created __pycache__.
 # integration_test.py additionally compiles every Python source in memory.
-for test in update_test.py services_test.py openvpn_test.py integration_test.py; do
+for test in update_test.py services_test.py ssh_listeners_test.py openvpn_test.py integration_test.py; do
     printf 'Offline Python fixture: %s\n' "$test"
     "${clean[@]}" python3 -I -B "$project/tests/$test"
 done

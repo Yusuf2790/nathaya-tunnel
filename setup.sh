@@ -105,6 +105,7 @@ nt_worker() {
     printf 'NATHAYA TUNNEL %s | Ubuntu 24.04 amd64 | IP=%s | domain=%s | profile=%s\n' "$(cat "$NT_SOURCE/VERSION")" "$NT_PUBLIC_IP" "$NT_DOMAIN" "$NT_PROFILE"
     local stage
     for stage in staging OS dependencies firewall host-keys runtime TLS Xray proxies maintenance verification; do NT_STAGE="$stage"; nt_state MENUNGGU; done
+    nt_ssh_assert_baseline
     nt_run_stage staging nt_stage_source
     NT_OS_MAINTENANCE=1
     nt_run_stage OS nt_os_maintenance
@@ -168,6 +169,7 @@ nt_setup_main() {
     nt_directory /opt/nathaya 755
     nt_directory /opt/nathaya/logs 700
     NT_RUN="$(mktemp -d /var/backups/nathaya-tunnel/run.XXXXXXXX)"
+    nt_ssh_persist_baseline
     python3 -I -B "$NT_SOURCE/installer/state.py" prepare "$NT_SOURCE" "$NT_RUN/updater-before.json"
     NT_LOG="/opt/nathaya/logs/install-$(date -u +%Y%m%dT%H%M%SZ)-$$.log"
     nt_private_file "$NT_LOG"
