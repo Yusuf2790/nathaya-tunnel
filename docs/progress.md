@@ -46,4 +46,13 @@
 - Belum dijalankan: git status/diff/diff --check, bash -n, Python/test suite, build artifact, download updater, installer dan uji VPS. Tools sesi ini tidak menyediakan eksekusi Bash/Python/Git. Working tree tidak diklaim clean dan seluruh perubahan pengguna tetap dipertahankan.
 - Langkah pengguna: dari source tepercaya jalankan `bash tests/run-local.sh`, lalu `git diff --check` dan `git status --short`; tinjau untracked secara terpisah. Setelah PASS dan backup/konsol siap, uji core pada VPS disposable sesuai docs/install.md. Full tetap BLOCKED; jangan mengedit gate agar terlihat sukses. Updater/auto-update belum diuji dan timer tidak diaktifkan installer.
 
+## 7 — Perbaikan mock expiry berdasarkan trace VPS
+
+- Penyebab: source Renew/Lock/Unlock di cabang UI memuat ulang account-db.sh setelah mock dipasang, sehingga ssh_db_init asli aktif lagi (FORBIDDEN install), dan wrapper ssh_db_update_status juga tertimpa. Ini masalah urutan fixture, bukan alasan mengubah produksi.
+- Perubahan: seluruh lima source fixture sekarang selesai sebelum salinan implementasi DB dan mock final dipasang. Assertion source tanpa DB/write/operasi tetap ada dan diperluas ke seluruh modul; chown/chmod tetap mock tanpa operasi asli, dengan pencatatan trace. Guard install dan operasi akun tetap dipertahankan.
+- Penguatan: identitas fungsi mock penting diperiksa sebelum batas/cabang UI dan setiap pemanggilan UI; negative check membuktikan penggantian init dan status tanpa lock terdeteksi tanpa menjalankan fungsi pengganti. Satu perubahan passwd mock untuk Lock/Unlock dicatat eksplisit; guard DB tidak berubah. Trace UI harus menunjukkan wrapper status terkunci benar-benar dipanggil.
+- Cakupan tetap: Renew P/L/NP, metadata lock 123, Lock/Unlock, expiry tepat timestamp, UID terkelola, gagal lock/chage/DB, winning renewal dan expiry race; tidak ada assertion lama dihapus.
+- File diubah hanya tests/expiry.sh dan dokumen ini. Pemeriksaan aktual: review source serta kontrak statis JavaScript (semua source sebelum mock, wrapper lock/guard tetap, tidak ada source UI terlambat, kasus regresi tetap, tidak ada trailing whitespace). Bash/Git tidak tersedia, sehingga bash -n dan test belum dijalankan; tidak ada klaim PASS atau uji VPS baru.
+- Pengguna dapat menjalankan dari source VPS: `bash -n tests/expiry.sh && bash tests/expiry.sh`. Cabang UI tetap root-gated dan di-SKIP pada non-root; operasi akun di dalam fixture tetap seluruhnya mock.
+
 Tidak ada installer, apt, layanan/firewall/akun, reboot, commit/push/publish yang dijalankan selama pengembangan.

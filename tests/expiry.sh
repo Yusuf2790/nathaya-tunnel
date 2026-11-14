@@ -26,8 +26,8 @@ for cmd in useradd userdel chpasswd curl wget systemctl reboot shutdown ssh-keyg
 done
 # Initialization/ownership helpers are mocked; never change host ownership.
 install() { deny install; }
-chown() { :; }
-chmod() { :; }
+chown() { record_call "chown $*"; }
+chmod() { record_call "chmod $*"; }
 touch() { deny touch; }
 
 MOCK_OP_HELD=0
@@ -122,6 +122,12 @@ passwd() {
 source "$project/modules/maintenance/ssh-expire.sh"
 [[ ! -e "$NATHAYA_SSH_DB" && ! -s "$trace" ]] || fail 'source had side effects'
 source "$project/modules/ssh/account-db.sh"
+# UI modules source account-db.sh again. Load ALL tested modules before taking
+# the real implementation snapshot and installing the final DB mocks below.
+source "$project/modules/ssh/renew.sh"
+source "$project/modules/ssh/lock.sh"
+source "$project/modules/ssh/unlock.sh"
+[[ ! -e "$NATHAYA_SSH_DB" && ! -s "$trace" ]] || fail 'tested module source had side effects'
 # Retain real DB update implementation, with safe ownership mocks above.
 eval "$(declare -f ssh_db_update_status | sed '1s/ssh_db_update_status/fixture_real_update_status/')"
 ssh_db_update_status() {
@@ -131,6 +137,27 @@ ssh_db_update_status() {
     fixture_real_update_status "$@"
 }
 ssh_db_init() { record_call init; }
+# Capture identities only AFTER the last production source. A later source must
+# not silently replace fixture initialization or the operations.lock wrapper.
+declare -A fixture_mock_definitions=()
+for fixture_function in ssh_db_init ssh_db_update_status fixture_real_update_status \
+    flock install chown chmod touch chage pkill passwd useradd userdel chpasswd \
+    curl wget systemctl reboot shutdown ssh-keygen getent id date; do
+    fixture_mock_definitions["$fixture_function"]="$(declare -f "$fixture_function")"
+done
+unset fixture_function
+assert_fixture_mocks() {
+    local name
+    for name in "${!fixture_mock_definitions[@]}"; do
+        declare -F "$name" >/dev/null || fail "fixture function missing: $name"
+        [[ "$(declare -f "$name")" == "${fixture_mock_definitions[$name]}" ]] || fail "fixture function replaced: $name"
+    done
+}
+assert_fixture_mocks
+# Detect both overwrite classes without calling a replacement or real initializer.
+if ( ssh_db_init() { :; }; assert_fixture_mocks ) >/dev/null 2>&1; then fail 'initializer replacement was not detected'; fi
+if ( ssh_db_update_status() { fixture_real_update_status "$@"; }; assert_fixture_mocks ) >/dev/null 2>&1; then fail 'unguarded status replacement was not detected'; fi
+assert_fixture_mocks
 run_fixture_scan() (
     exec 8>>"$NATHAYA_SSH_OPERATIONS_LOCK"
     flock -x 8 || return 1
@@ -220,11 +247,10 @@ fi
 if ssh_expire_main --unsupported; then fail 'bad monitor argument accepted'; fi
 
 # UI integration is also fully mocked, but production root checks remain intact.
+# No production source may follow final mocks; verify identities at the UI boundary.
+assert_fixture_mocks
 # Skip only these root-gated branches on non-root development environments.
 if (( EUID == 0 )); then
-    source "$project/modules/ssh/renew.sh"
-    source "$project/modules/ssh/lock.sh"
-    source "$project/modules/ssh/unlock.sh"
     clear() { :; }
     get_width() { printf '80\n'; }
     draw_nathaya_header() { :; }
@@ -236,6 +262,7 @@ if (( EUID == 0 )); then
         PASSWORD_STATE="$password_state"
         printf 'renewuser|2025-05-01|2025-05-30|1|expired|0|regular\n' > "$NATHAYA_SSH_DB"
         reset_trace
+        assert_fixture_mocks
         renew_ssh_account > "$work/ui-output" <<'INPUT'
 renewuser
 2
@@ -247,12 +274,14 @@ INPUT
         [[ "$password_state" != P ]] || expected=active
         grep -Fxq "renewuser|2025-05-01|2025-06-03|1|$expected|0|regular" "$NATHAYA_SSH_DB" || fail 'renew expired state'
         grep -Fxq 'chage -E 2025-06-04 renewuser' "$trace" || fail 'renew did not restore Linux expiry'
+        grep -Fxq "status renewuser $expected 0" "$trace" || fail 'renew bypassed operation-locked status wrapper'
         ! grep -q '^FORBIDDEN ' "$trace" || fail 'renew attempted password unlock or host operation'
         [[ "$MOCK_OP_HELD" == 0 ]] || fail 'renew leaked operation lock'
     done
     PASSWORD_STATE=P
     printf 'renewuser|2025-05-01|2025-05-30|1|expired|123|regular\n' > "$NATHAYA_SSH_DB"
     reset_trace
+    assert_fixture_mocks
     renew_ssh_account > "$work/ui-output" <<'INPUT'
 renewuser
 2
@@ -261,6 +290,8 @@ y
 z
 INPUT
     grep -Fxq 'renewuser|2025-05-01|2025-06-03|1|locked|123|regular' "$NATHAYA_SSH_DB" || fail 'renew lost admin lock metadata'
+    grep -Fxq 'status renewuser locked 123' "$trace" || fail 'renew metadata bypassed status wrapper'
+    ! grep -q '^FORBIDDEN ' "$trace" || fail 'renew metadata attempted host operation'
 
     # Manual password changes below remain mocks and require operations.lock.
     passwd() {
@@ -275,9 +306,14 @@ INPUT
             *) deny unexpected-passwd; return 1 ;;
         esac
     }
+    # Only this deliberate fixture replacement is allowed after capture: passwd
+    # permits -l/-u ONLY with operations.lock held. DB/host-operation guards stay fixed.
+    fixture_mock_definitions[passwd]="$(declare -f passwd)"
+    assert_fixture_mocks
     printf 'lockuser|2025-05-01|2025-06-02|1|active|0|regular\n' > "$NATHAYA_SSH_DB"
     PASSWORD_STATE=P
     reset_trace
+    assert_fixture_mocks
     lock_ssh_account > "$work/ui-output" <<'INPUT'
 lockuser
 y
@@ -287,10 +323,12 @@ INPUT
     grep -Fxq 'passwd -l lockuser' "$trace" || fail 'manual lock absent'
     grep -Fxq 'pkill -KILL -u 1200' "$trace" || fail 'manual lock kill UID'
     grep -q '|locked|0|regular$' "$NATHAYA_SSH_DB" || fail 'manual lock DB'
+    grep -Fxq 'status lockuser locked 0' "$trace" || fail 'manual lock bypassed status wrapper'
     [[ "$MOCK_OP_HELD" == 0 ]] || fail 'manual lock leaked FD state'
 
     PASSWORD_STATE=L
     reset_trace
+    assert_fixture_mocks
     unlock_ssh_account > "$work/ui-output" <<'INPUT'
 lockuser
 y
@@ -299,12 +337,14 @@ z
 INPUT
     grep -Fxq 'passwd -u lockuser' "$trace" || fail 'manual unlock absent'
     grep -q '|active|0|regular$' "$NATHAYA_SSH_DB" || fail 'manual unlock DB'
+    grep -Fxq 'status lockuser active 0' "$trace" || fail 'manual unlock bypassed status wrapper'
     [[ "$MOCK_OP_HELD" == 0 ]] || fail 'manual unlock leaked FD state'
 
     # Expiry winning after user confirmation blocks stale manual Lock.
     PASSWORD_STATE=P
     RACE_MODE=expirelock
     reset_trace
+    assert_fixture_mocks
     lock_ssh_account > "$work/ui-output" <<'INPUT'
 lockuser
 y
@@ -318,5 +358,6 @@ INPUT
 else
     printf 'SKIP: root-gated Renew/Lock/Unlock UI branches (monitor fixtures still ran).\n'
 fi
+assert_fixture_mocks
 [[ "$(<"$work/key-state")" == synthetic-key-state ]] || fail 'UI changed key state'
 printf 'PASS: isolated expiry fixtures and mocked locking protocol (not real concurrency or VPS tests).\n'
