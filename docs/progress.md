@@ -55,4 +55,12 @@
 - File diubah hanya tests/expiry.sh dan dokumen ini. Pemeriksaan aktual: review source serta kontrak statis JavaScript (semua source sebelum mock, wrapper lock/guard tetap, tidak ada source UI terlambat, kasus regresi tetap, tidak ada trailing whitespace). Bash/Git tidak tersedia, sehingga bash -n dan test belum dijalankan; tidak ada klaim PASS atau uji VPS baru.
 - Pengguna dapat menjalankan dari source VPS: `bash -n tests/expiry.sh && bash tests/expiry.sh`. Cabang UI tetap root-gated dan di-SKIP pada non-root; operasi akun di dalam fixture tetap seluruhnya mock.
 
+## 8 — False positive balance pada tes routing
+
+- Penyebab: pencarian substring balance pada seluruh teks HAProxy ikut membaca komentar penjelas, sehingga konfigurasi deterministik dianggap gagal.
+- Perubahan hanya tests/services_test.py dan dokumen ini: helper mengabaikan baris kosong/komentar penuh sambil mempertahankan indentasi; directive dicocokkan dari token pertama, bukan substring. Tes mux memakai baris aktif dan assertion khusus balance, tanpa menghapus komentar produksi.
+- Regresi: kata balance pada komentar, nama server, nilai log-format, atau prefix balance_pool tidak ditolak; directive balance aktif dengan spasi/tab, tanpa argumen, atau variasi huruf tetap terdeteksi dan menggagalkan assertion yang sama. Assertion satu server per backend, backend loopback, urutan routing, serta pasangan send-proxy/accept-proxy tetap ada.
+- Pemeriksaan aktual: review source dan pemeriksaan kontrak statis JavaScript atas filter/token/assertion serta tidak ada trailing whitespace. Python/Bash/Git tidak tersedia melalui tools sesi ini; tes Python belum dijalankan dan tidak diklaim PASS. Tidak ada konfigurasi produksi diubah.
+- Pengguna dapat menjalankan: `python3 -I -B tests/services_test.py`, atau fokus tiga kasus balance/mux dengan unittest sesuai nama test pada file.
+
 Tidak ada installer, apt, layanan/firewall/akun, reboot, commit/push/publish yang dijalankan selama pengembangan.

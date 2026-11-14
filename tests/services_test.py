@@ -55,7 +55,23 @@ def websocket_request(key=b"dGhlIHNhbXBsZSBub25jZQ=="):
                    b"Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: " + key + b"\r\n")
 
 
+def active_haproxy_lines(text):
+    """Physical config lines only; keep indentation for existing section checks."""
+    return [line for line in text.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")]
+
+
+def haproxy_directive_lines(text, keyword):
+    """Match the first whitespace-separated token, never prose or substrings."""
+    return [line for line in active_haproxy_lines(text)
+            if line.split(maxsplit=1)[0].casefold() == keyword.casefold()]
+
+
 class RenderTests(unittest.TestCase):
+    def assertNoActiveBalance(self, text):
+        self.assertEqual(haproxy_directive_lines(text, "balance"), [],
+                         "Active balance directive would defeat deterministic routing")
+
     def setUp(self):
         self.ports = R.load_ports()
         self.outputs = R.render_core("VPN.Example.org", self.ports, ss_server_key=FIXTURE_KEY)
@@ -141,7 +157,8 @@ class RenderTests(unittest.TestCase):
             self.assertRegex(backend, r"^127\.0\.0\.1:[0-9]+$")
 
     def test_mux_deterministic_and_proxy_pairing(self):
-        text = self.outputs["haproxy.cfg"]
+        raw = self.outputs["haproxy.cfg"]
+        text = "\n".join(active_haproxy_lines(raw)) + "\n"
         for port in (80, 443, 8080):
             self.assertIn(f"bind 0.0.0.0:{port}\n", text)
         self.assertIn("server tls abns@nathaya-tls send-proxy-v2", text)
@@ -157,10 +174,37 @@ class RenderTests(unittest.TestCase):
         self.assertIn("server nginx 127.0.0.1:1013 send-proxy-v2", text)
         for backend in re.findall(r"^    server \S+ (\S+)", text, re.M):
             self.assertTrue(backend.startswith(("127.0.0.1:", "abns@nathaya-tls")))
-        for prohibited in ("balance ", "1194", "openvpn", "0.0.0.0:2222"):
+        self.assertNoActiveBalance(raw)
+        for prohibited in ("1194", "openvpn", "0.0.0.0:2222"):
             self.assertNotIn(prohibited, text.lower())
         decrypted = text.split("frontend decrypted_tls", 1)[1]
         self.assertLess(decrypted.index("use_backend grpc_h2"), decrypted.index("use_backend ssh_tls"))
+
+    def test_balance_comment_and_nonleading_tokens_are_ignored(self):
+        text = (
+            "# One backend server per protocol; never balance across protocols.\n"
+            "\n   \t\n   # balance roundrobin\n\t# BALANCE leastconn\n"
+            "backend deterministic\n"
+            "    server balance 127.0.0.1:1010\n"
+            '    log-format "balance is descriptive text"\n'
+            "    balance_pool not-a-balance-directive\n"
+        )
+        self.assertIn("balance ", text.lower())  # Reproduces the old false positive.
+        self.assertEqual(active_haproxy_lines(text), [
+            "backend deterministic", "    server balance 127.0.0.1:1010",
+            '    log-format "balance is descriptive text"',
+            "    balance_pool not-a-balance-directive"])
+        self.assertNoActiveBalance(text)
+
+    def test_active_balance_directive_is_rejected(self):
+        for directive in ("balance roundrobin", "    balance leastconn # active",
+                          "\tbalance\troundrobin", "balance", "  BALANCE roundrobin"):
+            with self.subTest(directive=directive):
+                text = "# balance in this comment is harmless\nbackend deterministic\n" + directive + "\n"
+                self.assertEqual(haproxy_directive_lines(text, "balance"), [directive])
+                # Exercise the SAME assertion used by the rendered mux test.
+                with self.assertRaises(AssertionError):
+                    self.assertNoActiveBalance(text)
 
     def test_xray_empty_clients_and_pinned_engine(self):
         self.assertEqual(self.ports["xray"]["version"], "v26.11.9")
