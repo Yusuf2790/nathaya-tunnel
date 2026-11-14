@@ -336,9 +336,12 @@ def render_core(domain, ports, *, ss_server_key):
         extra="RuntimeDirectory=nathaya-nginx\nRuntimeDirectoryMode=0750\n"
               "ExecStartPre=/usr/bin/install -d -o www-data -g www-data -m 0700 /run/nathaya-nginx/body /run/nathaya-nginx/proxy /run/nathaya-nginx/fastcgi /run/nathaya-nginx/uwsgi /run/nathaya-nginx/scgi\n"
               f"ExecReload=/usr/sbin/nginx -s reload -c {SERVICES}/nginx.conf\n")
+    # Root master reads private PEM/binds low ports; HAProxy drops worker UID/GID.
+    # KILL permits master signals to non-root workers during USR2/reexec. It is
+    # NOT a claimed fix for an unexplained setuid() failure on a particular VPS.
     result["nathaya-haproxy.service"] = unit(
         "Nathaya HAProxy", f"/usr/sbin/haproxy -W -db -f {SERVICES}/haproxy.cfg",
-        caps="CAP_NET_BIND_SERVICE CAP_SETUID CAP_SETGID",
+        caps="CAP_NET_BIND_SERVICE CAP_SETUID CAP_SETGID CAP_KILL",
         extra="ExecReload=/bin/kill -USR2 $MAINPID\n")
     result["nathaya-ws.service"] = unit(
         "Nathaya fixed-target SSH WebSocket relay", "/usr/bin/python3 -I -B /opt/nathaya/services/ws_proxy.py",

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Read-only production checks plus pure policy helpers. Never changes services."""
 import hashlib
+import importlib.util
+import grp
+import pwd
 import ipaddress
 import json
 import os
@@ -185,6 +188,169 @@ def _ssh_cli(args):
         return 2
 
 
+_HAPROXY_UNIT = "/etc/systemd/system/nathaya-haproxy.service"
+_HAPROXY_CAPS = 0x4e0  # KILL, SETGID, SETUID, NET_BIND_SERVICE only.
+_PROC_LIMIT = 64 * 1024
+
+
+def _haproxy_invalid():
+    raise ValueError("Invalid HAProxy identity") from None
+
+
+def parse_haproxy_status(raw):
+    """Pure /proc status parser: require all identity fields, reject duplicates."""
+    wanted = {"Pid", "PPid", "Uid", "Gid", "Groups", "CapEff", "CapPrm", "CapAmb", "NoNewPrivs"}
+    if type(raw) is not str or len(raw) > _PROC_LIMIT:
+        _haproxy_invalid()
+    result = {}
+    for line in raw.splitlines():
+        key, separator, value = line.partition(":")
+        if key not in wanted:
+            continue
+        if not separator or key in result:
+            _haproxy_invalid()
+        fields = value.split()
+        count = len(fields) if key == "Groups" else 4 if key in ("Uid", "Gid") else 1
+        if count > 1024:
+            _haproxy_invalid()
+        pattern = r"[0-9a-fA-F]{1,16}" if key.startswith("Cap") else r"[0-9]{1,10}"
+        if len(fields) != count or any(not re.fullmatch(pattern, f) for f in fields):
+            _haproxy_invalid()
+        values = tuple(int(f, 16 if key.startswith("Cap") else 10) for f in fields)
+        result[key] = values if key in ("Uid", "Gid", "Groups") else values[0]
+    if set(result) != wanted:
+        _haproxy_invalid()
+    return result
+
+
+def validate_haproxy_identity(master, workers, uid, gid):
+    """Pure policy: root master with exact narrow caps; unprivileged workers only."""
+    if type(uid) is not int or type(gid) is not int or uid <= 0 or gid <= 0 or not workers:
+        _haproxy_invalid()
+    if (master["Uid"] != (0,) * 4 or master["Gid"] != (0,) * 4 or
+            master["CapEff"] != _HAPROXY_CAPS or master["CapPrm"] != _HAPROXY_CAPS or
+            master["CapAmb"] != 0 or master["NoNewPrivs"] != 1):
+        _haproxy_invalid()
+    for worker in workers:
+        if (worker["Uid"] != (uid,) * 4 or worker["Gid"] != (gid,) * 4 or
+                any(group != gid for group in worker["Groups"]) or
+                any(worker[key] != 0 for key in ("CapEff", "CapPrm", "CapAmb")) or
+                worker["NoNewPrivs"] != 1 or worker["PPid"] != master["Pid"]):
+            _haproxy_invalid()
+    return True
+
+
+def _proc_text(path):
+    with path.open("rb") as stream:
+        raw = stream.read(_PROC_LIMIT + 1)
+    if len(raw) > _PROC_LIMIT:
+        _haproxy_invalid()
+    return raw.decode("ascii")
+
+
+def _haproxy_children(pid):
+    raw = _proc_text(Path(f"/proc/{pid}/task/{pid}/children"))
+    fields = raw.split()
+    if (not fields or len(fields) > 1024 or
+            any(not re.fullmatch(r"[1-9][0-9]{0,9}", f) for f in fields)):
+        _haproxy_invalid()
+    result = [int(f) for f in fields]
+    if len(set(result)) != len(result) or pid in result:
+        _haproxy_invalid()
+    return sorted(result)
+
+
+def _haproxy_process(pid):
+    base = Path(f"/proc/{pid}")
+    if os.readlink(base / "exe") != "/usr/sbin/haproxy":
+        _haproxy_invalid()
+    value = parse_haproxy_status(_proc_text(base / "status"))
+    if value["Pid"] != pid:
+        _haproxy_invalid()
+    return value
+
+
+def verify_haproxy_identity(pid):
+    """Read-only, bounded snapshot; children come ONLY from the supplied master."""
+    if type(pid) is not int or not 1 <= pid <= 2147483647:
+        _haproxy_invalid()
+    account, group = pwd.getpwnam("haproxy"), grp.getgrnam("haproxy")
+    if account.pw_gid != group.gr_gid:
+        _haproxy_invalid()
+    children = _haproxy_children(pid)
+    master = _haproxy_process(pid)
+    workers = [_haproxy_process(child) for child in children]
+    validate_haproxy_identity(master, workers, account.pw_uid, group.gr_gid)
+    # Fail closed on observed exits/reloads/identity changes; never retry forever.
+    if (children != _haproxy_children(pid) or master != _haproxy_process(pid) or
+            workers != [_haproxy_process(child) for child in children]):
+        _haproxy_invalid()
+
+
+def _metadata():
+    spec = importlib.util.spec_from_file_location("nathaya_check_metadata", ROOT / "installer/state.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def check_managed_unit_hashes(state, root=Path("/")):
+    """Compare against the EXISTING registry, never against the new renderer."""
+    metadata = _metadata()
+    files = state["files"] if state is not None else {}
+    for name in metadata.unit_paths():
+        path = metadata._safe(root / name.lstrip("/"), root == Path("/"))
+        if name in files and not path.exists():
+            raise ValueError("Missing registered managed unit")
+        if path.exists():
+            if name not in files or hashlib.sha256(path.read_bytes()).hexdigest() != files[name]:
+                raise ValueError("Foreign/edited managed unit")
+
+
+def validate_haproxy_unit(fragment, dropins, load, owned, exists):
+    """Pure effective-unit policy; not-found is safe only when genuinely absent."""
+    if dropins:
+        raise ValueError("HAProxy unit override conflict")
+    if load == "not-found" and not fragment and not exists and not owned:
+        return
+    if load != "loaded" or fragment != _HAPROXY_UNIT or not owned or not exists:
+        raise ValueError("HAProxy effective unit conflict")
+
+
+def check_haproxy_unit(root=Path("/"), state=None):
+    metadata = _metadata()
+    if state is None:
+        state, _raw = metadata.read_service_registry(root)
+    check_managed_unit_hashes(state, root)
+    values = []
+    for prop in ("FragmentPath", "DropInPaths", "LoadState"):
+        result = subprocess.run(["systemctl", "show", "nathaya-haproxy.service",
+                                 "--property=" + prop, "--value"],
+                                check=False, text=True, capture_output=True, timeout=10)
+        if result.returncode != 0 or type(result.stdout) is not str or len(result.stdout) > _PROC_LIMIT:
+            raise ValueError("HAProxy unit inspection failed")
+        values.append(result.stdout.strip())
+    path = root / _HAPROXY_UNIT.lstrip("/")
+    validate_haproxy_unit(*values, owned=state is not None and _HAPROXY_UNIT in state["files"],
+                          exists=path.exists())
+
+
+def _haproxy_cli(args):
+    try:
+        if args[0] == "verify-haproxy-identity":
+            if len(args) != 2 or not re.fullmatch(r"[1-9][0-9]{0,9}", args[1]):
+                _haproxy_invalid()
+            verify_haproxy_identity(int(args[1]))
+        else:
+            if len(args) != 1:
+                _haproxy_invalid()
+            check_haproxy_unit()
+        return 0
+    except (OSError, ValueError, TypeError, KeyError, UnicodeError, subprocess.SubprocessError):
+        print("BLOCKED HAProxy: identity/unit validation failed", file=sys.stderr)
+        return 1
+
+
 def required_listeners(ports):
     result = {}
     for port in ports["public"]["haproxy"]: result[port] = ("nathaya-haproxy.service", False)
@@ -230,17 +396,15 @@ def check_rows(rows, required, verify=False, managed=False, belongs=pid_in_unit)
 def main():
     if sys.argv[1:2] in (["canonical-ssh-listeners"], ["compare-ssh-listeners"]):
         return _ssh_cli(sys.argv[1:])
+    if sys.argv[1:2] in (["verify-haproxy-identity"], ["check-haproxy-unit"]):
+        return _haproxy_cli(sys.argv[1:])
     ports = json.loads((ROOT / "config/ports.json").read_text())
     required = required_listeners(ports)
-    registry = Path("/etc/nathaya-tunnel/managed-services.json")
-    managed = False
-    state = {"files": {}}
-    if registry.exists():
-        if registry.is_symlink() or registry.stat().st_uid != 0 or registry.stat().st_mode & 0o077:
-            raise ValueError("Untrusted service registry")
-        state = json.loads(registry.read_text())
-        managed = state.get("schema") == 1 and state.get("owner") == "Nathaya Tunnel"
-        if not managed: raise ValueError("Foreign registry")
+    state, _raw = _metadata().read_service_registry()
+    managed = state is not None
+    if sys.argv[1:2] == ["preflight"]:
+        check_haproxy_unit(state=state)
+    state = state if state is not None else {"files": {}}
     # Fixed global units: never overwrite another app or an edited root unit silently.
     names = {unit for unit, _ in required.values()}
     names |= {p + suffix for p in ("nathaya-ssh-expire", "nathaya-cert-renew", "nathaya-update") for suffix in (".service", ".timer")}

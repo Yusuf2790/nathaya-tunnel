@@ -129,6 +129,90 @@ def unit_paths():
     result += ["/etc/systemd/system/" + u + ".timer" for u in ("nathaya-ssh-expire", "nathaya-cert-renew", "nathaya-update")]
     return result
 
+def validate_service_registry(value):
+    if (type(value) is not dict or set(value) != {"schema", "owner", "files"} or
+            type(value["schema"]) is not int or value["schema"] != 1 or
+            value["owner"] != "Nathaya Tunnel" or type(value["files"]) is not dict or
+            not value["files"]):
+        raise ValueError("Invalid service registry")
+    for name, digest in value["files"].items():
+        if (type(name) is not str or not name.startswith("/") or
+                str(Path(name)) != name or ".." in Path(name).parts or
+                type(digest) is not str or not re.fullmatch(r"[0-9a-f]{64}", digest)):
+            raise ValueError("Invalid service registry")
+    return value
+
+
+def read_service_registry(root=Path("/")):
+    root = Path(os.path.abspath(root))
+    production = root == Path("/")
+    path = _safe(root / "etc/nathaya-tunnel/managed-services.json", production)
+    if path.parent.exists() and (stat.S_IMODE(path.parent.stat().st_mode) != 0o700 or
+                                 (production and path.parent.stat().st_gid != 0)):
+        raise ValueError("Service registry directory must be private")
+    if not path.exists():
+        return None, None
+    if (stat.S_IMODE(path.stat().st_mode) != 0o600 or
+            (production and path.stat().st_gid != 0)):
+        raise ValueError("Service registry must be private")
+    raw = _read(path, production)
+    return validate_service_registry(_json(raw)), raw
+
+
+def backup_service_registry(run, root=Path("/")):
+    """First snapshot wins, including explicit absence; never reserialize old bytes."""
+    root = Path(os.path.abspath(root))
+    production = root == Path("/")
+    run = _safe(run, production)
+    if (not run.is_dir() or stat.S_IMODE(run.stat().st_mode) != 0o700 or
+            (production and run.stat().st_gid != 0)):
+        raise ValueError("Private installer run directory required")
+    backup = _safe(run / "managed-services.before.json", production)
+    absent = _safe(run / "managed-services.absent", production)
+    if backup.exists() or absent.exists():
+        if backup.exists() and absent.exists():
+            raise ValueError("Ambiguous registry backup")
+        saved = backup if backup.exists() else absent
+        if (stat.S_IMODE(saved.stat().st_mode) != 0o600 or
+                (production and saved.stat().st_gid != 0)):
+            raise ValueError("Registry backup must be private")
+        raw = _read(saved, production)
+        if saved == backup:
+            validate_service_registry(_json(raw))
+        elif raw != b"absent\n":
+            raise ValueError("Invalid registry absence marker")
+        return
+    _previous, raw = read_service_registry(root)
+    target = backup if raw is not None else absent
+    # O_EXCL keeps a second record from replacing the first snapshot.
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as stream:
+        if production: os.fchown(stream.fileno(), 0, 0)
+        os.fchmod(stream.fileno(), 0o600)
+        stream.write(raw if raw is not None else b"absent\n")
+        stream.flush(); os.fsync(stream.fileno())
+
+
+def record_services(root=Path("/"), backup=None):
+    root = Path(os.path.abspath(root))
+    production = root == Path("/")
+    paths = unit_paths()
+    paths += ["/etc/profile.d/nathaya-dashboard.sh", "/usr/local/bin/nathaya-update"]
+    paths += ["/etc/nathaya-tunnel/services/" + n for n in ("nginx.conf", "haproxy.cfg")]
+    paths += [f"/etc/nathaya-tunnel/xray/{p}/config.json" for p in ("vmess", "vless", "trojan", "shadowsocks")]
+    files = {}
+    for name in paths:
+        path = _safe(root / name.lstrip("/"), production)
+        if not path.exists(): continue
+        files[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    value = validate_service_registry({"schema": 1, "owner": "Nathaya Tunnel", "files": files})
+    # Validate the old registry even without a backup request; never bless bad state.
+    read_service_registry(root)
+    if backup is not None:
+        backup_service_registry(backup, root)
+    atomic_json(_safe(root / "etc/nathaya-tunnel/managed-services.json", production), value)
+
+
 def main():
     if os.geteuid() != 0: raise ValueError("Root required")
     action = sys.argv[1]
@@ -140,18 +224,14 @@ def main():
             raise ValueError("Journal must be in the private installer run directory")
         handler = {"prepare": prepare_install, "validate-prepared": validate_prepared, "commit": commit_install}[action]
         handler(Path(sys.argv[2]), Path("/"), journal)
-    elif action == "record-services" and len(sys.argv) == 2:
-        paths = unit_paths()
-        paths += ["/etc/profile.d/nathaya-dashboard.sh", "/usr/local/bin/nathaya-update"]
-        paths += ["/etc/nathaya-tunnel/services/" + n for n in ("nginx.conf", "haproxy.cfg")]
-        paths += [f"/etc/nathaya-tunnel/xray/{p}/config.json" for p in ("vmess", "vless", "trojan", "shadowsocks")]
-        files = {}
-        for name in paths:
-            path = Path(name)
-            if not path.exists() and not path.is_symlink(): continue
-            if not path.is_file() or path.is_symlink() or path.stat().st_uid != 0: raise ValueError("Unsafe managed destination")
-            files[name] = hashlib.sha256(path.read_bytes()).hexdigest()
-        atomic_json(Path("/etc/nathaya-tunnel/managed-services.json"), {"schema": 1, "owner": "Nathaya Tunnel", "files": files})
+    elif action == "record-services" and (len(sys.argv) == 2 or
+                                           (len(sys.argv) == 4 and sys.argv[2] == "--backup")):
+        run = None
+        if len(sys.argv) == 4:
+            run = Path(os.path.abspath(sys.argv[3]))
+            if run.parent != Path("/var/backups/nathaya-tunnel") or not run.name.startswith("run."):
+                raise ValueError("Backup must use the private installer run directory")
+        record_services(backup=run)
     else: raise ValueError("Unknown metadata operation")
 
 if __name__ == "__main__":

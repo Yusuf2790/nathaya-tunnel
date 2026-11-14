@@ -237,6 +237,36 @@ class RenderTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             R.validate_server_key("not-a-key")
 
+    def test_haproxy_root_master_unprivileged_worker_contract(self):
+        # Rendered intent only: NOT a real setuid/capability/systemd test.
+        config = self.outputs["haproxy.cfg"]
+        self.assertEqual(haproxy_directive_lines(config, "user"), ["    user haproxy"])
+        self.assertEqual(haproxy_directive_lines(config, "group"), ["    group haproxy"])
+        self.assertEqual(haproxy_directive_lines(config, "master-worker"), ["    master-worker"])
+        self.assertEqual(haproxy_directive_lines(config, "setcap"), [])
+        unit = self.outputs["nathaya-haproxy.service"]
+        fields = dict(line.split("=", 1) for line in unit.splitlines()
+                      if line and not line.startswith(("#", "[")) and "=" in line)
+        self.assertEqual(fields["User"], "root")
+        self.assertEqual(fields["Group"], "root")
+        self.assertEqual(fields["CapabilityBoundingSet"].split(),
+                         ["CAP_NET_BIND_SERVICE", "CAP_SETUID", "CAP_SETGID", "CAP_KILL"])
+        self.assertEqual(fields["AmbientCapabilities"], "")
+        self.assertEqual(fields["ExecReload"], "/bin/kill -USR2 $MAINPID")
+        self.assertEqual(fields["ExecStart"], "/usr/sbin/haproxy -W -db -f /etc/nathaya-tunnel/services/haproxy.cfg")
+        for key, value in (("NoNewPrivileges", "true"), ("ProtectSystem", "strict"),
+                           ("ProtectHome", "true"), ("PrivateTmp", "true"),
+                           ("RestrictSUIDSGID", "true"), ("ProtectKernelTunables", "true"),
+                           ("ProtectKernelModules", "true"), ("ProtectControlGroups", "true")):
+            self.assertEqual(fields[key], value)
+        self.assertEqual(fields["RestrictAddressFamilies"], "AF_INET AF_INET6 AF_UNIX")
+        self.assertEqual(fields["StandardError"], "append:/opt/nathaya/logs/%N.log")
+        tls = (ROOT / "installer/tls.sh").read_text()
+        self.assertIn("nt_directory /etc/nathaya-tunnel/tls 700", tls)
+        self.assertIn("/etc/nathaya-tunnel/tls/haproxy.pem 600", tls)
+        self.assertNotIn("chmod 777", tls)
+        self.assertIn("ssl crt /etc/nathaya-tunnel/tls/haproxy.pem", config)
+
     def test_units_privileges_and_exact_commands(self):
         for proto in R.PROTOCOLS:
             unit = self.outputs[proto + "@config.service"]

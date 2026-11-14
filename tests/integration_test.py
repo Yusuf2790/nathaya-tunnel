@@ -202,6 +202,34 @@ class SourceContractTests(Isolated):
         self.assertLess(countdown.index("nt_can_reboot "), countdown.index("for ((remaining="))
         self.assertLess(countdown.index("    nt_finalize_success\n"), countdown.index("    systemctl reboot\n"))
 
+    def test_static_haproxy_recheck_is_under_lock_before_worker_mutations(self):
+        setup = (REPO / "setup.sh").read_text()
+        main = setup.split("nt_setup_main() {\n", 1)[1]
+        recheck = main.index('    python3 -I -B "$NT_SOURCE/installer/checks.py" check-haproxy-unit\n')
+        self.assertLess(main.index("    NT_LOCK_HELD=1\n"), recheck)
+        self.assertLess(main.index('NT_RUN="$(mktemp -d '), recheck)
+        self.assertLess(main.index('state.py" prepare "$NT_SOURCE" "$NT_RUN/updater-before.json"'), recheck)
+        self.assertLess(recheck, main.index("    NT_LOCK_HELD=0\n"))
+        self.assertLess(recheck, main.index('( NT_LOCK_HELD=1; nt_worker )'))
+        self.assertNotIn('checks.py" preflight', main)
+        self.assertNotIn('state.py" commit ', main)
+
+    def test_static_registry_backup_contract_precedes_publication(self):
+        # Every installer record call must pass the SAME run directory, including
+        # the early proxy record before services start and the final worker record.
+        for name in ("setup.sh", "installer/proxies.sh"):
+            calls = [line.strip() for line in (REPO / name).read_text().splitlines()
+                     if 'state.py" record-services' in line]
+            self.assertTrue(calls)
+            for call in calls:
+                self.assertTrue(call.endswith('record-services --backup "$NT_RUN"'))
+        state = (REPO / "installer/state.py").read_text()
+        record = state.split('def record_services(', 1)[1].split('\ndef main():', 1)[0]
+        self.assertLess(record.index("backup_service_registry(backup, root)"),
+                        record.index("    atomic_json("))
+        self.assertNotIn("commit_install", record)
+        self.assertNotIn("installed.json", record)
+
     def test_static_ssh_preflight_baseline_reaches_worker(self):
         # No live worker/installer calls: inheritance is exercised by installer.sh.
         setup = (REPO / "setup.sh").read_text()

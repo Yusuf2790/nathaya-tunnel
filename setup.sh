@@ -121,7 +121,7 @@ nt_worker() {
     nt_run_stage Xray nt_xray_install
     nt_run_stage proxies nt_proxies_install
     nt_run_stage maintenance nt_maintenance_install
-    python3 -I -B "$NT_SOURCE/installer/state.py" record-services
+    python3 -I -B "$NT_SOURCE/installer/state.py" record-services --backup "$NT_RUN"
     nt_run_stage verification nt_core_verify
     if [[ "$NT_PROFILE" == full ]]; then
         # Additional mandatory gates deliberately fail closed until the server
@@ -171,6 +171,8 @@ nt_setup_main() {
     NT_RUN="$(mktemp -d /var/backups/nathaya-tunnel/run.XXXXXXXX)"
     nt_ssh_persist_baseline
     python3 -I -B "$NT_SOURCE/installer/state.py" prepare "$NT_SOURCE" "$NT_RUN/updater-before.json"
+    # Under the shared lock: ownership/hash only, not another global port check.
+    python3 -I -B "$NT_SOURCE/installer/checks.py" check-haproxy-unit
     NT_LOG="/opt/nathaya/logs/install-$(date -u +%Y%m%dT%H%M%SZ)-$$.log"
     nt_private_file "$NT_LOG"
     # Transfer before forking: once a worker may exist the viewer NEVER releases

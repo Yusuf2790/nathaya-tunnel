@@ -44,10 +44,14 @@ nt_proxies_install() {
     if [[ "$NT_NGINX_NEW" == 1 ]]; then systemctl disable --now nginx.service; fi
     if [[ "$NT_HAPROXY_NEW" == 1 ]]; then systemctl disable --now haproxy.service; fi
     systemctl daemon-reload
-    python3 -I -B "$NT_SOURCE/installer/state.py" record-services
+    python3 -I -B "$NT_SOURCE/installer/state.py" record-services --backup "$NT_RUN"
     while IFS= read -r unit; do
         nt_track_unit_change "$unit.service" yes
-        systemctl enable "$unit.service"
-        systemctl restart "$unit.service"
+        if ! systemctl enable "$unit.service"; then
+            nt_report_unit_failure "$unit.service" 'enable gagal'; return 1
+        fi
+        if ! systemctl restart "$unit.service"; then
+            nt_report_unit_failure "$unit.service" 'restart gagal'; return 1
+        fi
     done < <(nt_core_units)
 }

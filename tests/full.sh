@@ -40,6 +40,57 @@ source "$project/services/login-policy.sh"
 for cmd in mkdir rmdir touch install chmod cp mv rm tee; do unset -f "$cmd"; done
 # Keep ownership, Python, networking and host-operation guards in place.
 
+# Unit failures must identify the unit/log BEFORE simulated cleanup. Only the
+# orchestrator is tested: strict mock providers, no systemd/setuid/proc execution.
+(
+    NT_RUN="$work/unit-diagnostics" NT_SOURCE="$project" NT_LOG="$work/worker.log"
+    mkdir -m 700 -- "$NT_RUN"
+    unit_active=0 status_failure=0 pid_failure=0 validator_rc=1
+    nt_set_owner() { [[ "$1" == "$work/"* ]] || fail 'owner outside fixture'; }
+    systemctl() {
+        printf '%s\n' "$*" >> "$NT_RUN/events"
+        case "$*" in
+            'is-active --quiet nathaya-haproxy.service') [[ "$unit_active" == 1 ]] ;;
+            'show nathaya-haproxy.service -p MainPID --value')
+                [[ "$pid_failure" == 0 ]] || return 45
+                printf '4242\n' ;;
+            'show nathaya-haproxy.service -p ActiveState -p SubState -p Result -p ExecMainCode -p ExecMainStatus -p MainPID')
+                printf 'ActiveState=failed\nResult=exit-code\nExecMainStatus=3\n'
+                printf 'fixture-private-marker\n'
+                return "$status_failure" ;;
+            *) deny; return 97 ;;
+        esac
+    }
+    python3() {
+        [[ $# == 5 && "$1" == -I && "$2" == -B && "$3" == "$project/installer/checks.py" &&
+           "$4" == verify-haproxy-identity && "$5" == 4242 ]] || { deny; return 97; }
+        printf 'fixture identity result\n'
+        return "$validator_rc"
+    }
+    expect_fail nt_require_unit_active nathaya-haproxy.service 2> "$NT_RUN/message"
+    grep -Fq 'unit=nathaya-haproxy.service' "$NT_RUN/message" || fail 'unit failure unnamed'
+    grep -Fq '/opt/nathaya/logs/nathaya-haproxy.log' "$NT_RUN/message" || fail 'wrong %N log path'
+    grep -Fq 'journalctl -u nathaya-haproxy.service' "$NT_RUN/message" || fail 'journal pointer missing'
+    if grep -Fq 'fixture-private-marker' "$NT_RUN/message"; then fail 'private status dumped'; fi
+    [[ -f "$NT_RUN/unit-nathaya-haproxy.service.failure" ]] || fail 'no pre-cleanup status snapshot'
+    [[ "$(stat -c %a "$NT_RUN/unit-nathaya-haproxy.service.failure")" == 600 ]] || fail 'status not private'
+    printf 'simulated-cleanup\n' >> "$NT_RUN/events"
+    [[ "$(tail -n 1 "$NT_RUN/events")" == simulated-cleanup ]] || fail 'diagnostics not before cleanup'
+    status_failure=1
+    expect_fail nt_require_unit_active nathaya-haproxy.service 2> "$NT_RUN/message"
+    grep -Fq 'snapshot read failed' "$NT_RUN/unit-nathaya-haproxy.service.failure" || fail 'status-read failure hidden'
+    unit_active=1 status_failure=0
+    nt_require_unit_active nathaya-haproxy.service
+    expect_fail nt_verify_haproxy_identity 2> "$NT_RUN/message"
+    grep -Fq 'haproxy-identity-check.log' "$NT_RUN/message" || fail 'identity diagnostics missing'
+    [[ "$(stat -c %a "$NT_RUN/haproxy-identity-check.log")" == 600 ]] || fail 'identity log not private'
+    validator_rc=0
+    nt_verify_haproxy_identity
+    pid_failure=1
+    expect_fail nt_verify_haproxy_identity 2> "$NT_RUN/message"
+    grep -Fq 'MainPID tidak dapat dibaca' "$NT_RUN/message" || fail 'PID query failure hidden'
+)
+
 # All seven login policy inputs are data: root + interactive + SSH + tty +
 # login shell + not already shown + no forced command. No live hook is sourced.
 nathaya_login_policy 0 himBH 'fixture ssh connection' yes -bash '' ''

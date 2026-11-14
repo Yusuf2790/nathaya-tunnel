@@ -31,6 +31,12 @@ reboot, migrasi akun, atau restart/konfigurasi layanan tunnel/SSH.
   `setup.sh`, `tools/`, `templates/`, `docs/` adalah pengecualian artifact-only,
   tidak diwajibkan ada di installed tree. Jangan melemahkan policy atau menerima
   validator remote; perubahan trust base memerlukan reviewed manual source reinstall.
+  Perubahan unit/capability HAProxy juga tidak bisa diterapkan lewat routine
+  updater: kode installer immutable yang berbeda dari candidate ditolak. Lihat
+  [HAProxy 2.8.30: diagnosis `Cannot set uid 109` dan reinstall](install.md#haproxy-2830-diagnosis-dan-reinstall).
+  Reinstall dari source tepercaya tetap mencakup maintenance OS, bukan patch
+  unit-only; penambahan `CAP_KILL` untuk signal lintas UID/USR2 **tidak
+  membuktikan penyebab kegagalan setuid telah diperbaiki**.
 - Runtime config `/etc/nathaya-tunnel/config.conf`, akun/database, key, cache,
   log, wrapper `/usr/local/bin/menu`, dan unit systemd tidak diganti oleh apply.
   `config/config.conf.example` adalah template program, bukan config aktif.
@@ -65,6 +71,24 @@ updater timer**. Keberadaan unit bukan opt-in. Baseline hilang/tidak cocok pada
 operasi updater memblokir, bukan ditebak/reset. Setup gagal **tidak memiliki
 rollback kode/OS otomatis**: partial deployment/VERSION dan baseline lama dapat
 memerlukan rekonsiliasi manual. Jangan memalsukan installed.json untuk lanjut.
+
+Registry service bukan baseline updater: `checks.py` memvalidasi schema/privacy
+registry dan menerima existing unit hanya bila hash aktual cocok hash **lama**
+yang tercatat, meski renderer baru berbeda. Effective HAProxy wajib fragment
+`/etc/systemd/system/nathaya-haproxy.service`, loaded dan tanpa drop-in; mask,
+runtime/vendor override, unit tanpa registry cocok atau hash drift memblokir.
+Preflight dan pemeriksaan di bawah lock dilakukan sebelum worker memutasi OS.
+Reinstall menyimpan unit lama privat melalui `nt_replace_file` di
+`"$NT_RUN/replaced/etc/systemd/system/nathaya-haproxy.service"` (0600).
+Pencatatan internal `record-services --backup "$NT_RUN"` menyimpan bytes awal
+registry ke `managed-services.before.json` atau marker `managed-services.absent`
+(0600); snapshot pertama tidak berubah pada pencatatan kedua. Registry dapat
+ada sebelum verification yang gagal sementara `installed.json` masih absent/lama.
+Partial mismatch VERSION/kode/baseline perlu restore manual backup yang koheren,
+bukan menghapus unit/registry/installed.json, blind adoption atau menjalankan
+`record-services` manual untuk memaksa lolos. Detail diagnosis privat, recovery
+dan uji VPS yang masih wajib ada pada [bagian HAProxy](install.md#haproxy-2830-diagnosis-dan-reinstall).
+
 Full tetap BLOCKED oleh OpenVPN/UDP provenance; core subset tidak reboot.
 Tidak ada instalasi atau uji sistem yang dijalankan di editor.
 
