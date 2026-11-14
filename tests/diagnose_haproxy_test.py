@@ -174,6 +174,13 @@ class Offline(unittest.TestCase):
             'ExecStart': exec_property(plan['argv']), 'ExecStartPre': exec_property(plan['pre']),
             'ExecReload': '',
         })
+        # Preserve availability, not production argv: these aliases describe the
+        # transient plan, whose Pre gate is active and Reload is unused.
+        for key in ('ExecStart', 'ExecStartPre'):
+            if key + 'Ex' in p:
+                p[key + 'Ex'] = p[key]
+        if 'ExecReloadEx' in p:
+            p['ExecReloadEx'] = ''
         return p
 
     def gate(self, c, plan, probe=None, current=None, live=None, clock=1):
@@ -444,6 +451,365 @@ class OptionalLoggingContracts(Offline):
         c.save.assert_not_called()
 
 
+class EmptyExecHookContracts(Offline):
+    SOURCE_HOOKS = ('ExecStartPre', 'ExecStartPost', 'ExecCondition',
+                    'ExecStop', 'ExecStopPost')
+    PROBE_HOOKS = ('ExecReload', 'ExecStartPost', 'ExecCondition',
+                   'ExecStop', 'ExecStopPost')
+
+    @staticmethod
+    def fields(hooks):
+        return tuple(name + suffix for name in hooks for suffix in ('', 'Ex'))
+
+    @staticmethod
+    def representation(properties, fields, absent):
+        result = dict(properties)
+        result.update(dict.fromkeys(fields, ''))
+        for key in absent:
+            result.pop(key, None)
+        return result
+
+    def refuse_at_either_snapshot(self, c, plan, bad, reason):
+        good = self.probe(c, plan)
+        for snapshot in ('first', 'live'):
+            c.save.reset_mock()
+            with self.subTest(snapshot=snapshot), self.assertRaisesRegex(self.D.Unsupported, reason):
+                self.gate(c, plan, probe=bad if snapshot == 'first' else good,
+                          live=bad if snapshot == 'live' else good)
+            c.save.assert_not_called()
+
+    def test_source_all_absent_empty_permutations_and_individual_omissions(self):
+        fields = self.fields(self.SOURCE_HOOKS)
+        self.assertEqual(self.D.SOURCE_EMPTY_EXEC_HOOKS, self.SOURCE_HOOKS)
+        self.assertEqual(self.D.PROBE_EMPTY_EXEC_HOOKS, self.PROBE_HOOKS)
+        self.assertEqual(self.D.EMPTY_EXEC_FIELDS,
+                         frozenset(fields + self.fields(self.PROBE_HOOKS)))
+        for old, caps in ((True, CAPS3), (False, CAPS4)):
+            fragment = self.D.validate_fragment(rendered(old))
+            # Every Base/Ex availability combination, including exactly one
+            # omission, all absent, and all explicitly empty.
+            for mask in range(1 << len(fields)):
+                absent = [key for bit, key in enumerate(fields) if mask & (1 << bit)]
+                props = self.representation(source_properties(old), fields, absent)
+                with self.subTest(old=old, absent=absent):
+                    self.assertEqual(self.D._source_empty_exec_fields(props, fragment), frozenset(fields))
+                    self.assertEqual(self.D.validate_effective(props, fragment), caps)
+                    self.assertEqual(set(props) & set(fields), set(fields) - set(absent))
+
+    def test_effective_unused_nonempty_base_and_ex_only_rejected(self):
+        fields = self.fields(self.SOURCE_HOOKS)
+        for key in fields:
+            for others_absent in (False, True):
+                for value in ('unexpected', exec_property(['/bin/true'])):
+                    props = self.representation(source_properties(), fields,
+                                                fields if others_absent else ())
+                    props[key] = value
+                    with self.subTest(key=key, ex_only=others_absent, value=value):
+                        fragment = self.D.validate_fragment(rendered())
+                        with self.assertRaisesRegex(self.D.Unsupported, 'active-hook:' + key):
+                            self.D._source_empty_exec_fields(props, fragment)
+                        with self.assertRaisesRegex(self.D.Unsupported, 'active-hook:' + key):
+                            self.D.validate_effective(props, fragment)
+
+    def test_source_fragment_declarations_partial_and_untrusted_properties_rejected(self):
+        props = self.representation(source_properties(), self.fields(self.SOURCE_HOOKS),
+                                    self.fields(self.SOURCE_HOOKS))
+        fragment = self.D.validate_fragment(rendered())
+        for key in self.fields(self.SOURCE_HOOKS):
+            for value in ('', '/bin/true'):
+                raw = rendered().replace('[Service]\n', '[Service]\n' + key + '=' + value + '\n')
+                with self.subTest(key=key, value=value):
+                    with self.assertRaisesRegex(self.D.Unsupported, 'fragment-directive'):
+                        self.D.validate_fragment(raw)
+                    # A caller cannot bypass the raw validator with a mapping
+                    # that declares a reset, even when show omits that hook.
+                    with self.assertRaisesRegex(self.D.Unsupported, 'source-hook-defined-in-fragment:' + key):
+                        self.D._source_empty_exec_fields(props, dict(fragment, **{key: value}))
+        for bad in (None, {}, {k: v for k, v in fragment.items() if k != 'ExecReload'},
+                    dict(fragment, FutureDirective='no'), dict(fragment, User='haproxy'),
+                    dict(fragment, ExecStart='/bin/true'), dict(fragment, ExecReload=None)):
+            with self.subTest(fragment=type(bad).__name__), self.assertRaisesRegex(
+                    self.D.Unsupported, 'source-hook-fragment-uncertain'):
+                self.D._source_empty_exec_fields(props, bad)
+        for key, wrong in (('Id', 'foreign.service'), ('LoadState', 'not-found'),
+                           ('FragmentPath', '/tmp/foreign.service'), ('DropInPaths', '/tmp/drop.conf'),
+                           ('NeedDaemonReload', 'yes')):
+            for value in (None, wrong):
+                bad = dict(props, **{key: value})
+                with self.subTest(key=key, value=value), self.assertRaisesRegex(self.D.Unsupported, key):
+                    self.D._source_empty_exec_fields(bad, fragment)
+            bad = dict(props)
+            del bad[key]
+            with self.subTest(missing=key), self.assertRaisesRegex(self.D.Unsupported, key):
+                self.D._source_empty_exec_fields(bad, fragment)
+        with self.assertRaisesRegex(self.D.Unsupported, 'CapabilityBoundingSet'):
+            self.D.validate_effective(props, self.D.validate_fragment(rendered(True)))
+
+    def test_source_start_and_reload_base_mandatory_and_available_ex_exact(self):
+        fields = self.fields(self.SOURCE_HOOKS)
+        for old, caps in ((True, CAPS3), (False, CAPS4)):
+            fragment = self.D.validate_fragment(rendered(old))
+            good = self.representation(source_properties(old), fields, fields)
+            for key in ('ExecStart', 'ExecReload'):
+                good[key + 'Ex'] = good[key]
+            self.assertEqual(self.D.validate_effective(good, fragment), caps)
+            for key in ('ExecStart', 'ExecReload'):
+                for value in (None, '', exec_property(['/bin/true']),
+                              good[key] + ' ' + exec_property(['/bin/true'])):
+                    for target in (key, key + 'Ex'):
+                        bad = dict(good)
+                        if value is None:
+                            del bad[target]
+                        else:
+                            bad[target] = value
+                        with self.subTest(old=old, target=target, value=value):
+                            if target.endswith('Ex') and value is None:
+                                self.assertEqual(self.D.validate_effective(bad, fragment), caps)
+                            else:
+                                with self.assertRaisesRegex(self.D.Unsupported, target):
+                                    self.D.validate_effective(bad, fragment)
+
+    def test_probe_pre_base_and_available_ex_checked_at_both_snapshots(self):
+        for phase in ('plain', 'trace'):
+            c = self.controller()
+            plan = self.plan(c, phase)
+            fields = self.fields(self.PROBE_HOOKS)
+            good = self.representation(self.probe(c, plan), fields, fields)
+            # Pre Ex is optional, not an alternative to the mandatory Base.
+            c.validate_probe(good, plan)
+            for key, argv in (('ExecStart', plan['argv']), ('ExecStartPre', plan['pre'])):
+                alias = dict(good, **{key + 'Ex': exec_property(argv)})
+                c.validate_probe(alias, plan)
+                for target in (key, key + 'Ex'):
+                    values = ('', exec_property(['/bin/true']),
+                              exec_property(argv + ['--unexpected-fixture']),
+                              exec_property(argv) + ' ' + exec_property(['/bin/true']))
+                    if target == key:
+                        values = (None,) + values
+                    for value in values:
+                        bad = dict(alias)
+                        if value is None:
+                            del bad[target]
+                        else:
+                            bad[target] = value
+                        with self.subTest(phase=phase, target=target, value=value):
+                            with self.assertRaisesRegex(self.D.Unsupported, target):
+                                c.validate_probe(bad, plan)
+                            self.refuse_at_either_snapshot(c, plan, bad, target)
+
+    def test_probe_unused_absent_empty_permutations_require_owned_no_declaration_plan(self):
+        c = self.controller()
+        plan = self.plan(c)
+        fields = self.fields(self.PROBE_HOOKS)
+        for mask in range(1 << len(fields)):
+            absent = [key for bit, key in enumerate(fields) if mask & (1 << bit)]
+            props = self.representation(self.probe(c, plan), fields, absent)
+            with self.subTest(absent=absent):
+                self.assertEqual(c.empty_probe_exec_fields(props, plan), frozenset(fields))
+                c.validate_probe(props, plan)
+        good = self.probe(c, plan)
+        for key, value in (('Id', MAIN), ('Transient', 'no'), ('Description', 'foreign'),
+                           ('ControlGroup', '/system.slice/foreign.service'), ('FragmentPath', FRAGMENT),
+                           ('LoadState', 'not-found'), ('DropInPaths', None),
+                           ('DropInPaths', '/tmp/drop.conf'), ('NeedDaemonReload', 'yes')):
+            with self.subTest(key=key, value=value), self.assertRaises(self.D.Unsupported):
+                c.empty_probe_exec_fields(dict(good, **{key: value}), plan)
+        for key in ('DropInPaths', 'LoadState', 'NeedDaemonReload'):
+            bad = dict(good)
+            del bad[key]
+            with self.assertRaisesRegex(self.D.Unsupported, key):
+                c.empty_probe_exec_fields(bad, plan)
+        # The fixture must not invent unavailable active aliases, nor copy the
+        # source's active Reload Ex or empty Pre Ex into the transient snapshot.
+        self.assertFalse(any(key + 'Ex' in good for key in ('ExecStart', 'ExecStartPre', 'ExecReload')))
+        for phase in ('plain', 'trace'):
+            for key in ('ExecStart', 'ExecReload'):
+                c.source[key + 'Ex'] = c.source[key]
+            c.source['ExecStartPreEx'] = ''
+            augmented = self.plan(c, phase)
+            probe = self.probe(c, augmented)
+            self.assertEqual(probe['ExecStartEx'], exec_property(augmented['argv']))
+            self.assertEqual(probe['ExecStartPreEx'], exec_property(augmented['pre']))
+            self.assertEqual(probe['ExecReloadEx'], '')
+            c.validate_probe(probe, augmented)
+
+    def test_probe_unused_active_base_or_ex_only_never_releases(self):
+        c = self.controller()
+        plan = self.plan(c)
+        fields = self.fields(self.PROBE_HOOKS)
+        for key in fields:
+            for others_absent in (False, True):
+                bad = self.representation(self.probe(c, plan), fields,
+                                          fields if others_absent else ())
+                bad[key] = exec_property(['/bin/true'])
+                with self.subTest(key=key, ex_only=others_absent):
+                    with self.assertRaisesRegex(self.D.Unsupported, 'active-hook:' + key):
+                        c.empty_probe_exec_fields(bad, plan)
+                    self.refuse_at_either_snapshot(c, plan, bad, 'active-hook:' + key)
+
+    def test_probe_unused_plan_mapping_and_all_cli_declaration_forms_rejected(self):
+        c = self.controller()
+        good = self.plan(c)
+        fields = self.fields(self.PROBE_HOOKS)
+        probe = self.representation(self.probe(c, good), fields, fields)
+        for key in fields:
+            for value in ('', '/bin/true'):
+                assignment = key + '=' + value
+                variants = (None, ['--property=' + assignment], ['--property', assignment],
+                            ['-p', assignment], ['-p' + assignment])
+                for args in variants:
+                    plan = copy.deepcopy(good)
+                    if args is None:
+                        plan['properties'][key] = value
+                    else:
+                        boundary = plan['command'].index('--')
+                        plan['command'][boundary:boundary] = args
+                    with self.subTest(key=key, value=value, args=args):
+                        with self.assertRaisesRegex(self.D.Unsupported, 'probe-hook-declared:' + key):
+                            c.empty_probe_exec_fields(probe, plan)
+                        self.refuse_at_either_snapshot(c, plan, probe, 'probe-hook-declared:' + key)
+
+    def test_comparator_strict_defaults_scoped_proofs_and_no_security_exemptions(self):
+        c = self.controller()
+        source_fields = self.fields(self.SOURCE_HOOKS)
+        probe_fields = self.fields(self.PROBE_HOOKS)
+        full = self.representation(c.source, source_fields, ())
+        absent = self.representation(full, source_fields, source_fields)
+        full_proof = self.D._source_empty_exec_fields(full, c.fragment)
+        absent_proof = self.D._source_empty_exec_fields(absent, c.fragment)
+        for left, right, lp, rp in ((full, absent, full_proof, absent_proof),
+                                    (absent, full, absent_proof, full_proof)):
+            self.assertEqual(self.D.restriction_differences(left, right), sorted(source_fields))
+            self.assertEqual(self.D.restriction_differences(
+                left, right, checked_empty_source=lp, checked_empty_probe=rp), [])
+        c.source = full
+        plan = self.plan(c)
+        probe = self.representation(self.probe(c, plan), probe_fields, probe_fields)
+        live = self.representation(probe, probe_fields, ())
+        c.validate_probe(probe, plan)
+        c.validate_probe(live, plan)
+        pp = c.empty_probe_exec_fields(probe, plan)
+        pl = c.empty_probe_exec_fields(live, plan)
+        self.assertEqual(self.D.restriction_differences(probe, live), sorted(probe_fields))
+        self.assertEqual(self.D.restriction_differences(
+            probe, live, checked_empty_source=pp, checked_empty_probe=pl), [])
+        # Validate active argv first, then allow source Pre empty/absent ->
+        # probe active and source Reload active -> probe empty/absent.
+        for source in (full, absent):
+            self.D.validate_effective(source, c.fragment)
+            sp = self.D._source_empty_exec_fields(source, c.fragment)
+            for target, tp in ((probe, pp), (live, pl)):
+                self.assertEqual(self.D.restriction_differences(
+                    source, target, checked_empty_source=sp, checked_empty_probe=tp), [])
+        for key in ('User', 'SystemCallFilter', 'NoNewPrivileges', 'FutureSecurityKnob', 'ExecFutureHook'):
+            left = dict(absent, **{key: 'required'})
+            for right in (dict(left, **{key: 'changed'}), {k: v for k, v in left.items() if k != key}):
+                with self.subTest(key=key):
+                    self.assertEqual(self.D.restriction_differences(
+                        left, right, checked_empty_source=absent_proof,
+                        checked_empty_probe=absent_proof), [key])
+            with self.assertRaisesRegex(self.D.Unsupported, 'empty-hook-proof-scope'):
+                self.D._checked_empty_exec_fields({}, (key,))
+        for key in self.D.EMPTY_EXEC_FIELDS:
+            for side in ('source', 'probe'):
+                active = {key: exec_property(['/bin/true'])}
+                kwargs = {'checked_empty_' + side: (key,)}
+                with self.subTest(key=key, side=side), self.assertRaisesRegex(
+                        self.D.Unsupported, 'active-hook:' + key):
+                    self.D.restriction_differences(active if side == 'source' else {},
+                                                  active if side == 'probe' else {}, **kwargs)
+        for fields in (None, ('ExecStart',), ('ExecStartEx',), ('FutureSecurityKnob',)):
+            with self.assertRaisesRegex(self.D.Unsupported, 'empty-hook-proof-scope'):
+                self.D._checked_empty_exec_fields({}, fields)
+
+    def test_full_gate_source_current_and_probe_live_omissions_caps_phases_and_private_logs(self):
+        sf, pf = self.fields(self.SOURCE_HOOKS), self.fields(self.PROBE_HOOKS)
+        for old in (True, False):
+            for phase in ('plain', 'trace'):
+                for scope, fields in (('source-current', sf), ('probe-live', pf)):
+                    # Both directions plus each individual Base/Ex omission.
+                    cases = [((), fields), (fields, ())] + [((), (key,)) for key in fields]
+                    cases += [((key,), ()) for key in fields]
+                    for first_absent, second_absent in cases:
+                        with self.subTest(old=old, phase=phase, scope=scope,
+                                          first=first_absent, second=second_absent):
+                            c = self.controller(old)
+                            c.source['ExecStartEx'] = c.source['ExecStart']
+                            c.source['ExecReloadEx'] = c.source['ExecReload']
+                            c.source = self.representation(c.source, sf,
+                                                           first_absent if scope == 'source-current' else sf)
+                            # Optional logging metadata remains independently
+                            # unavailable; no production destination is copied.
+                            for key in OptionalLoggingContracts.FILE_KEYS:
+                                c.source.pop(key, None)
+                            plan = self.plan(c, phase)
+                            current = self.representation(c.source, sf,
+                                                         second_absent if scope == 'source-current' else ())
+                            probe = self.representation(self.probe(c, plan), pf,
+                                                       first_absent if scope == 'probe-live' else pf)
+                            live = self.representation(probe, pf,
+                                                      second_absent if scope == 'probe-live' else ())
+                            for key in OptionalLoggingContracts.FILE_KEYS:
+                                probe.pop(key, None)
+                                live.pop(key, None)
+                            self.assertEqual(c.caps, CAPS3 if old else CAPS4)
+                            self.assertEqual((probe['User'], probe['Group']), ('root', 'root'))
+                            self.assertEqual(plan['properties']['ReadWritePaths'], '/opt/nathaya/logs')
+                            destination = str(c.directory / phase / 'combined.log')
+                            for key in ('StandardOutput', 'StandardError'):
+                                self.assertEqual(plan['properties'][key], 'append:' + destination)
+                            self.assertFalse(any('/opt/nathaya/logs/nathaya-haproxy.log' in arg
+                                                 for arg in plan['command']))
+                            c.save.reset_mock()
+                            self.gate(c, plan, probe=probe, current=current, live=live)
+                            c.save.assert_called_once_with(phase + '/go', b'')
+                            evidence = next(call.args[1] for call in c.record.call_args_list
+                                            if call.args[0] == phase + '/comparison.json')
+                            self.assertEqual(evidence['unsupported'], [])
+                            self.assertEqual(evidence['validated_empty_exec']['source'], sorted(sf))
+                            self.assertEqual(evidence['validated_empty_exec']['probe'], sorted(pf))
+                            self.assertEqual(evidence['validated_empty_exec']['source_absent'],
+                                             sorted(set(sf) - set(current)))
+                            self.assertEqual(evidence['validated_empty_exec']['probe_absent'],
+                                             sorted(set(pf) - set(probe)))
+                            logging = next(call.args[1] for call in c.record.call_args_list
+                                           if call.args[0] == phase + '/logging-metadata.json')
+                            self.assertFalse(any(logging['source_file_properties_available'].values()))
+                            self.assertFalse(any(logging['probe_file_properties_available'].values()))
+                            self.assertEqual(logging['probe_destination'], destination)
+
+    def test_failed_or_timed_out_show_with_valid_omitted_body_never_falls_back(self):
+        c = self.controller()
+        fields = self.fields(self.SOURCE_HOOKS)
+        props = self.representation(c.source, fields, fields)
+        self.assertEqual(self.D.validate_effective(props, c.fragment), CAPS4)
+        raw = ''.join(key + '=' + value + '\n' for key, value in props.items()).encode()
+        c.command = Mock(return_value=(0, raw, b''))
+        self.assertEqual(c.show(MAIN), props)
+        for code in (1, None):
+            c.command = Mock(return_value=(code, raw, b'PRIVATE_FIXTURE_VALUE'))
+            with self.subTest(code=code), self.assertRaises(self.D.Unsupported):
+                c.show(MAIN)
+            c.command.assert_called_once_with(
+                ['/usr/bin/systemctl', 'show', '--all', '--no-pager', MAIN], timeout=3)
+
+    def test_source_cannot_prove_fragment_none_never_releases(self):
+        for phase in ('plain', 'trace'):
+            c = self.controller()
+            plan = self.plan(c, phase)
+            fields = self.fields(self.SOURCE_HOOKS)
+            c.source = self.representation(c.source, fields, fields)
+            # Even a valid CURRENT read cannot retroactively prove the saved
+            # source snapshot when its verified fragment evidence is missing.
+            c.fragment = None
+            with self.assertRaisesRegex(self.D.Unsupported, 'source-hook-fragment-uncertain'):
+                self.D.validate_effective(c.source, c.fragment)
+            c.save.reset_mock()
+            with self.assertRaisesRegex(self.D.Unsupported, 'source-hook-fragment-uncertain'):
+                self.gate(c, plan)
+            c.save.assert_not_called()
+
+
 class PureContracts(Offline):
     def test_parse_show_preserves_equals_and_empty_values(self):
         self.assertEqual(self.D.parse_show('Id=fixture.service\nEmpty=\nValue=a=b\n'),
@@ -491,7 +857,7 @@ class PureContracts(Offline):
             p[key] = value
             with self.subTest(property=key), self.assertRaises(self.D.Unsupported):
                 self.D.validate_effective(p, self.D.validate_fragment(rendered()))
-        for key in ('User', 'SystemCallFilter', 'ExecStartPre'):
+        for key in ('User', 'SystemCallFilter'):
             p = source_properties()
             del p[key]
             with self.assertRaises(self.D.Unsupported):

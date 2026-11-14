@@ -159,6 +159,60 @@ def _require(properties, expected):
         raise Unsupported('properties:' + ','.join(sorted(bad)))
 
 
+# These lists describe UNUSED hooks in two different, validated contexts.
+# ExecStart and the probe's ExecStartPre gate are NEVER optional empty hooks.
+SOURCE_EMPTY_EXEC_HOOKS = ('ExecStartPre', 'ExecStartPost', 'ExecCondition',
+                           'ExecStop', 'ExecStopPost')
+PROBE_EMPTY_EXEC_HOOKS = ('ExecReload', 'ExecStartPost', 'ExecCondition',
+                          'ExecStop', 'ExecStopPost')
+EMPTY_EXEC_FIELDS = frozenset(name + suffix
+                              for name in SOURCE_EMPTY_EXEC_HOOKS + PROBE_EMPTY_EXEC_HOOKS
+                              for suffix in ('', 'Ex'))
+
+
+def _checked_empty_exec_fields(properties, fields):
+    try:
+        fields = frozenset(fields)
+    except (TypeError, ValueError):
+        raise Unsupported('empty-hook-proof-scope') from None
+    if not fields <= EMPTY_EXEC_FIELDS:
+        raise Unsupported('empty-hook-proof-scope')
+    for key in sorted(fields):
+        if key in properties and properties[key] != '':
+            raise Unsupported('active-hook:' + key)
+    return fields
+
+
+def _source_empty_exec_fields(properties, fragment):
+    # Runtime callers supply the dictionary returned by validate_fragment after
+    # _read_private_source. Reject partial/different fragment evidence, not merely
+    # a missing hook property. Missing DropInPaths is NOT proof of no drop-ins.
+    _require(properties, {'Id': MAIN, 'LoadState': 'loaded', 'FragmentPath': FRAGMENT,
+                          'DropInPaths': '', 'NeedDaemonReload': 'no'})
+    if not isinstance(fragment, dict):
+        raise Unsupported('source-hook-fragment-uncertain')
+    fields = frozenset(name + suffix for name in SOURCE_EMPTY_EXEC_HOOKS
+                       for suffix in ('', 'Ex'))
+    for key in sorted(fields):
+        if key in fragment:
+            raise Unsupported('source-hook-defined-in-fragment:' + key)
+    expected_values = {**UNIT_FIELDS, **SERVICE_FIELDS, **INSTALL_FIELDS}
+    if set(fragment) != set(expected_values) | {'CapabilityBoundingSet'}:
+        raise Unsupported('source-hook-fragment-uncertain')
+    for key, value in fragment.items():
+        if not isinstance(value, str):
+            raise Unsupported('source-hook-fragment-uncertain')
+        if key == 'CapabilityBoundingSet':
+            if _capset(value) not in (CAPS3, CAPS4):
+                raise Unsupported('source-hook-fragment-uncertain')
+        elif key in ('StandardOutput', 'StandardError'):
+            if not value.startswith('append:') or not value[len('append:'):]:
+                raise Unsupported('source-hook-fragment-uncertain')
+        elif value != expected_values[key]:
+            raise Unsupported('source-hook-fragment-uncertain')
+    return _checked_empty_exec_fields(properties, fields)
+
+
 def _exec_struct(value, argv):
     """Validate one show Exec* structure against our exact command factory.
 
@@ -217,6 +271,7 @@ def validate_effective(properties, fragment):
         # The production log pathname is not needed and is not always exposed
         # by systemd's D-Bus interface. Never infer an absent property as empty.
     })
+    _source_empty_exec_fields(properties, fragment)
     caps = _capset(properties.get('CapabilityBoundingSet', ''))
     if caps not in (CAPS3, CAPS4) or caps != _capset(fragment['CapabilityBoundingSet']):
         raise Unsupported('CapabilityBoundingSet')
@@ -232,9 +287,6 @@ def validate_effective(properties, fragment):
             raise Unsupported(name)
         if name + 'Ex' in properties and not _exec_struct(properties[name + 'Ex'], argv):
             raise Unsupported(name + 'Ex')
-    for name in ('ExecStartPre', 'ExecStartPost', 'ExecCondition', 'ExecStop', 'ExecStopPost'):
-        if properties.get(name) != '' or properties.get(name + 'Ex', '') != '':
-            raise Unsupported(name)
     return caps
 
 
@@ -295,14 +347,26 @@ def _equivalent(key, value):
     return value
 
 
-def restriction_differences(source, probe):
-    """Only the two optional log File metadata keys may be missing/extra.
+def restriction_differences(source, probe, *, checked_empty_source=(), checked_empty_probe=()):
+    """Empty-hook representation equivalence needs explicit, scoped proof.
 
-    All other missing/extra properties block, even runtime/intended fields.
-    Returned names contain no values. Intended differences are separately
-    validated by Controller.gate; this function does not authorise execution.
+    Defaults remain strict (apart from the two optional log File metadata keys).
+    Callers MUST validate fragment/plan, active argv, ownership and drop-ins first.
+    Present nonempty hooks cannot claim empty proof. No Exec-prefix exemption.
+    This comparison never authorises execution by itself.
     """
+    empty_source = _checked_empty_exec_fields(source, checked_empty_source)
+    empty_probe = _checked_empty_exec_fields(probe, checked_empty_probe)
     missing = (set(source) ^ set(probe)) - OPTIONAL_LOG_PROPERTIES
+    for key in tuple(missing):
+        # Only Pre and Reload are intentional empty<->active context changes;
+        # active base commands/available Ex argv must already have been checked.
+        if key in INTENDED_PROPERTIES and key in (empty_source | empty_probe):
+            missing.remove(key)
+        elif key not in source and key in empty_source and probe[key] == '':
+            missing.remove(key)
+        elif key not in probe and key in empty_probe and source[key] == '':
+            missing.remove(key)
     changed = {k for k in set(source) & set(probe)
                if k not in RUNTIME_PROPERTIES | INTENDED_PROPERTIES
                and _equivalent(k, source[k]) != _equivalent(k, probe[k])}
@@ -718,6 +782,40 @@ class Controller:
             if key in probe and probe[key] != destination:
                 raise Unsupported(key)
 
+    def empty_probe_exec_fields(self, probe, plan):
+        # No unused hook may be declared, even as an empty reset. Validate the
+        # actual property arguments too, not only the cached property mapping.
+        if not owned_unit(probe, plan['unit'], self.nonce):
+            raise Unsupported('probe-ownership')
+        _require(probe, {'LoadState': 'loaded', 'DropInPaths': '', 'NeedDaemonReload': 'no'})
+        fields = frozenset(name + suffix for name in PROBE_EMPTY_EXEC_HOOKS
+                           for suffix in ('', 'Ex'))
+        if not isinstance(plan['properties'], dict) or not isinstance(plan['command'], list):
+            raise Unsupported('probe-hook-plan-uncertain')
+        declarations = set(plan['properties'])
+        args = plan['command']
+        for index, arg in enumerate(args):
+            if not isinstance(arg, str):
+                raise Unsupported('probe-hook-plan-uncertain')
+            assignment = None
+            if arg.startswith('--property='):
+                assignment = arg[len('--property='):]
+            elif arg in ('--property', '-p'):
+                if index + 1 >= len(args) or not isinstance(args[index + 1], str):
+                    raise Unsupported('probe-hook-plan-uncertain')
+                assignment = args[index + 1]
+            elif arg.startswith('-p') and arg != '-p':
+                assignment = arg[2:]
+            if assignment is not None:
+                name, separator, _value = assignment.partition('=')
+                if not separator:
+                    raise Unsupported('probe-hook-plan-uncertain')
+                declarations.add(name)
+        for key in sorted(fields):
+            if key in declarations:
+                raise Unsupported('probe-hook-declared:' + key)
+        return _checked_empty_exec_fields(probe, fields)
+
     def validate_probe(self, probe, plan):
         unit = plan['unit']
         if not owned_unit(probe, unit, self.nonce):
@@ -738,8 +836,7 @@ class Controller:
                 raise Unsupported(key)
             if key + 'Ex' in probe and not _exec_struct(probe[key + 'Ex'], argv):
                 raise Unsupported(key + 'Ex')
-        if probe.get('ExecReload') != '' or probe.get('ExecReloadEx', '') != '':
-            raise Unsupported('ExecReload')
+        self.empty_probe_exec_fields(probe, plan)
 
     def gate(self, plan):
         unit = plan['unit']
@@ -764,8 +861,12 @@ class Controller:
         _no_lock()
         current = self.show(MAIN, timeout=max(0.01, deadline - time.monotonic()))
         raw, metadata = _read_private_source(FRAGMENT, 65536)
-        validate_effective(current, validate_fragment(raw.decode('utf-8', 'strict')))
-        if raw != self.source_bytes or restriction_differences(self.source, current):
+        current_fragment = validate_fragment(raw.decode('utf-8', 'strict'))
+        validate_effective(current, current_fragment)
+        source_empty = _source_empty_exec_fields(self.source, self.fragment)
+        current_empty = _source_empty_exec_fields(current, current_fragment)
+        if raw != self.source_bytes or restriction_differences(
+                self.source, current, checked_empty_source=source_empty, checked_empty_probe=current_empty):
             raise Unsupported('source-profile-changed')
         self.record(plan['phase'] + '/source-gate.metadata.json', metadata)
         self.record(plan['phase'] + '/probe-gate.show.json', probe)
@@ -778,12 +879,21 @@ class Controller:
             # Absence means unavailable, NOT a verified empty pathname. If a
             # probe File property is available, validate_probe_logging checks it.
         })
-        differences = restriction_differences(current, probe)
+        probe_empty = self.empty_probe_exec_fields(probe, plan)
+        differences = restriction_differences(current, probe, checked_empty_source=current_empty,
+                                             checked_empty_probe=probe_empty)
         ignored = {k: {'source': current.get(k), 'probe': probe.get(k),
                        'category': 'intended' if k in INTENDED_PROPERTIES else 'runtime-metadata'}
                    for k in sorted(set(current) | set(probe))
                    if current.get(k) != probe.get(k) and k in RUNTIME_PROPERTIES | INTENDED_PROPERTIES}
-        self.record(plan['phase'] + '/comparison.json', {'ignored': ignored, 'unsupported': differences})
+        self.record(plan['phase'] + '/comparison.json', {
+            'ignored': ignored, 'unsupported': differences,
+            'validated_empty_exec': {
+                'source': sorted(current_empty), 'probe': sorted(probe_empty),
+                'source_absent': sorted(k for k in current_empty if k not in current),
+                'probe_absent': sorted(k for k in probe_empty if k not in probe),
+            },
+        })
         if differences:
             raise Unsupported('properties:' + ','.join(differences))
         # Both comparison and gate must be live at the instant of release. The
@@ -792,10 +902,12 @@ class Controller:
             raise Unsupported('prestart-deadline')
         live = self.show(unit, timeout=max(0.01, deadline - time.monotonic()))
         self.validate_probe(live, plan)
+        live_empty = self.empty_probe_exec_fields(live, plan)
         if (not owned_unit(live, unit, self.nonce) or
                 live.get('ActiveState') != 'activating' or live.get('SubState') != 'start-pre' or
                 live.get('ControlPID') != probe.get('ControlPID') or
-                restriction_differences(probe, live) or time.monotonic() >= deadline):
+                restriction_differences(probe, live, checked_empty_source=probe_empty,
+                                        checked_empty_probe=live_empty) or time.monotonic() >= deadline):
             raise Unsupported('prestart-unavailable')
         _no_lock()
         self.release_reservations()
