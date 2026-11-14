@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 
-SCRIPT_DIR="/opt/nathaya/modules/ssh"
-source "$SCRIPT_DIR/account-db.sh"
-source "/opt/nathaya/modules/common/ui.sh"
+source "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../common" && pwd)/bootstrap.sh" || { return 1 2>/dev/null || exit 1; }
+source "$NATHAYA_BASE/modules/ssh/account-db.sh"
+source "$NATHAYA_BASE/modules/common/ui.sh"
 
 create_ssh_account() {
     if [[ $EUID -ne 0 ]]; then
@@ -31,8 +31,8 @@ create_ssh_account() {
     local isp="Tidak diketahui" city="Tidak diketahui"
     local next_action=""
 
-    domain="$(sed -n 's/^DOMAIN="\([^"]*\)"/\1/p' \
-        /etc/nathaya-tunnel/config.conf | head -1)"
+    load_nathaya_config || true
+    domain="${DOMAIN:-}"
     public_ip="$(curl -4 -fsS --max-time 5 \
         https://api.ipify.org 2>/dev/null || true)"
 
@@ -117,32 +117,41 @@ create_ssh_account() {
     expiry="$(date -d "+${days} days" +%F)"
     linux_expiry="$(date -d "${expiry} +1 day" +%F)"
 
-    if ! useradd -m -s /bin/bash "$username"; then
-        printf '%bGagal membuat akun Linux.%b\n' "$C_RED" "$C_RESET"
-        unset password
-        eval "$old_set"
-        return 1
-    fi
-
-    if ! printf '%s:%s\n' "$username" "$password" | chpasswd; then
-        userdel -r "$username" 2>/dev/null || true
-        printf '%bGagal mengatur password.%b\n' "$C_RED" "$C_RESET"
-        unset password
-        eval "$old_set"
-        return 1
-    fi
-
-    if ! chage -E "$linux_expiry" "$username"; then
-        userdel -r "$username" 2>/dev/null || true
-        printf '%bGagal mengatur masa aktif.%b\n' "$C_RED" "$C_RESET"
-        unset password
-        eval "$old_set"
-        return 1
-    fi
-
-    if ! ssh_db_add_account "$username" "$created" "$expiry" "$limit_ip"; then
-        userdel -r "$username" 2>/dev/null || true
-        printf '%bGagal menyimpan database akun.%b\n' "$C_RED" "$C_RESET"
+    # Lock only the mutation window, never prompts, network or Telegram.
+    # A subshell owns FD 8 so every failure/signal closes it; DB helpers use FD 9.
+    if ! (
+        flock -x 8 || exit 1
+        if ssh_username_exists "$username" || ssh_db_has_username "$username"; then
+            printf '%bUsername sudah digunakan.%b\n' "$C_RED" "$C_RESET"
+            exit 1
+        fi
+        if ! useradd -m -s /bin/bash "$username"; then
+            printf '%bGagal membuat akun Linux.%b\n' "$C_RED" "$C_RESET"
+            unset password
+            exit 1
+        fi
+    
+        if ! printf '%s:%s\n' "$username" "$password" | chpasswd; then
+            userdel -r "$username" 2>/dev/null || true
+            printf '%bGagal mengatur password.%b\n' "$C_RED" "$C_RESET"
+            unset password
+            exit 1
+        fi
+    
+        if ! chage -E "$linux_expiry" "$username"; then
+            userdel -r "$username" 2>/dev/null || true
+            printf '%bGagal mengatur masa aktif.%b\n' "$C_RED" "$C_RESET"
+            unset password
+            exit 1
+        fi
+    
+        if ! ssh_db_add_account "$username" "$created" "$expiry" "$limit_ip"; then
+            userdel -r "$username" 2>/dev/null || true
+            printf '%bGagal menyimpan database akun.%b\n' "$C_RED" "$C_RESET"
+            unset password
+            exit 1
+        fi
+    ) 8>>"$NATHAYA_SSH_OPERATIONS_LOCK"; then
         unset password
         eval "$old_set"
         return 1
@@ -169,7 +178,7 @@ create_ssh_account() {
 
     printf '\n%bCONNECTION INFORMATION%b\n' "$C_CYAN" "$C_RESET"
     printf '%b%s%b\n' "$C_CYAN" "$LINE" "$C_RESET"
-    printf 'SSH Ports : 22, 2222, 2223\n'
+    printf 'SSH Ports : Sesuai konfigurasi server\n'
     printf 'UDP       : Belum dikonfigurasi\n'
 
     printf '\n%bPAYLOAD HTTP%b\n' "$C_CYAN" "$C_RESET"
@@ -187,8 +196,8 @@ create_ssh_account() {
     printf '%b%s%b\n\n' "$C_CYAN" "$LINE" "$C_RESET"
 
     # Notifikasi Telegram: label seragam, nilai monospace.
-    if [[ -r /opt/nathaya/modules/common/telegram.sh ]]; then
-        source /opt/nathaya/modules/common/telegram.sh
+    if [[ -r "$NATHAYA_BASE/modules/common/telegram.sh" ]]; then
+        source "$NATHAYA_BASE/modules/common/telegram.sh"
 
         telegram_message="&#128640; <b>NATHAYA TUNNEL</b>
 &#128994; <b>SSH ACCOUNT CREATED</b>
@@ -212,7 +221,7 @@ create_ssh_account() {
 ━━━━━━━━━━━━━━━━━━━━
 <b>CONNECTION</b>
 ━━━━━━━━━━━━━━━━━━━━
-<code>SSH Port:</code> <code>22, 2222, 2223</code>
+<code>SSH Port:</code> <code>Sesuai konfigurasi server</code>
 <code>UDP     :</code> <code>Belum dikonfigurasi</code>
 
 ━━━━━━━━━━━━━━━━━━━━

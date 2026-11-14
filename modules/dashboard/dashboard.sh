@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# NATHAYA_BASE diwarisi dari menu.sh.
+source "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../common" && pwd)/bootstrap.sh" || { return 1 2>/dev/null || exit 1; }
 
 source "$NATHAYA_BASE/modules/common/ui.sh"
 source "$NATHAYA_BASE/modules/common/functions.sh"
@@ -65,7 +65,7 @@ draw_dashboard_info() {
     draw_section_title "TELEGRAM STATUS" "$width"
 
     printf '%b│%b Notification Bot : ' "$CYAN" "$RESET"
-    status_badge "${TELEGRAM_NOTIFICATION_STATUS:-OFF}"
+    status_badge "${TELEGRAM_STATUS:-OFF}"
     printf ' │ Management Bot : '
     status_badge "${TELEGRAM_MANAGEMENT_STATUS:-OFF}"
     printf '\n'
@@ -77,11 +77,11 @@ draw_dashboard_info() {
     draw_section_title "SERVICE STATUS" "$width"
 
     _service_row "SSH" "$SSH_STATUS" "XRAY" "$XRAY_STATUS"
-    _service_row "DROPBEAR" "$(get_service_status dropbear)" \
-        "NGINX" "$(get_service_status nginx)"
+    _service_row "DROPBEAR" "$(get_service_status nathaya-dropbear.service)" \
+        "NGINX" "$(get_service_status nathaya-nginx.service)"
 
     printf '%b│%b OPENVPN  : ' "$CYAN" "$RESET"
-    status_badge "$(get_service_status openvpn)"
+    printf '%bBLOCKED%b' "$ORANGE" "$RESET"
     printf '\n'
 
     draw_box_bottom "$width" "$CYAN"
@@ -90,10 +90,10 @@ draw_dashboard_info() {
     printf '\n'
     draw_section_title "ACCOUNT TOTAL" "$width"
 
-    printf '%b│%b SSH : %b%s%b │ VMESS : %b0%b │ VLESS : %b0%b │ TROJAN : %b0%b\n' \
+    printf '%b│%b SSH : %b%s%b │ VMESS : %b%s%b │ VLESS : %b%s%b │ TROJAN : %b%s%b\n' \
         "$CYAN" "$RESET" "$ORANGE" "$SSH_TOTAL" "$RESET" \
-        "$ORANGE" "$RESET" "$ORANGE" "$RESET" \
-        "$ORANGE" "$RESET"
+        "$ORANGE" "$VMESS_TOTAL" "$RESET" "$ORANGE" "$VLESS_TOTAL" "$RESET" \
+        "$ORANGE" "$TROJAN_TOTAL" "$RESET"
 
     draw_box_bottom "$width" "$CYAN"
 
@@ -102,7 +102,7 @@ draw_dashboard_info() {
     draw_box_top "$width" "$CYAN"
 
     printf '%b│%b Script Version : %s\n' \
-        "$CYAN" "$RESET" "${SCRIPT_VERSION:-1.0.0}"
+        "$CYAN" "$RESET" "${SCRIPT_VERSION:-unknown}"
 
     printf '%b│%b Developer      : %b%s%b\n' \
         "$CYAN" "$RESET" "$ORANGE" \

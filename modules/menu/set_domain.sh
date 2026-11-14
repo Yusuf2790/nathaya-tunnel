@@ -1,7 +1,6 @@
 #!/bin/bash
 
-# NATHAYA_BASE diwarisi dari menu.sh.
-CONFIG_FILE="/etc/nathaya-tunnel/config.conf"
+source "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../common" && pwd)/bootstrap.sh" || { return 1 2>/dev/null || exit 1; }
 
 source "$NATHAYA_BASE/modules/common/ui.sh"
 source "$NATHAYA_BASE/modules/common/functions.sh"
@@ -26,7 +25,13 @@ get_domain_a_records() {
         awk '/^([0-9]{1,3}\.){3}[0-9]{1,3}$/'
 }
 
-set_domain_vps() {
+set_domain_vps() (
+    [[ $EUID -eq 0 ]] || { printf 'ERROR: Jalankan sebagai root.\n'; return 1; }
+    if [[ -e "$NATHAYA_CONFIG/managed-services.json" ]]; then
+        printf 'Domain layanan/TLS terkelola tidak dapat diganti dari menu ini; perlu migrasi terkoordinasi.\n'
+        pause_return
+        return 1
+    fi
     clear
 
     local width domain confirm vps_ip
@@ -38,7 +43,7 @@ set_domain_vps() {
     draw_nathaya_header "$width"
     draw_section_title "SET DOMAIN VPS" "$width"
 
-    source "$CONFIG_FILE" 2>/dev/null || true
+    load_nathaya_config || true
 
     printf "  Domain saat ini : %s\n\n" "${DOMAIN:-Belum disetting}"
     printf "  Masukkan domain VPS.\n"
@@ -99,9 +104,11 @@ set_domain_vps() {
             ;;
     esac
 
-    mkdir -p "$(dirname "$CONFIG_FILE")"
-    touch "$CONFIG_FILE"
-    chmod 600 "$CONFIG_FILE"
+    # Serialize with installer, renewal and updater; never change domain mid-deploy.
+    mkdir -m 700 -- /run/nathaya-tunnel-setup.lock || { printf 'Installer/update/renewal sedang aktif.\n'; return 1; }
+    trap 'rmdir -- /run/nathaya-tunnel-setup.lock' EXIT
+    [[ ! -e "$NATHAYA_CONFIG/managed-services.json" ]] || return 1
+    mkdir -p -- "$(dirname -- "$CONFIG_FILE")" || return 1
 
     local tmp
     tmp=$(mktemp "${CONFIG_FILE}.XXXXXX") || {
@@ -111,13 +118,30 @@ set_domain_vps() {
     }
 
     if [[ -f "$CONFIG_FILE" ]]; then
-        grep -v '^DOMAIN=' "$CONFIG_FILE" > "$tmp" || true
+        grep -Ev '^[[:space:]]*DOMAIN[[:space:]]*=' "$CONFIG_FILE" > "$tmp" || {
+            local rc=$?
+            if (( rc > 1 )); then
+                rm -f -- "$tmp"
+                printf "\n  Gagal membaca konfigurasi.\n"
+                pause_return
+                return 1
+            fi
+        }
     fi
 
-    printf 'DOMAIN="%s"\n' "$domain" >> "$tmp"
-    chmod 600 "$tmp"
-    mv "$tmp" "$CONFIG_FILE"
+    if ! printf 'DOMAIN="%s"\n' "$domain" >> "$tmp"; then
+        rm -f -- "$tmp"
+        printf "\n  Gagal menulis konfigurasi.\n"
+        pause_return
+        return 1
+    fi
+    if ! { chmod 600 "$tmp" && chown root:root "$tmp" && mv -- "$tmp" "$CONFIG_FILE"; }; then
+        rm -f -- "$tmp"
+        printf "\n  Gagal menyimpan konfigurasi.\n"
+        pause_return
+        return 1
+    fi
 
     printf "\n  Domain berhasil disimpan!\n"
     pause_return
-}
+)

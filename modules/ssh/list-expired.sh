@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 
-NATHAYA_EXPIRED_BASE="/opt/nathaya"
-
-source "$NATHAYA_EXPIRED_BASE/modules/ssh/account-db.sh"
-source "$NATHAYA_EXPIRED_BASE/modules/common/ui.sh"
+source "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../common" && pwd)/bootstrap.sh" || { return 1 2>/dev/null || exit 1; }
+source "$NATHAYA_BASE/modules/ssh/account-db.sh"
+source "$NATHAYA_BASE/modules/common/ui.sh"
 
 list_expired_ssh_users() {
     clear

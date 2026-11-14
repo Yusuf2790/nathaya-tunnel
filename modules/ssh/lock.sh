@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-NATHAYA_BASE="${NATHAYA_BASE:-/opt/nathaya}"
+source "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../common" && pwd)/bootstrap.sh" || { return 1 2>/dev/null || exit 1; }
 source "$NATHAYA_BASE/modules/common/ui.sh"
 source "$NATHAYA_BASE/modules/ssh/account-db.sh"
 
@@ -9,6 +9,7 @@ lock_ssh_account() {
 
     local width choice username created expiry limit_ip status lock_until account_type
     local uid shell confirm today record item current_type
+    local current_record fields identity linux_user linux_uid home
     local -a accounts=()
 
     ssh_db_init || return 1
@@ -122,36 +123,60 @@ lock_ssh_account() {
 
         case "${confirm,,}" in
             y|yes)
-                # Recheck type/status immediately before changing the Linux password.
-                record="$(ssh_db_get_account "$username")" || {
-                    echo "ERROR: Record database tidak ditemukan; operasi dibatalkan."
-                    read -r -p "Tekan Enter untuk kembali..." _
-                    continue
-                }
-                IFS='|' read -r username created expiry limit_ip status lock_until current_type <<< "$record"
-                if [[ "$current_type" != "regular" || "$status" != "active" ]] || ! ssh_valid_date "$expiry"; then
-                    echo "ERROR: Data akun berubah atau bukan akun regular active; operasi dibatalkan."
-                    read -r -p "Tekan Enter untuk kembali..." _
-                    continue
-                fi
-                if passwd -l "$username"; then
-                    if ssh_db_update_status "$username" locked 0; then
-                        # Putuskan proses milik akun target saja setelah DB dan password berhasil di-lock.
-                        # Jangan gunakan pkill untuk user root atau service SSH global.
-                        pkill -KILL -u "$username" 2>/dev/null || true
-                        printf '\n%bLock berhasil: %s%b\n' "$GREEN" "$username" "$RESET"
-                        echo "Status password Linux: terkunci."
-                        echo "Sesi/proses aktif akun target telah dihentikan (jika ada)."
-                    else
-                        if passwd -u "$username"; then
-                            echo "ERROR: Database gagal; password di-rollback."
-                        else
-                            echo "PERINGATAN: Database dan rollback gagal; periksa akun segera."
-                        fi
+                # Re-read under the shared operation lock after confirmation.
+                # Subshell scope closes FD 8 on all exits; DB flock stays on FD 9.
+                (
+                    flock -x 8 || exit 1
+                    current_record="$(ssh_db_get_account "$username")" || {
+                        echo "ERROR: Record database tidak ditemukan; operasi dibatalkan."
+                        exit 1
+                    }
+                    if [[ "$current_record" != "$record" || "$current_record" == *$'\n'* ]]; then
+                        echo "ERROR: Data akun berubah atau bukan akun regular active; operasi dibatalkan."
+                        exit 1
                     fi
-                else
-                    echo "ERROR: Gagal mengunci password Linux."
-                fi
+                    fields="${current_record//[^|]/}"
+                    [[ ${#fields} -eq 6 ]] || exit 1
+                    IFS='|' read -r username created expiry limit_ip status lock_until current_type <<< "$current_record"
+                    if [[ "$current_type" != "regular" || "$status" != "active" ]] ||
+                       ! ssh_valid_username "$username" || [[ "$username" == "root" ]] ||
+                       ! ssh_valid_date "$created" || ! ssh_valid_date "$expiry" ||
+                       ssh_account_expiry_reached regular "$expiry"; then
+                        echo "ERROR: Data akun berubah atau bukan akun regular active; operasi dibatalkan."
+                        exit 1
+                    fi
+                    uid="$(id -u "$username" 2>/dev/null)" || exit 1
+                    identity="$(getent passwd "$username")" || exit 1
+                    IFS=: read -r linux_user _ linux_uid _ _ home shell <<< "$identity"
+                    if [[ "$identity" == *$'\n'* || ! "$uid" =~ ^[1-9][0-9]{3,9}$ ||
+                          "$uid" -lt 1000 || "$uid" == 65534 ||
+                          "$linux_user" != "$username" || "$linux_uid" != "$uid" ||
+                          "$home" != "/home/$username" || "$shell" != "/bin/bash" ]]; then
+                        echo "Akun tidak memenuhi syarat pengelolaan Nathaya."
+                        exit 1
+                    fi
+                    if ! passwd -S "$username" | awk '$2=="P"{ok=1} END{exit !ok}'; then
+                        echo "Password Linux tidak berstatus normal; tidak diubah."
+                        exit 1
+                    fi
+                    if passwd -l "$username"; then
+                        if ssh_db_update_status "$username" locked 0; then
+                            # Only the revalidated managed user, never root/services.
+                            pkill -KILL -u "$uid" 2>/dev/null || true
+                            printf '\n%bLock berhasil: %s%b\n' "$GREEN" "$username" "$RESET"
+                            echo "Status password Linux: terkunci."
+                            echo "Sesi/proses aktif akun target telah dihentikan (jika ada)."
+                        else
+                            if passwd -u "$username"; then
+                                echo "ERROR: Database gagal; password di-rollback."
+                            else
+                                echo "PERINGATAN: Database dan rollback gagal; periksa akun segera."
+                            fi
+                        fi
+                    else
+                        echo "ERROR: Gagal mengunci password Linux."
+                    fi
+                ) 8>>"$NATHAYA_SSH_OPERATIONS_LOCK" || true
                 ;;
             *) echo "Lock dibatalkan." ;;
         esac

@@ -1,0 +1,9 @@
+[Unit]
+Description=Nathaya certificate renewal checks
+[Timer]
+OnCalendar=*-*-* 03,15:25:00
+RandomizedDelaySec=1800
+Persistent=true
+Unit=nathaya-cert-renew.service
+[Install]
+WantedBy=timers.target

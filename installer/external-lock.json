@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "xray": {
+    "repository": "XTLS/Xray-core",
+    "version": "v26.11.9",
+    "asset": "Xray-linux-64.zip",
+    "sha256": "b651f7e1d9966ee2c1b1ee1bf8b52c72771824d3065dce96bbc8bcc19ed95f82",
+    "url": "https://github.com/XTLS/Xray-core/releases/download/v26.11.9/Xray-linux-64.zip",
+    "metadata": "https://api.github.com/repos/XTLS/Xray-core/releases/tags/v26.11.9",
+    "max_bytes": 33554432
+  },
+  "udp_custom": {
+    "status": "BLOCKED",
+    "reason": "Reference opaque binary: version/checksum/source/license not established"
+  },
+  "badvpn": {
+    "status": "BLOCKED",
+    "reason": "Reference opaque binary provenance/version/license not established"
+  },
+  "openvpn_archive": {
+    "status": "BLOCKED",
+    "reason": "Reference zip members/server config/private material not inspectable with current tools; no approved server contract"
+  }
+}

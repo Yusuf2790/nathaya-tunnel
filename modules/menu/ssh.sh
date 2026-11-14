@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# NATHAYA_BASE diwarisi dari menu.sh.
+source "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../common" && pwd)/bootstrap.sh" || { return 1 2>/dev/null || exit 1; }
 
 source "$NATHAYA_BASE/modules/common/ui.sh"
 

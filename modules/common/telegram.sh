@@ -1,16 +1,13 @@
 #!/usr/bin/env bash
 
-NATHAYA_TELEGRAM_CONFIG="/etc/nathaya-tunnel/config.conf"
-NATHAYA_TELEGRAM_LOG="/opt/nathaya/logs/telegram.log"
+source "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/bootstrap.sh" || { return 1 2>/dev/null || exit 1; }
 
 telegram_send_message() {
     local message="${1:-}"
     local response_file http_code
 
-    [[ -r "$NATHAYA_TELEGRAM_CONFIG" ]] || return 1
     [[ -n "$message" ]] || return 1
-
-    source "$NATHAYA_TELEGRAM_CONFIG"
+    load_nathaya_config || return 1
 
     [[ "${TELEGRAM_STATUS:-OFF}" == "ON" ]] || return 2
     [[ -n "${TELEGRAM_BOT_TOKEN:-}" ]] || return 3
@@ -40,6 +37,7 @@ telegram_send_message() {
         return 0
     fi
 
+    mkdir -p -- "$NATHAYA_LOG_DIR" 2>/dev/null || true
     {
         printf '%s Telegram send failed; HTTP=%s\n' \
             "$(date '+%F %T')" "${http_code:-unknown}"

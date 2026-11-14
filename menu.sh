@@ -5,8 +5,7 @@
 # Main Entry Point
 # ==========================================
 
-NATHAYA_BASE="${NATHAYA_BASE:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}"
-CONFIG_FILE="/etc/nathaya-tunnel/config.conf"
+source "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/modules/common" && pwd)/bootstrap.sh" || { return 1 2>/dev/null || exit 1; }
 
 source "$NATHAYA_BASE/modules/common/ui.sh"
 source "$NATHAYA_BASE/modules/common/functions.sh"
@@ -17,11 +16,7 @@ source "$NATHAYA_BASE/modules/menu/domain.sh"
 source "$NATHAYA_BASE/modules/menu/set_domain.sh"
 
 # ---------- Informasi versi ----------
-SCRIPT_VERSION="1.0.0"
-
-if [[ -f "$CONFIG_FILE" ]]; then
-    source "$CONFIG_FILE"
-fi
+SCRIPT_VERSION="$(get_nathaya_version)"
 
 # ---------- Pesan fitur sementara ----------
 feature_not_ready() {
@@ -45,7 +40,7 @@ dashboard_loop() {
         clear
         draw_dashboard_info
 
-        read -r choice
+        read -r choice || return 0
 
         case "${choice,,}" in
             menu)
@@ -66,7 +61,7 @@ dashboard_loop() {
 main_menu_loop() {
     while true; do
         show_main_menu
-        read -r -p "  Pilih menu: " choice
+        read -r -p "  Pilih menu: " choice || return 0
 
         case "${choice,,}" in
             1)
@@ -96,7 +91,7 @@ main_menu_loop() {
 ssh_menu_loop() {
     while true; do
         show_ssh_menu
-        read -r -p "  Pilih menu SSH: " choice
+        read -r -p "  Pilih menu SSH: " choice || return 0
 
         case "${choice,,}" in
             1)
@@ -156,7 +151,7 @@ ssh_menu_loop() {
 domain_menu_loop() {
     while true; do
         show_domain_menu
-        read -r -p "  Pilih menu Domain: " choice
+        read -r -p "  Pilih menu Domain: " choice || return 0
 
         case "${choice,,}" in
             1)
@@ -180,4 +175,13 @@ domain_menu_loop() {
 }
 
 # ---------- Jalankan aplikasi ----------
-dashboard_loop
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    case "${1:-}" in
+        ''|--login) ;;
+        --help|-h) printf 'Pemakaian: menu [--login]\n'; exit 0 ;;
+        *) printf 'Opsi menu tidak dikenal.\n' >&2; exit 2 ;;
+    esac
+    if [[ "${1:-}" == --login && ( ! -t 0 || ! -t 1 ) ]]; then exit 0; fi
+    load_nathaya_config || true
+    dashboard_loop
+fi

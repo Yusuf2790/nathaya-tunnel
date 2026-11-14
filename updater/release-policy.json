@@ -1,0 +1,317 @@
+{
+  "schema": 1,
+  "channel": "stable",
+  "source": {
+    "owner": "Yusuf2790",
+    "repo": "nathaya-tunnel"
+  },
+  "supported_deployed_schemas": [
+    1
+  ],
+  "files": {
+    "menu.sh": {
+      "mode": "0755",
+      "deploy": true
+    },
+    "VERSION": {
+      "mode": "0644",
+      "deploy": true
+    },
+    "NOTICE": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "licenses/Alrescha79-MIT.txt": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "config/config.conf.example": {
+      "mode": "0644",
+      "deploy": true
+    },
+    "config/ports.json": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "modules/common/bootstrap.sh": {
+      "mode": "0644",
+      "deploy": true
+    },
+    "modules/common/functions.sh": {
+      "mode": "0644",
+      "deploy": true
+    },
+    "modules/common/telegram.sh": {
+      "mode": "0644",
+      "deploy": true
+    },
+    "modules/common/ui.sh": {
+      "mode": "0644",
+      "deploy": true
+    },
+    "modules/dashboard/dashboard.sh": {
+      "mode": "0644",
+      "deploy": true
+    },
+    "modules/menu/domain.sh": {
+      "mode": "0644",
+      "deploy": true
+    },
+    "modules/menu/main.sh": {
+      "mode": "0644",
+      "deploy": true
+    },
+    "modules/menu/set_domain.sh": {
+      "mode": "0644",
+      "deploy": true
+    },
+    "modules/menu/ssh.sh": {
+      "mode": "0644",
+      "deploy": true
+    },
+    "modules/ssh/account-db.sh": {
+      "mode": "0644",
+      "deploy": true
+    },
+    "modules/ssh/create.sh": {
+      "mode": "0644",
+      "deploy": true
+    },
+    "modules/ssh/delete.sh": {
+      "mode": "0644",
+      "deploy": true
+    },
+    "modules/ssh/list-expired.sh": {
+      "mode": "0644",
+      "deploy": true
+    },
+    "modules/ssh/list-member.sh": {
+      "mode": "0644",
+      "deploy": true
+    },
+    "modules/ssh/lock.sh": {
+      "mode": "0644",
+      "deploy": true
+    },
+    "modules/ssh/login.sh": {
+      "mode": "0644",
+      "deploy": true
+    },
+    "modules/ssh/renew.sh": {
+      "mode": "0644",
+      "deploy": true
+    },
+    "modules/ssh/trial.sh": {
+      "mode": "0644",
+      "deploy": true
+    },
+    "modules/ssh/unlock.sh": {
+      "mode": "0644",
+      "deploy": true
+    },
+    "modules/maintenance/ssh-expire.sh": {
+      "mode": "0644",
+      "deploy": true
+    },
+    "installer/lib.sh": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "installer/policy.sh": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "installer/openssh.sh": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "installer/domain.sh": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "installer/dependencies.sh": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "installer/firewall.sh": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "installer/dropbear.sh": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "installer/websocket.sh": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "installer/udp.sh": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "installer/openvpn.sh": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "installer/ui.sh": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "installer/runtime.sh": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "installer/tls.sh": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "installer/tls-renew.sh": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "installer/xray.sh": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "installer/proxies.sh": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "installer/maintenance.sh": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "installer/verify.sh": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "installer/preflight.sh": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "installer/menu-wrapper.sh": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "installer/external-lock.json": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "installer/artifacts.py": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "installer/render.py": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "installer/checks.py": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "installer/state.py": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "services/login-policy.sh": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "services/nathaya-dashboard.sh": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "services/ws_proxy.py": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "services/nathaya-ssh-expire.service": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "services/nathaya-ssh-expire.timer": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "services/nathaya-cert-renew.service": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "services/nathaya-cert-renew.timer": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "updater/main.py": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "updater/release.py": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "updater/release-policy.json": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "updater/update.sh": {
+      "mode": "0755",
+      "deploy": false
+    },
+    "updater/nathaya-update.service": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "updater/nathaya-update.timer": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "setup.sh": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "tools/build-release.py": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "tools/audit-openvpn.py": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "tools/openvpn-clients.py": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "templates/openvpn/client-tcp.ovpn.in": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "templates/openvpn/client-udp.ovpn.in": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "templates/openvpn/client-ssl.ovpn.in": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "docs/install.md": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "docs/architecture.md": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "docs/update.md": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "docs/alrescha-parity.md": {
+      "mode": "0644",
+      "deploy": false
+    },
+    "docs/permissions.md": {
+      "mode": "0644",
+      "deploy": false
+    }
+  }
+}

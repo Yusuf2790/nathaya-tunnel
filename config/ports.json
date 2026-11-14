@@ -1,0 +1,32 @@
+{
+  "schema": 1,
+  "profile": "alrescha-core",
+  "loopback": "127.0.0.1",
+  "public": {
+    "haproxy": [80, 443, 8080],
+    "tls_download": 81,
+    "dropbear": 143
+  },
+  "internal": {
+    "nginx_ws": 1010,
+    "nginx_grpc": 1013,
+    "ssh_relay": 10015,
+    "dropbear": 109,
+    "sshd_tls": 2222,
+    "sshd_plain": 2223
+  },
+  "ssh_ws_path": "/ssh",
+  "routes": {
+    "vmess": {"ws_path": "/vmess", "ws_port": 10002, "grpc_service": "vmess-grpc", "grpc_port": 10006, "stats_port": 20001},
+    "vless": {"ws_path": "/vless", "ws_port": 10001, "grpc_service": "vless-grpc", "grpc_port": 10005, "stats_port": 20002},
+    "trojan": {"ws_path": "/trojan-ws", "ws_port": 10003, "grpc_service": "trojan-grpc", "grpc_port": 10007, "stats_port": 20003},
+    "shadowsocks": {"ws_path": "/ss-ws", "ws_port": 10004, "grpc_service": "ss-grpc", "grpc_port": 10008, "stats_port": 20004}
+  },
+  "download_files": ["client-tcp.ovpn", "client-udp.ovpn", "client-ssl.ovpn", "allovpn.zip"],
+  "openvpn": {"status": "BLOCKED", "reason": "Archive provenance and server contract not approved; no core listener or fallback"},
+  "xray": {
+    "version": "v26.11.9",
+    "metadata": "https://api.github.com/repos/XTLS/Xray-core/releases/tags/v26.11.9",
+    "grpc": "deprecated-supported; binary config tests and VPS integration still required"
+  }
+}

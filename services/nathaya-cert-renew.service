@@ -1,0 +1,7 @@
+[Unit]
+Description=Nathaya certificate renewal and managed proxy reload
+After=network-online.target
+[Service]
+Type=oneshot
+UMask=0077
+ExecStart=/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root /bin/bash --noprofile --norc /opt/nathaya/installer/tls-renew.sh

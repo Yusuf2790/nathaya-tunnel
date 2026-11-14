@@ -1,0 +1,9 @@
+[Unit]
+Description=Nathaya SSH expiry scan every 15 seconds
+[Timer]
+OnBootSec=15s
+OnUnitInactiveSec=15s
+AccuracySec=1s
+Unit=nathaya-ssh-expire.service
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,28 @@
+oldregular|2025-05-01|2025-05-30|2|active|0|regular
+oldtrial|2025-06-01|2025-06-01 11:59:59|1|active|0|trial
+exacttrial|2025-06-01|2025-06-01 12:00:00|1|active|0|trial
+oldlocked|2025-05-01|2025-05-30|1|locked|123|regular
+oldexpired|2025-05-01|2025-05-30|1|expired|0|regular
+0000|2025-05-01|2025-05-30|1|active|0|regular
+todayregular|2025-05-01|2025-06-01|1|active|0|regular
+futuretrial|2025-06-01|2025-06-01 12:00:01|1|active|0|trial
+futurelocked|2025-05-01|2025-06-02|1|locked|0|regular
+root|2025-05-01|2025-05-30|1|active|0|regular
+lowuid|2025-05-01|2025-05-30|1|active|0|regular
+zerouid|2025-05-01|2025-05-30|1|active|0|regular
+badhome|2025-05-01|2025-05-30|1|active|0|regular
+badshell|2025-05-01|2025-05-30|1|active|0|regular
+missinguser|2025-05-01|2025-05-30|1|active|0|regular
+legacyuser|2025-05-01|2025-05-30|1|active|0
+unknownkind|2025-05-01|2025-05-30|1|active|0|other
+unknownstatus|2025-05-01|2025-05-30|1|pending|0|regular
+badcreated|2025-02-30|2025-05-30|1|active|0|regular
+badexpiry|2025-05-01|2025-02-30|1|active|0|regular
+badtimestamp|2025-05-01|2025-06-01 24:00:00|1|active|0|trial
+badlimit|2025-05-01|2025-05-30|101|active|0|regular
+badlock|2025-05-01|2025-05-30|1|active|invalid|regular
+extraempty|2025-05-01|2025-05-30|1|active|0|regular|
+extrafield|2025-05-01|2025-05-30|1|active|0|regular|extra
+bad-name|2025-05-01|2025-05-30|1|active|0|regular
+duplicate|2025-05-01|2025-05-30|1|active|0|regular
+duplicate|2025-05-01|2025-06-02|1|active|0|regular

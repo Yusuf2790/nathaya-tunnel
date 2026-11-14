@@ -1,14 +1,12 @@
 #!/usr/bin/env bash
 
-# NATHAYA_BASE diwarisi dari menu.sh.
+source "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../common" && pwd)/bootstrap.sh" || { return 1 2>/dev/null || exit 1; }
 source "$NATHAYA_BASE/modules/common/ui.sh"
 source "$NATHAYA_BASE/modules/ssh/account-db.sh"
 
-NATHAYA_SSH_RECONCILE_LOG="/opt/nathaya/logs/ssh-reconcile.log"
-
 ssh_reconcile_log() {
     local operation="$1" username="$2" phase="$3" detail="$4"
-    mkdir -p /opt/nathaya/logs 2>/dev/null || true
+    mkdir -p -- "$NATHAYA_LOG_DIR" 2>/dev/null || true
     printf '%s operation=%s username=%s phase=%s detail=%s\n' \
         "$(date '+%F %T')" "$operation" "$username" "$phase" "$detail" \
         >> "$NATHAYA_SSH_RECONCILE_LOG" 2>/dev/null || true
@@ -182,7 +180,7 @@ delete_ssh_account() {
         read -r -p "Hapus akun ini? [y/n]: " confirm || return 0
         case "${confirm,,}" in
             y|yes)
-                exec 8>>/opt/nathaya/data/ssh/operations.lock
+                exec 8>>"$NATHAYA_SSH_OPERATIONS_LOCK"
                 if ! flock -x 8; then
                     exec 8>&-
                     printf '\nGagal memperoleh lock operasi akun.\n'
@@ -216,7 +214,8 @@ delete_ssh_account() {
 
                 uid="$(id -u "$username" 2>/dev/null || echo 0)"
                 shell="$(getent passwd "$username" | cut -d: -f7)"
-                if [[ ! "$uid" =~ ^[0-9]+$ || "$uid" -lt 1000 || "$shell" != "/bin/bash" ]]; then
+                if [[ ! "$uid" =~ ^[0-9]+$ || "$uid" -lt 1000 || "$uid" == 65534 || "$shell" != "/bin/bash" ||
+                      "$(getent passwd "$username" | cut -d: -f1)" != "$username" ]]; then
                     flock -u 8
                     exec 8>&-
                     printf '\nIdentitas Linux akun berubah; penghapusan dibatalkan.\n'
@@ -224,7 +223,7 @@ delete_ssh_account() {
                     continue
                 fi
 
-                pkill -KILL -u "$username" 2>/dev/null || true
+                pkill -KILL -u "$uid" 2>/dev/null || true
 
                 if userdel -r "$username" 2>/dev/null; then
                     if ssh_db_remove_account "$username"; then
@@ -233,8 +232,8 @@ delete_ssh_account() {
                         printf '\n%bAkun %s berhasil dihapus.%b\n' \
                             "$GREEN" "$username" "$RESET"
 
-                        if [[ -r /opt/nathaya/modules/common/telegram.sh ]]; then
-                            source /opt/nathaya/modules/common/telegram.sh
+                        if [[ -r "$NATHAYA_BASE/modules/common/telegram.sh" ]]; then
+                            source "$NATHAYA_BASE/modules/common/telegram.sh"
 
                             telegram_message="&#128640; <b>NATHAYA TUNNEL</b>
 &#128308; <b>SSH ACCOUNT DELETED</b>

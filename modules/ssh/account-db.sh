@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 
-NATHAYA_SSH_DIR="${NATHAYA_SSH_DIR:-/opt/nathaya/data/ssh}"
-NATHAYA_SSH_DB="${NATHAYA_SSH_DB:-$NATHAYA_SSH_DIR/accounts.db}"
-NATHAYA_SSH_LOCK="${NATHAYA_SSH_LOCK:-$NATHAYA_SSH_DIR/accounts.lock}"
+source "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../common" && pwd)/bootstrap.sh" || { return 1 2>/dev/null || exit 1; }
 
 ssh_db_init() {
     install -d -o root -g root -m 700 "$NATHAYA_SSH_DIR" || return 1

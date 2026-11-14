@@ -4,22 +4,7 @@
 # NATHAYA TUNNEL - COMMON FUNCTIONS
 # ==========================================
 
-NATHAYA_CONFIG="/etc/nathaya-tunnel"
-NATHAYA_CACHE="/var/cache/nathaya-tunnel"
-
-mkdir -p "$NATHAYA_CONFIG" "$NATHAYA_CACHE"
-
-# ---------- Baca konfigurasi ----------
-load_nathaya_config() {
-    DOMAIN=""
-
-    if [[ -f "$NATHAYA_CONFIG/config.conf" ]]; then
-        # shellcheck source=/dev/null
-        source "$NATHAYA_CONFIG/config.conf"
-    fi
-
-    DOMAIN="${DOMAIN:-}"
-}
+source "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/bootstrap.sh" || { return 1 2>/dev/null || exit 1; }
 
 # ---------- Informasi sistem ----------
 get_os_name() {
@@ -114,8 +99,10 @@ except Exception:
     CITY="${CITY:-Tidak diketahui}"
     ISP="${ISP:-Tidak diketahui}"
 
-    printf '%s|%s|%s|%s\n' \
-        "$current_ip" "$now" "$CITY" "$ISP" > "$cache_file"
+    if mkdir -p -- "$NATHAYA_CACHE" 2>/dev/null; then
+        printf '%s|%s|%s|%s\n' \
+            "$current_ip" "$now" "$CITY" "$ISP" > "$cache_file" 2>/dev/null || true
+    fi
 }
 
 # ---------- Status service ----------
@@ -129,25 +116,51 @@ get_service_status() {
     fi
 }
 
-# ---------- Jumlah akun SSH ----------
+# Runtime state, not menu availability. No probes run merely by sourcing this file.
+get_ssh_status() {
+    if systemctl is-active --quiet ssh.service 2>/dev/null ||
+       systemctl is-active --quiet ssh.socket 2>/dev/null; then printf 'ON'; else printf 'OFF'; fi
+}
+get_xray_status() {
+    local protocol
+    for protocol in vmess vless trojan shadowsocks; do
+        if ! systemctl is-active --quiet "$protocol@config.service" 2>/dev/null; then printf 'OFF'; return; fi
+    done
+    printf 'ON'
+}
+get_nathaya_version() {
+    local identity='unknown'
+    if [[ -r "$NATHAYA_BASE/VERSION" ]]; then IFS= read -r identity < "$NATHAYA_BASE/VERSION" || identity=unknown; fi
+    [[ "$identity" =~ ^[0-9]+[.][0-9]+[.][0-9]+$ ]] || identity=unknown
+    printf '%s' "$identity"
+}
 count_ssh_accounts() {
-    local count=0
-
-    if [[ -f /etc/passwd ]]; then
-        count=$(awk -F: '
-            $3 >= 1000 && $3 < 60000 &&
-            $7 ~ /(bash|sh)$/ &&
-            $6 ~ /^\/home\// {n++}
-            END {print n+0}
-        ' /etc/passwd)
-    fi
-
-    printf '%s' "${count:-0}"
+    [[ -r "$NATHAYA_SSH_DB" ]] || { printf '0'; return; }
+    awk -F '|' 'NF==7 && length($1)>=4 && length($1)<=32 && $1 ~ /^[a-z0-9]+$/ &&
+        ($7=="regular" || $7=="trial") && $5 ~ /^(active|locked|expired)$/ {n++} END {print n+0}' "$NATHAYA_SSH_DB"
+}
+count_xray_accounts() {
+    local protocol="$1"
+    case "$protocol" in vmess|vless|trojan) ;; *) printf '?'; return ;; esac
+    python3 -I -B -c '
+import json, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+try:
+    if not p.exists(): print(0)
+    else:
+        config = json.loads(p.read_text())
+        users = {item.get("id", item.get("password"))
+                 for inbound in config["inbounds"] if inbound.get("protocol") == sys.argv[2]
+                 for item in inbound.get("settings", {}).get("clients", [])}
+        users.discard(None)
+        print(len(users))
+except (OSError, ValueError, KeyError, TypeError): print("?")
+' "$NATHAYA_CONFIG/xray/$protocol/config.json" "$protocol" 2>/dev/null || printf '?'
 }
 
 # ---------- Inisialisasi data dashboard ----------
 refresh_system_info() {
-    load_nathaya_config
+    load_nathaya_config || true
 
     OS_NAME=$(get_os_name)
     HOST_NAME=$(get_hostname)
@@ -158,8 +171,11 @@ refresh_system_info() {
 
     get_location_info "$PUBLIC_IP"
 
-    SSH_STATUS=$(get_service_status ssh)
-    XRAY_STATUS=$(get_service_status xray)
-
+    SSH_STATUS=$(get_ssh_status)
+    XRAY_STATUS=$(get_xray_status)
+    SCRIPT_VERSION=$(get_nathaya_version)
     SSH_TOTAL=$(count_ssh_accounts)
+    VMESS_TOTAL=$(count_xray_accounts vmess)
+    VLESS_TOTAL=$(count_xray_accounts vless)
+    TROJAN_TOTAL=$(count_xray_accounts trojan)
 }

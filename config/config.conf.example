@@ -1,0 +1,10 @@
+# Contoh data konfigurasi, bukan script shell. Salin hanya saat instalasi pertama.
+# Runtime: /etc/nathaya-tunnel/config.conf; owner root:root, mode 600.
+# Update TIDAK BOLEH menimpa konfigurasi runtime yang sudah ada.
+# KEY="literal", KEY='literal', atau nilai tanpa kutip sederhana; satu key per baris.
+# Tidak ada ekspansi variabel/perintah, escape, export, atau komentar inline.
+# Hanya empat key berikut dibaca; key path/kode/helper diabaikan.
+DOMAIN=""
+TELEGRAM_STATUS="OFF"
+TELEGRAM_BOT_TOKEN=""
+TELEGRAM_ADMIN_ID=""

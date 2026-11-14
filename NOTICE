@@ -1,0 +1,6 @@
+Nathaya Tunnel
+Service layout, protocol paths and legacy OpenVPN client directives adapted from
+Alrescha79, Copyright (c) 2025 Anggun Caksono.
+MIT notice: licenses/Alrescha79-MIT.txt. No secrets/private host keys copied.
+Opaque binaries and reference OpenVPN archive are not redistributed.
+See docs/alrescha-parity.md.

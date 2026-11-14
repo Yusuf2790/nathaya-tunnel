@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
 
-# NATHAYA_BASE diwarisi dari menu.sh.
+source "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../common" && pwd)/bootstrap.sh" || { return 1 2>/dev/null || exit 1; }
 source "$NATHAYA_BASE/modules/common/ui.sh"
 source "$NATHAYA_BASE/modules/ssh/account-db.sh"
 
 renew_ssh_account() {
+    [[ $EUID -eq 0 ]] || { echo "ERROR: Jalankan sebagai root."; return 1; }
     local width username created expiry limit_ip status lock_until account_type extra
     local choice days new_expiry linux_expiry confirm uid shell today base_expiry
     local current_record current_user current_created current_expiry current_limit
     local current_status current_lock current_type current_extra
-    local domain public_ip
+    local domain public_ip fields identity linux_user linux_uid home renewed_status renewed_lock password_state
     local -a accounts=()
 
-    ssh_db_init
+    ssh_db_init || return 1
 
     while true; do
         clear
@@ -40,7 +41,7 @@ renew_ssh_account() {
             # Renew hanya tersedia untuk akun reguler pada skema 7 kolom.
             [[ "${account_type:-}" == "regular" ]] || continue
             ssh_valid_date "$expiry" || continue
-            [[ "$status" == "active" || "$status" == "locked" ]] || continue
+            [[ "$status" == "active" || "$status" == "locked" || "$status" == "expired" ]] || continue
             id "$username" >/dev/null 2>&1 || continue
             [[ "$username" != "root" ]] || continue
 
@@ -103,7 +104,7 @@ renew_ssh_account() {
 
         if [[ -n "${extra:-}" || "$account_type" != "regular" ]] ||
            ! ssh_valid_date "$expiry" ||
-           [[ "$status" != "active" && "$status" != "locked" ]] ||
+           [[ "$status" != "active" && "$status" != "locked" && "$status" != "expired" ]] ||
            ! id "$username" >/dev/null 2>&1; then
             printf '\nAkun bukan reguler atau record tidak valid; Renew dibatalkan.\n'
             read -r -p "Tekan Enter untuk lanjut..." _
@@ -146,7 +147,10 @@ renew_ssh_account() {
         case "${confirm,,}" in
             y|yes)
                 # Serialisasi dengan auto-expire dan delete.
-                exec 8>>/opt/nathaya/data/ssh/operations.lock
+                if ! exec 8>>"$NATHAYA_SSH_OPERATIONS_LOCK"; then
+                    printf '\nGagal memperoleh lock operasi akun.\n'
+                    continue
+                fi
                 if ! flock -x 8; then
                     exec 8>&-
                     printf '\nGagal memperoleh lock operasi akun.\n'
@@ -173,6 +177,36 @@ renew_ssh_account() {
                     continue
                 fi
 
+                # Validate the Linux identity again inside operations.lock.
+                fields="${current_record//[^|]/}"
+                uid="$(id -u "$username" 2>/dev/null || true)"
+                identity="$(getent passwd "$username" || true)"
+                IFS=: read -r linux_user _ linux_uid _ _ home shell <<< "$identity"
+                if [[ ${#fields} -ne 6 || "$current_record" == *$'\n'* ||
+                      "$identity" == *$'\n'* || ! "$uid" =~ ^[1-9][0-9]{3,9}$ ||
+                      "$uid" -lt 1000 || "$uid" == 65534 ||
+                      "$linux_user" != "$username" || "$linux_uid" != "$uid" ||
+                      "$home" != "/home/$username" || "$shell" != "/bin/bash" ]] ||
+                   ! ssh_valid_username "$username" || [[ "$username" == root ]] ||
+                   ! ssh_valid_date "$created" || ! ssh_valid_date "$expiry"; then
+                    flock -u 8
+                    exec 8>&-
+                    printf '\nData akun berubah atau akun tidak lagi valid. Renew dibatalkan.\n'
+                    continue
+                fi
+
+                # Expiry never unlocks a password. Preserve locked state/metadata,
+                # including a password locked outside Nathaya while status=expired.
+                renewed_status="$status"
+                renewed_lock="$lock_until"
+                if [[ "$status" == expired ]]; then
+                    password_state="$(passwd -S "$username" 2>/dev/null | awk '{print $2}' || true)"
+                    renewed_status=locked
+                    if [[ "$password_state" == P && "$lock_until" == 0 ]]; then
+                        renewed_status=active
+                    fi
+                fi
+
                 # Update Linux expiry lebih dulu. Jika database gagal, laporkan untuk rekonsiliasi.
                 if ! chage -E "$linux_expiry" "$username"; then
                     flock -u 8
@@ -190,6 +224,14 @@ renew_ssh_account() {
                     continue
                 fi
 
+                if [[ "$status" == expired ]] &&
+                   ! ssh_db_update_status "$username" "$renewed_status" "$renewed_lock"; then
+                    flock -u 8
+                    exec 8>&-
+                    printf '\nDatabase gagal diperbarui setelah Linux expiry berubah. Periksa akun %s sebelum mencoba lagi.\n' "$username"
+                    continue
+                fi
+
                 flock -u 8
                 exec 8>&-
 
@@ -198,9 +240,10 @@ renew_ssh_account() {
                 printf 'Expired lama  : %s\n' "$expiry"
                 printf 'Expired baru  : %s\n' "$new_expiry"
 
-                if [[ -r /opt/nathaya/modules/common/telegram.sh ]]; then
-                    source /opt/nathaya/modules/common/telegram.sh
-                    domain="${DOMAIN:-id1.nathaya.web.id}"
+                if [[ -r "$NATHAYA_BASE/modules/common/telegram.sh" ]]; then
+                    source "$NATHAYA_BASE/modules/common/telegram.sh"
+                    load_nathaya_config || true
+                    domain="${DOMAIN:-Tidak diketahui}"
                     public_ip="$(curl -4 -fsS --max-time 5 https://api.ipify.org 2>/dev/null || printf 'Tidak diketahui')"
 
                     telegram_message="&#128640; <b>NATHAYA TUNNEL</b>

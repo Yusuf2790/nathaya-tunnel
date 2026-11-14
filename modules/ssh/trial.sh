@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# NATHAYA_BASE diwarisi dari menu.sh.
+source "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../common" && pwd)/bootstrap.sh" || { return 1 2>/dev/null || exit 1; }
 
 source "$NATHAYA_BASE/modules/common/ui.sh"
 source "$NATHAYA_BASE/modules/ssh/account-db.sh"
@@ -15,7 +15,7 @@ create_trial_account() {
     local created expiry expiry_epoch linux_expiry domain public_ip
     local isp="Tidak diketahui" city="Tidak diketahui"
     local attempt duration_value duration_unit
-    local operations_lock=/opt/nathaya/data/ssh/operations.lock
+    local operations_lock="$NATHAYA_SSH_OPERATIONS_LOCK"
     local operations_locked=0
 
     ssh_db_init
@@ -119,8 +119,8 @@ create_trial_account() {
         return 1
     }
 
-    domain="$(sed -n 's/^DOMAIN="\([^"]*\)"/\1/p' \
-        /etc/nathaya-tunnel/config.conf | head -1)"
+    load_nathaya_config || true
+    domain="${DOMAIN:-}"
     public_ip="$(curl -4 -fsS --max-time 5 \
         https://api.ipify.org 2>/dev/null || true)"
 
@@ -192,7 +192,7 @@ create_trial_account() {
     printf '\n%bCONNECTION INFORMATION%b\n' "$CYAN" "$RESET"
     printf '%b%s%b\n' "$CYAN" \
         "────────────────────────────────────────────────" "$RESET"
-    printf 'SSH Ports : 22, 2222, 2223\n'
+    printf 'SSH Ports : Sesuai konfigurasi server\n'
     printf 'WebSocket : Belum diaktifkan\n'
 
     printf '\n%bCATATAN%b\n' "$YELLOW" "$RESET"
@@ -207,8 +207,8 @@ create_trial_account() {
     printf '%b%s%b\n\n' "$C_CYAN" "────────────────────────────────────────────────" "$C_RESET"
 
     # Kirim notifikasi Telegram setelah akun trial berhasil dibuat.
-    if [[ -r /opt/nathaya/modules/common/telegram.sh ]]; then
-        source /opt/nathaya/modules/common/telegram.sh
+    if [[ -r "$NATHAYA_BASE/modules/common/telegram.sh" ]]; then
+        source "$NATHAYA_BASE/modules/common/telegram.sh"
 
         telegram_message="&#128640; <b>NATHAYA TUNNEL</b>
 &#128994; <b>TRIAL SSH CREATED</b>
@@ -232,7 +232,7 @@ create_trial_account() {
 ━━━━━━━━━━━━━━━━━━━━
 <b>CONNECTION</b>
 ━━━━━━━━━━━━━━━━━━━━
-<code>SSH Port:</code> <code>22, 2222, 2223</code>
+<code>SSH Port:</code> <code>Sesuai konfigurasi server</code>
 <code>WebSocket:</code> <code>Belum diaktifkan</code>
 
 ━━━━━━━━━━━━━━━━━━━━
