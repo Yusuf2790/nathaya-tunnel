@@ -285,6 +285,165 @@ class ImportAndShellContracts(Offline):
         c.command.assert_not_called()
 
 
+class OptionalLoggingContracts(Offline):
+    FILE_KEYS = ('StandardOutputFile', 'StandardErrorFile')
+    OMISSIONS = ((), ('StandardOutputFile',), ('StandardErrorFile',),
+                 ('StandardOutputFile', 'StandardErrorFile'))
+
+    @staticmethod
+    def omit(properties, keys):
+        result = dict(properties)
+        for key in keys:
+            result.pop(key, None)
+        return result
+
+    def test_file_metadata_is_exactly_two_optional_names(self):
+        self.assertEqual(self.D.OPTIONAL_LOG_PROPERTIES, frozenset(self.FILE_KEYS))
+        for omitted in self.OMISSIONS:
+            left = source_properties()
+            right = self.omit(left, omitted)
+            self.assertEqual(self.D.restriction_differences(left, right), [])
+            self.assertEqual(self.D.restriction_differences(right, left), [])
+        for key in ('StandardOutput', 'StandardError', 'NoNewPrivileges',
+                    'CapabilityBoundingSet', 'SystemCallFilter', 'FutureSecurityKnob'):
+            left = dict(source_properties(), **{key: 'required'})
+            right = dict(left)
+            del right[key]
+            with self.subTest(property=key):
+                self.assertEqual(self.D.restriction_differences(left, right), [key])
+                self.assertEqual(self.D.restriction_differences(right, left), [key])
+
+    def test_successful_show_omission_is_absence_not_empty_or_read_failure(self):
+        c = self.controller(True)
+        original = self.omit(source_properties(True), self.FILE_KEYS)
+        raw = ''.join(key + '=' + value + '\n' for key, value in original.items()).encode()
+        c.command = Mock(return_value=(0, raw, b''))
+        result = c.show(MAIN)
+        self.assertEqual(result, original)
+        for key in self.FILE_KEYS:
+            self.assertNotIn(key, result)
+        self.assertEqual(self.D.validate_effective(result, c.fragment), CAPS3)
+        c.command.assert_called_once()
+
+    def test_nonzero_and_timeout_show_are_not_hidden_by_optional_metadata(self):
+        c = self.controller()
+        original = self.omit(source_properties(), self.FILE_KEYS)
+        raw = ''.join(key + '=' + value + '\n' for key, value in original.items()).encode()
+        for code in (1, None):
+            c.command = Mock(return_value=(code, raw, b'PRIVATE_FIXTURE_VALUE'))
+            with self.subTest(code=code), self.assertRaises(self.D.Unsupported):
+                c.show(MAIN)
+            c.command.assert_called_once()
+
+    def test_production_path_metadata_is_not_needed_or_reused(self):
+        c = self.controller()
+        alternate = rendered().replace('append:/opt/nathaya/logs/%N.log',
+                                        'append:/different/production/log')
+        self.D.validate_fragment(alternate)
+        for mode in ('journal', 'inherit', 'append:'):
+            with self.subTest(mode=mode), self.assertRaises(self.D.Unsupported):
+                self.D.validate_fragment(rendered().replace('append:/opt/nathaya/logs/%N.log', mode))
+        for key in self.FILE_KEYS:
+            c.source[key] = 'PRIVATE_PRODUCTION_PATH_NOT_NEEDED'
+        self.assertEqual(self.D.validate_effective(c.source, c.fragment), CAPS4)
+        for phase in ('plain', 'trace'):
+            plan = self.plan(c, phase)
+            destination = str(c.directory / phase / 'combined.log')
+            for key in ('StandardOutput', 'StandardError'):
+                self.assertEqual(plan['properties'][key], 'append:' + destination)
+                self.assertEqual([a for a in plan['command'] if a.startswith('--property=' + key + '=')],
+                                 ['--property=' + key + '=append:' + destination])
+            self.assertFalse(any('PRIVATE_PRODUCTION_PATH' in arg for arg in plan['command']))
+
+    def test_full_gate_accepts_each_absence_and_available_path_combination(self):
+        for old in (True, False):
+            for absent_source in self.OMISSIONS:
+                for absent_probe in self.OMISSIONS:
+                    with self.subTest(old=old, source=absent_source, probe=absent_probe):
+                        c = self.controller(old)
+                        c.source = self.omit(c.source, absent_source)
+                        plan = self.plan(c)
+                        probe = self.omit(self.probe(c, plan), absent_probe)
+                        c.save.reset_mock()
+                        self.gate(c, plan, probe=probe)
+                        c.save.assert_called_once_with('plain/go', b'')
+                        evidence = next(call.args[1] for call in c.record.call_args_list
+                                        if call.args[0] == 'plain/logging-metadata.json')
+                        self.assertEqual(evidence['source_file_properties_available'],
+                                         {k: k not in absent_source for k in self.FILE_KEYS})
+                        self.assertEqual(evidence['probe_file_properties_available'],
+                                         {k: k not in absent_probe for k in self.FILE_KEYS})
+                        self.assertEqual(evidence['probe_destination'], str(plan['output']))
+                        self.assertEqual(evidence['destination_basis'], 'explicit-private-transient-assignments')
+
+    def test_available_probe_file_must_match_private_path_and_not_empty(self):
+        c = self.controller()
+        plan = self.plan(c)
+        probe = self.probe(c, plan)
+        c.validate_probe(probe, plan)
+        for key in self.FILE_KEYS:
+            for value in ('', '/opt/nathaya/logs/nathaya-haproxy.log',
+                          '/run/nathaya-haproxy-probe.other/plain/combined.log'):
+                bad = dict(probe, **{key: value})
+                with self.subTest(property=key, value=value), self.assertRaises(self.D.Unsupported):
+                    c.validate_probe(bad, plan)
+        c.validate_probe(self.omit(probe, self.FILE_KEYS), plan)
+
+    def test_missing_file_properties_never_make_output_modes_optional(self):
+        c = self.controller()
+        plan = self.plan(c)
+        for key in ('StandardOutput', 'StandardError'):
+            for value in (None, '', 'inherit', 'journal'):
+                source = self.omit(c.source, self.FILE_KEYS)
+                probe = self.omit(self.probe(c, plan), self.FILE_KEYS)
+                if value is None:
+                    del source[key]
+                    del probe[key]
+                else:
+                    source[key] = probe[key] = value
+                with self.subTest(property=key, value=value):
+                    with self.assertRaises(self.D.Unsupported):
+                        self.D.validate_effective(source, c.fragment)
+                    with self.assertRaises(self.D.Unsupported):
+                        c.validate_probe(probe, plan)
+
+    def test_private_destination_requires_both_explicit_assignments_exactly_once(self):
+        c = self.controller()
+        good = self.plan(c)
+        probe = self.omit(self.probe(c, good), self.FILE_KEYS)
+        c.validate_probe(probe, good)
+        for key in ('StandardOutput', 'StandardError'):
+            prefix = '--property=' + key + '='
+            for variant in ('dict', 'cli', 'missing', 'duplicate'):
+                plan = copy.deepcopy(good)
+                production = 'append:/opt/nathaya/logs/nathaya-haproxy.log'
+                if variant == 'dict':
+                    plan['properties'][key] = production
+                elif variant == 'cli':
+                    plan['command'] = [prefix + production if a.startswith(prefix) else a
+                                       for a in plan['command']]
+                elif variant == 'missing':
+                    plan['command'] = [a for a in plan['command'] if not a.startswith(prefix)]
+                else:
+                    plan['command'].append(prefix + production)
+                with self.subTest(property=key, variant=variant), self.assertRaises(self.D.Unsupported):
+                    c.validate_probe(probe, plan)
+        plan = copy.deepcopy(good)
+        plan['output'] = Path('/opt/nathaya/logs/nathaya-haproxy.log')
+        with self.assertRaises(self.D.Unsupported):
+            c.validate_probe(probe, plan)
+
+    def test_second_snapshot_available_production_path_blocks_gate(self):
+        c = self.controller(True)
+        plan = self.plan(c)
+        initial = self.omit(self.probe(c, plan), self.FILE_KEYS)
+        live = dict(initial, StandardErrorFile='/opt/nathaya/logs/nathaya-haproxy.log')
+        c.save.reset_mock()
+        with self.assertRaises(self.D.Unsupported):
+            self.gate(c, plan, probe=initial, live=live)
+        c.save.assert_not_called()
+
+
 class PureContracts(Offline):
     def test_parse_show_preserves_equals_and_empty_values(self):
         self.assertEqual(self.D.parse_show('Id=fixture.service\nEmpty=\nValue=a=b\n'),

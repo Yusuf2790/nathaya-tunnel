@@ -139,6 +139,11 @@ def validate_fragment(text):
         if key == 'CapabilityBoundingSet':
             if _capset(value) not in (CAPS3, CAPS4):
                 raise Unsupported('CapabilityBoundingSet')
+        elif section == 'Service' and key in ('StandardOutput', 'StandardError'):
+            # Validate the logging mode only. The production pathname is neither
+            # needed nor reused for a probe, and is never expanded/evaluated.
+            if not value.startswith('append:') or not value[len('append:'):]:
+                raise Unsupported('fragment-value')
         elif value != expected[section][key]:
             raise Unsupported('fragment-value')
         result[key] = value
@@ -209,8 +214,8 @@ def validate_effective(properties, fragment):
         'Restart': 'on-failure', 'RestartUSec': '3s', 'CanReload': 'yes',
         'Description': 'Nathaya HAProxy',
         'StandardOutput': 'append', 'StandardError': 'append',
-        'StandardOutputFile': '/opt/nathaya/logs/nathaya-haproxy.log',
-        'StandardErrorFile': '/opt/nathaya/logs/nathaya-haproxy.log',
+        # The production log pathname is not needed and is not always exposed
+        # by systemd's D-Bus interface. Never infer an absent property as empty.
     })
     caps = _capset(properties.get('CapabilityBoundingSet', ''))
     if caps not in (CAPS3, CAPS4) or caps != _capset(fragment['CapabilityBoundingSet']):
@@ -276,6 +281,11 @@ ExecStart ExecStartEx ExecStartPre ExecStartPreEx ExecReload ExecReloadEx
 '''.split())
 
 
+# Only these two logging metadata fields may be absent. This exception is NOT
+# a fallback for output modes, security restrictions, or other unknown fields.
+OPTIONAL_LOG_PROPERTIES = frozenset(('StandardOutputFile', 'StandardErrorFile'))
+
+
 def _equivalent(key, value):
     if key in ('CapabilityBoundingSet', 'AmbientCapabilities'):
         return _capset(value)
@@ -286,12 +296,13 @@ def _equivalent(key, value):
 
 
 def restriction_differences(source, probe):
-    """All missing/extra properties block, INCLUDING exempt property names.
+    """Only the two optional log File metadata keys may be missing/extra.
 
+    All other missing/extra properties block, even runtime/intended fields.
     Returned names contain no values. Intended differences are separately
     validated by Controller.gate; this function does not authorise execution.
     """
-    missing = set(source) ^ set(probe)
+    missing = (set(source) ^ set(probe)) - OPTIONAL_LOG_PROPERTIES
     changed = {k for k in set(source) & set(probe)
                if k not in RUNTIME_PROPERTIES | INTENDED_PROPERTIES
                and _equivalent(k, source[k]) != _equivalent(k, probe[k])}
@@ -682,6 +693,31 @@ class Controller:
         return {'phase': phase, 'unit': unit, 'command': command, 'argv': argv,
                 'pre': pre, 'go': go, 'output': output, 'properties': properties}
 
+    def validate_probe_logging(self, probe, plan):
+        # The declared destination comes only from this run, NOT production show
+        # metadata. systemd-run receives explicit append paths even on versions
+        # which do not expose Standard{Output,Error}File through D-Bus.
+        phase = plan['phase']
+        directory = str(self.directory)
+        if (phase not in ('plain', 'trace') or not re.fullmatch(
+                r'/run/nathaya-haproxy-probe\.[A-Za-z0-9_-]+', directory)):
+            raise Unsupported('probe-output-plan')
+        destination = str(self.directory / phase / 'combined.log')
+        if str(plan['output']) != destination:
+            raise Unsupported('probe-output-plan')
+        argv = plan['command']
+        if not isinstance(argv, list) or any(not isinstance(a, str) for a in argv):
+            raise Unsupported('probe-output-plan')
+        for key in ('StandardOutput', 'StandardError'):
+            value = 'append:' + destination
+            prefix = '--property=' + key + '='
+            if (plan['properties'].get(key) != value or
+                    [a for a in argv if a.startswith(prefix)] != [prefix + value]):
+                raise Unsupported('probe-output-plan')
+        for key in OPTIONAL_LOG_PROPERTIES:
+            if key in probe and probe[key] != destination:
+                raise Unsupported(key)
+
     def validate_probe(self, probe, plan):
         unit = plan['unit']
         if not owned_unit(probe, unit, self.nonce):
@@ -694,9 +730,9 @@ class Controller:
             'TimeoutStopUSec': '2s', 'TimeoutAbortUSec': '2s', 'CanReload': 'no',
             'KillMode': 'control-group', 'SendSIGKILL': 'yes',
             'StandardOutput': 'append', 'StandardError': 'append',
-            'StandardOutputFile': str(plan['output']), 'StandardErrorFile': str(plan['output']),
             'SecureBits': '0', 'NoNewPrivileges': 'yes',
         })
+        self.validate_probe_logging(probe, plan)
         for key, argv in (('ExecStart', plan['argv']), ('ExecStartPre', plan['pre'])):
             if not _exec_struct(probe.get(key, ''), argv):
                 raise Unsupported(key)
@@ -734,6 +770,14 @@ class Controller:
         self.record(plan['phase'] + '/source-gate.metadata.json', metadata)
         self.record(plan['phase'] + '/probe-gate.show.json', probe)
         self.validate_probe(probe, plan)
+        self.record(plan['phase'] + '/logging-metadata.json', {
+            'source_file_properties_available': {k: k in current for k in sorted(OPTIONAL_LOG_PROPERTIES)},
+            'probe_file_properties_available': {k: k in probe for k in sorted(OPTIONAL_LOG_PROPERTIES)},
+            'probe_destination': str(plan['output']),
+            'destination_basis': 'explicit-private-transient-assignments',
+            # Absence means unavailable, NOT a verified empty pathname. If a
+            # probe File property is available, validate_probe_logging checks it.
+        })
         differences = restriction_differences(current, probe)
         ignored = {k: {'source': current.get(k), 'probe': probe.get(k),
                        'category': 'intended' if k in INTENDED_PROPERTIES else 'runtime-metadata'}
