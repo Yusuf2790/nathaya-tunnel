@@ -11,7 +11,8 @@ sys.dont_write_bytecode = True
 import ast
 import builtins
 import collections
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
+from functools import wraps
 import copy
 import errno
 import grp
@@ -19,32 +20,37 @@ import hashlib
 import importlib.util
 import io
 import json
+import linecache
 import os
 from pathlib import Path
 import platform
 import pwd
 import re
 import secrets
+import shlex
 import signal
 import socket
 import stat
 import subprocess
 import tempfile
 import time
-from types import ModuleType, SimpleNamespace
+import traceback
+from types import FunctionType, ModuleType, SimpleNamespace
 import unittest
 import urllib.request
 from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parent.parent
-# Only checkout source reads happen during discovery, before host guards. No
-# renderer CLI, load_ports(), account lookup, runtime path or probe is invoked.
+# Checkout source reads happen during discovery or unguarded failure reporting.
+# No renderer CLI, load_ports(), account lookup, runtime path or probe is invoked.
 SHELL = (ROOT / 'tools/diagnose-haproxy.sh').read_text(encoding='utf-8')
 MARKER = 'NATHAYA_HAPROXY_DIAG_PY'
-START = "<<'" + MARKER + "'\n"
-if SHELL.count(START) != 1 or SHELL.count('\n' + MARKER + '\n') != 1:
+OPENERS = list(re.finditer(r"<<[ \t]*'" + MARKER + r"'[ \t]*\n", SHELL))
+DELIMITERS = list(re.finditer(r'(?m)^' + MARKER + r'$', SHELL))
+if len(OPENERS) != 1 or len(DELIMITERS) != 1 or OPENERS[0].end() >= DELIMITERS[0].start():
     raise AssertionError('Expected exactly one quoted diagnostic heredoc')
-PYTHON = SHELL.split(START, 1)[1].split('\n' + MARKER + '\n', 1)[0]
+START = OPENERS[0].group(0)
+PYTHON = SHELL[OPENERS[0].end():DELIMITERS[0].start()].removesuffix('\n')
 TREE = ast.parse(PYTHON, filename='diagnose-haproxy.sh:embedded')
 CODE = compile(TREE, 'diagnose-haproxy.sh:embedded', 'exec')
 SPEC = importlib.util.spec_from_file_location('diagnostic_actual_renderer', ROOT / 'installer/render.py')
@@ -68,8 +74,9 @@ CAPS3 = CAPS4 - {'CAP_KILL'}
 
 def rendered(old=False):
     # Import the actual renderer, not a hand-maintained copy of its unit text.
-    text = R.render_core('vpn.example.org', copy.deepcopy(PORTS),
-                         ss_server_key=FIXTURE_KEY)['nathaya-haproxy.service']
+    text = HostBoundary().invoke(
+        R.render_core, 'vpn.example.org', copy.deepcopy(PORTS),
+        ss_server_key=FIXTURE_KEY)['nathaya-haproxy.service']
     return text.replace(' CAP_KILL', '') if old else text
 
 
@@ -114,16 +121,41 @@ def source_properties(old=False):
     return result
 
 
-class Offline(unittest.TestCase):
-    def setUp(self):
-        self.stack = ExitStack()
-        self.addCleanup(self.stack.close)
+class HostBoundary:
+    """Deny host effects only during diagnostic execution, never reporting.
+
+    Reentrant calls share the outer guards and its explicit in-memory fakes.
+    Every stack unwinds before exceptions reach assertRaises/subTest/unittest.
+    """
+    def __init__(self):
+        self.depth = 0
+
+    @contextmanager
+    def guard(self, patchers=()):
+        with ExitStack() as stack:
+            outer = self.depth == 0
+            self.depth += 1
+            try:
+                if outer:
+                    self._deny(stack)
+                for patcher in patchers:
+                    stack.enter_context(patcher)
+                yield
+            finally:
+                self.depth -= 1
+
+    @staticmethod
+    def _deny(stack):
         def forbidden(*args, **kwargs):
             raise AssertionError('Real host operation forbidden in diagnostic fixtures')
-        # Deliberately blanket-deny filesystem access: even /proc reads and
-        # tempfile creation are forbidden here. No real temp files are needed.
+        # Blanket filesystem denial, including /proc and temporary files.
         targets = (
             (builtins, ('open',)), (io, ('open',)),
+            # Python 3.9/3.10 pathlib accessors cache OS functions, so the OS
+            # guards alone cannot deny these filesystem gateways.
+            (Path, ('open', 'stat', 'lstat', 'mkdir', 'unlink', 'rmdir', 'rename',
+                    'replace', 'chmod', 'lchmod', 'touch', 'symlink_to', 'link_to',
+                    'hardlink_to', 'readlink', 'resolve', 'exists', 'is_dir', 'is_file')),
             (subprocess, ('run', 'Popen', 'call', 'check_call', 'check_output', 'getoutput', 'getstatusoutput')),
             (os, ('system', 'popen', 'open', 'read', 'close', 'fdopen', 'fstat',
                   'stat', 'lstat', 'access', 'listdir', 'scandir', 'getxattr',
@@ -143,11 +175,45 @@ class Offline(unittest.TestCase):
         for obj, names in targets:
             for name in names:
                 if hasattr(obj, name):
-                    self.stack.enter_context(patch.object(obj, name, side_effect=forbidden))
-        self.stack.enter_context(patch.object(secrets, 'token_hex', return_value=NONCE))
+                    if obj is Path:
+                        # A function keeps later invocation-local autospec
+                        # fakes usable; autospec cannot replace a Mock guard.
+                        stack.enter_context(patch.object(obj, name, new=forbidden))
+                    else:
+                        stack.enter_context(patch.object(obj, name, side_effect=forbidden))
+        stack.enter_context(patch.object(secrets, 'token_hex', return_value=NONCE))
+
+    def invoke(self, operation, /, *args, patchers=(), **kwargs):
+        with self.guard(patchers):
+            return operation(*args, **kwargs)
+
+    def wrap(self, operation):
+        @wraps(operation)
+        def guarded(*args, **kwargs):
+            return self.invoke(operation, *args, **kwargs)
+        return guarded
+
+    def wrap_module(self, module):
+        # Preserve classes (especially exceptions), imported APIs and descriptors.
+        for name, value in list(vars(module).items()):
+            if isinstance(value, FunctionType) and value.__module__ == module.__name__:
+                setattr(module, name, self.wrap(value))
+        for name, value in list(vars(module.Controller).items()):
+            if isinstance(value, FunctionType) and value.__module__ == module.__name__:
+                setattr(module.Controller, name, self.wrap(value))
+
+
+class Offline(unittest.TestCase):
+    def setUp(self):
+        self.host = HostBoundary()
         self.D = ModuleType('nathaya_haproxy_diagnostic_fixture')
         self.D.__file__ = 'diagnose-haproxy.sh:embedded'
-        exec(CODE, self.D.__dict__)
+        with self.host.guard():
+            exec(CODE, self.D.__dict__)
+        self.host.wrap_module(self.D)
+
+    def invoke(self, operation, /, *args, patchers=(), **kwargs):
+        return self.host.invoke(operation, *args, patchers=patchers, **kwargs)
 
     def controller(self, old=False):
         c = self.D.Controller()
@@ -162,8 +228,11 @@ class Offline(unittest.TestCase):
 
     def plan(self, c, phase='plain'):
         # Real factory, with virtual directories, reservations and evidence only.
-        with patch.object(Path, 'mkdir') as mkdir, patch.object(c, 'reserve', return_value=(49173, ABSTRACT)):
-            result = c.factory(phase)
+        mkdir = Mock()
+        result = self.invoke(c.factory, phase, patchers=(
+            patch.object(Path, 'mkdir', mkdir),
+            patch.object(c, 'reserve', return_value=(49173, ABSTRACT)),
+        ))
         mkdir.assert_called_once_with(mode=0o700)
         return result
 
@@ -197,20 +266,61 @@ class Offline(unittest.TestCase):
         p = self.probe(c, plan) if probe is None else probe
         current = c.source if current is None else current
         plan['created_at'] = 0
-        with ExitStack() as stack:
-            stack.enter_context(patch.object(c, 'show', side_effect=[p, current, p if live is None else live]))
-            stack.enter_context(patch.object(self.D, '_no_lock'))
-            stack.enter_context(patch.object(self.D, '_read_private_source', return_value=(c.source_bytes, {})))
-            stack.enter_context(patch.object(time, 'monotonic', **(
-                {'side_effect': clock} if isinstance(clock, list) else {'return_value': clock})))
-            c.gate(plan)
+        self.invoke(c.gate, plan, patchers=(
+            patch.object(c, 'show', side_effect=[p, current, p if live is None else live]),
+            patch.object(self.D, '_no_lock'),
+            patch.object(self.D, '_read_private_source', return_value=(c.source_bytes, {})),
+            patch.object(time, 'monotonic', **(
+                {'side_effect': clock} if isinstance(clock, list) else {'return_value': clock})),
+        ))
 
-    def main_with(self, c, args=None):
+    def main_with(self, c, args=None, *, patchers=()):
         out, err = io.StringIO(), io.StringIO()
-        with patch.object(self.D, 'Controller', return_value=c), patch.object(signal, 'signal'), \
-                patch.object(sys, 'stdout', out), patch.object(sys, 'stderr', err):
-            rc = self.D.main(['--run'] if args is None else args)
+        rc = self.invoke(self.D.main, ['--run'] if args is None else args, patchers=(
+            patch.object(self.D, 'Controller', return_value=c),
+            patch.object(signal, 'signal'),
+            patch.object(sys, 'stdout', out), patch.object(sys, 'stderr', err),
+        ) + tuple(patchers))
         return rc, out.getvalue(), err.getvalue()
+
+
+def assert_launcher_contract(case, shell):
+    """Check shell structure/tokens, not indentation or continuation layout."""
+    openers = list(re.finditer(r"<<[ \t]*'" + MARKER + r"'[ \t]*\n", shell))
+    case.assertEqual(len(openers), 1, 'Exactly one quoted heredoc opener')
+    closers = list(re.finditer(r'(?m)^' + MARKER + r'$', shell))
+    case.assertEqual(len(closers), 1, 'Exactly one heredoc delimiter')
+    opener, closer = openers[0], closers[0]
+    case.assertLess(opener.end(), closer.start())
+    # The dispatch prefix intentionally EXCLUDES the heredoc opener.
+    prefix = shell[:opener.start()]
+    case.assertNotIn("<<'" + MARKER, prefix)
+    flat = re.sub(r'\\\n', '', prefix)
+    structure = re.search(
+        r'nathaya_diagnose_haproxy_main\s*\(\s*\)\s*\{\s*'
+        r'case\s+"\$#:\$\{1-\}"\s+in\s*'
+        r'1:--help\s*\)(?P<help>.*?)\s*;;\s*'
+        r'1:--run\s*\|\s*1:--cap-boundaries\s*\)\s*;;\s*'
+        r'\*\s*\)(?P<default>.*?)\s*;;\s*'
+        r'esac\s+(?P<dispatch>.*?)\s*\Z', flat, re.S)
+    case.assertIsNotNone(structure, 'One-argument allowlist before dispatch')
+    help_tokens = shlex.split(structure['help'], posix=False)
+    case.assertEqual(help_tokens[:2], ['builtin', 'printf'])
+    case.assertEqual(help_tokens[2], "'%s\\n'")
+    case.assertEqual(help_tokens[-2:], ['return', '0'])
+    case.assertTrue(all(re.fullmatch(r"'[^']*'", arg) for arg in help_tokens[2:-2]))
+    case.assertRegex(structure['help'], r'--help\s+is\s+read-only')
+    case.assertRegex(structure['default'],
+                     r"^\s*builtin\s+printf\s+'%s\\n'\s+'[^']*'\s*>\s*&2\s*;\s*return\s+64\s*$")
+    case.assertEqual(shlex.split(structure['dispatch'], posix=False), [
+        'exec', '/usr/bin/env', '-i', 'PATH=/usr/sbin:/usr/bin:/sbin:/bin',
+        'LANG=C', 'LC_ALL=C', '/usr/bin/python3', '-I', '-B', '-', '"$1"',
+    ])
+    case.assertNotRegex(prefix, r'\b(?:source|systemctl|systemd-run|sudo|apt|curl|wget)\b')
+    tail = shell[closer.end():]
+    case.assertRegex(tail,
+                     r'\}\s*if\s+\[\[\s*"\$\{BASH_SOURCE\[0\]\}"\s*==\s*"\$0"\s*\]\]\s*;\s*then\s+'
+                     r'nathaya_diagnose_haproxy_main\s+"\$@"\s*fi\s*$')
 
 
 class ImportAndShellContracts(Offline):
@@ -226,29 +336,29 @@ class ImportAndShellContracts(Offline):
         compile(ast.parse(self.D.GATE_PROGRAM), 'prestart-explicit-compile-check', 'exec')
 
     def test_help_is_builtin_only_before_python_dispatch(self):
-        prefix = SHELL.split(START, 1)[0]
-        help_arm = prefix.split('1:--help)', 1)[1].split(';;', 1)[0]
-        self.assertIn('return 0', help_arm)
-        self.assertIn('--help is read-only', help_arm)
-        # Remove quoted strings and shell continuations, leaving only builtins.
-        unquoted = re.sub(r"'[^']*'", "''", help_arm).replace('\\\n', '')
-        statements = [line.strip() for line in unquoted.splitlines() if line.strip()]
-        self.assertEqual(len(statements), 2)
-        self.assertTrue(statements[0].startswith('builtin printf '))
-        self.assertEqual(statements[1], 'return 0')
-        self.assertIn('1:--run|1:--cap-boundaries) ;;', prefix)
-        # Dispatch exactly one allowlisted argument, never arbitrary shell argv.
-        self.assertIn('case "$#:${1-}" in', prefix)
-        self.assertIn('*) builtin printf', prefix)
-        self.assertIn('>&2; return 64 ;;', prefix)
-        self.assertIn('exec /usr/bin/env -i PATH=', prefix)  # TERM/INT reach controller PID.
-        self.assertIn('/usr/bin/python3 -I -B - "$1" ' + START.rstrip('\n'), prefix)
-        self.assertEqual(prefix.count('/usr/bin/python3 -I -B - "$1"'), 1)
-        self.assertNotIn('/usr/bin/python3 -I -B - "$@"', prefix)
-        self.assertLess(prefix.index('return 64 ;;'), prefix.index('exec /usr/bin/env -i'))
-        tail = SHELL.split('\n' + MARKER + '\n', 1)[1]
-        self.assertRegex(tail, r'if \[\[ "\$\{BASH_SOURCE\[0\]\}" == "\$0" \]\]; then\s+nathaya_diagnose_haproxy_main "\$@"\s+fi')
-        self.assertNotRegex(prefix, r'\b(?:source|systemctl|systemd-run|sudo|apt|curl|wget)\b')
+        assert_launcher_contract(self, SHELL)
+
+    def test_launcher_contract_accepts_layout_not_dispatch_changes(self):
+        # Text-only variants: never source the shell or launch its Python.
+        variants = (
+            SHELL.replace(') ;;', ')\n            ;;')
+                 .replace('return 64 ;;', 'return\t64\n            ;;')
+                 .replace('    exec /usr/bin/env', '\texec\t/usr/bin/env'),
+            SHELL.replace('case "$#:${1-}" in', 'case\t"$#:${1-}"\tin')
+                 .replace(' -i PATH=', '  -i\tPATH=')
+                 .replace(' -I -B - "$1"', '\t-I  -B\t-  "$1"')
+                 .replace("<<'" + MARKER + "'\n", "<<  '" + MARKER + "'  \n"),
+        )
+        for variant in variants:
+            assert_launcher_contract(self, variant)
+        for before, after in (('-i PATH=', 'PATH='), (' -I -B ', ' -B '),
+                              ('- "$1"', '- $1'), ('- "$1"', '- "$@"'),
+                              ('return 64 ;;', 'return 0 ;;'),
+                              ('1:--run|1:--cap-boundaries)', '*)'),
+                              ('\n' + MARKER + '\n', '\n' + MARKER + ' \n'),
+                              ('\n' + MARKER + '\n', '\n' + MARKER + '\t\n')):
+            with self.subTest(change=after), self.assertRaises(AssertionError):
+                assert_launcher_contract(self, SHELL.replace(before, after))
 
     def test_host_guards_reject_accidental_real_operations(self):
         for operation in (lambda: Path('/proc/1/comm').read_text(),
@@ -257,23 +367,26 @@ class ImportAndShellContracts(Offline):
                           lambda: socket.socket(), lambda: pwd.getpwnam('haproxy'),
                           lambda: grp.getgrnam('haproxy'), lambda: tempfile.mkdtemp()):
             with self.assertRaisesRegex(AssertionError, 'Real host operation forbidden'):
-                operation()
+                self.invoke(operation)
 
     def test_main_invalid_arguments_never_construct_controller(self):
-        with patch.object(self.D, 'Controller') as factory, patch.object(sys, 'stderr', io.StringIO()):
-            for args in ([], ['--help'], ['--run', 'extra'], ['--trace']):
-                self.assertEqual(self.D.main(args), 64)
+        factory = Mock()
+        for args in ([], ['--help'], ['--run', 'extra'], ['--trace']):
+            result = self.invoke(self.D.main, args, patchers=(
+                patch.object(self.D, 'Controller', factory),
+                patch.object(sys, 'stderr', io.StringIO()),
+            ))
+            self.assertEqual(result, 64)
         factory.assert_not_called()
 
     def test_rooted_run_on_unsupported_host_stops_before_proc_or_commands(self):
         # Real main + real prepare, fake root identities and unsupported arch.
         c = self.D.Controller()
         c.command = Mock(side_effect=AssertionError('No command before host validation'))
-        with ExitStack() as stack:
-            for name in ('getuid', 'geteuid', 'getgid', 'getegid'):
-                stack.enter_context(patch.object(os, name, return_value=0))
-            stack.enter_context(patch.object(platform, 'machine', return_value='aarch64'))
-            rc, out, err = self.main_with(c)
+        rc, out, err = self.main_with(c, patchers=tuple(
+            patch.object(os, name, return_value=0)
+            for name in ('getuid', 'geteuid', 'getgid', 'getegid')
+        ) + (patch.object(platform, 'machine', return_value='aarch64'),))
         self.assertEqual(rc, 2)
         self.assertIn('unsupported: root-Ubuntu-24.04-amd64-required', out)
         self.assertEqual(err, '')
@@ -282,28 +395,27 @@ class ImportAndShellContracts(Offline):
 
     def test_non_systemd_pid1_is_inspected_only_through_mock(self):
         c = self.D.Controller()
-        with ExitStack() as stack:
-            for name in ('getuid', 'geteuid', 'getgid', 'getegid'):
-                stack.enter_context(patch.object(os, name, return_value=0))
-            stack.enter_context(patch.object(platform, 'machine', return_value='x86_64'))
-            read = stack.enter_context(patch.object(Path, 'read_text', return_value='not-systemd\n'))
-            with self.assertRaisesRegex(self.D.Unsupported, 'systemd-PID1-required'):
-                c.prepare()
+        read = Mock(return_value='not-systemd\n')
+        with self.assertRaisesRegex(self.D.Unsupported, 'systemd-PID1-required'):
+            self.invoke(c.prepare, patchers=tuple(
+                patch.object(os, name, return_value=0)
+                for name in ('getuid', 'geteuid', 'getgid', 'getegid')
+            ) + (patch.object(platform, 'machine', return_value='x86_64'),
+                 patch.object(Path, 'read_text', read)))
         read.assert_called_once_with()
         self.assertIsNone(c.directory)
 
     def test_root_systemd_but_unsupported_os_stops_before_tempwork(self):
         c = self.D.Controller()
         c.command = Mock()
-        with ExitStack() as stack:
-            for name in ('getuid', 'geteuid', 'getgid', 'getegid'):
-                stack.enter_context(patch.object(os, name, return_value=0))
-            stack.enter_context(patch.object(platform, 'machine', return_value='x86_64'))
-            stack.enter_context(patch.object(Path, 'read_text', return_value='systemd\n'))
-            read = stack.enter_context(patch.object(self.D, '_read_private_source',
-                                                    return_value=(b'ID=ubuntu\nVERSION_ID=22.04\n', {})))
-            with self.assertRaisesRegex(self.D.Unsupported, 'Ubuntu-24.04-required'):
-                c.prepare()
+        read = Mock(return_value=(b'ID=ubuntu\nVERSION_ID=22.04\n', {}))
+        with self.assertRaisesRegex(self.D.Unsupported, 'Ubuntu-24.04-required'):
+            self.invoke(c.prepare, patchers=tuple(
+                patch.object(os, name, return_value=0)
+                for name in ('getuid', 'geteuid', 'getgid', 'getegid')
+            ) + (patch.object(platform, 'machine', return_value='x86_64'),
+                 patch.object(Path, 'read_text', return_value='systemd\n'),
+                 patch.object(self.D, '_read_private_source', read)))
         read.assert_called_once_with('/usr/lib/os-release', 65536)
         self.assertIsNone(c.directory)
         c.command.assert_not_called()
@@ -958,12 +1070,15 @@ class Systemd255SnapshotContracts(Offline):
         c.save.reset_mock()
         c.release_reservations = Mock()
         label = 'fixture-setup-lock-present'
-        with patch.object(c, 'show', side_effect=[probe, c.source]) as show, \
-                patch.object(self.D, '_no_lock', side_effect=self.D.Unsupported(label)) as mock_no_lock, \
-                patch.object(self.D, '_read_private_source', return_value=(c.source_bytes, {})), \
-                patch.object(time, 'monotonic', return_value=1), \
-                self.assertRaises(self.D.Unsupported) as raised:
-            c.gate(plan)
+        show = Mock(side_effect=[probe, c.source])
+        mock_no_lock = Mock(side_effect=self.D.Unsupported(label))
+        with self.assertRaises(self.D.Unsupported) as raised:
+            self.invoke(c.gate, plan, patchers=(
+                patch.object(c, 'show', show),
+                patch.object(self.D, '_no_lock', mock_no_lock),
+                patch.object(self.D, '_read_private_source', return_value=(c.source_bytes, {})),
+                patch.object(time, 'monotonic', return_value=1),
+            ))
         audit = self.artifact(c, 'plain/comparison.json')
         self.assertFalse(audit['ok'])
         self.assertIn(label, audit['inspection_errors'])
@@ -993,12 +1108,16 @@ class Systemd255SnapshotContracts(Offline):
             c.save.reset_mock()
             c.release_reservations = Mock()
             with self.subTest(stage=stage):
-                with patch.object(c, 'show', side_effect=[probe, c.source, live]) as show, \
-                        patch.object(self.D, '_no_lock', side_effect=refusals) as mock_no_lock, \
-                        patch.object(self.D, '_read_private_source', return_value=(c.source_bytes, {})), \
-                        patch.object(time, 'monotonic', side_effect=ticks) as clock, \
-                        self.assertRaises(self.D.Unsupported) as raised:
-                    c.gate(plan)
+                show = Mock(side_effect=[probe, c.source, live])
+                mock_no_lock = Mock(side_effect=refusals)
+                clock = Mock(side_effect=ticks)
+                with self.assertRaises(self.D.Unsupported) as raised:
+                    self.invoke(c.gate, plan, patchers=(
+                        patch.object(c, 'show', show),
+                        patch.object(self.D, '_no_lock', mock_no_lock),
+                        patch.object(self.D, '_read_private_source', return_value=(c.source_bytes, {})),
+                        patch.object(time, 'monotonic', clock),
+                    ))
                 self.assertTrue(self.artifact(c, 'plain/comparison.json')['ok'])
                 live_audit = self.artifact(c, 'plain/live-comparison.json')
                 if stage == 'live':
@@ -1365,11 +1484,12 @@ class Systemd255SnapshotContracts(Offline):
             c.command = Mock(return_value=(code, REPORTED_PARTIAL.encode(), b'PRIVATE_SYNTHETIC_STDERR'))
             c.save.reset_mock()
             c.release_reservations = Mock()
-            with patch.object(self.D, '_no_lock'), \
-                    patch.object(self.D, '_read_private_source', return_value=(c.source_bytes, {})), \
-                    patch.object(time, 'monotonic', return_value=1), \
-                    self.assertRaises(self.D.Unsupported) as raised:
-                c.gate(plan)
+            with self.assertRaises(self.D.Unsupported) as raised:
+                self.invoke(c.gate, plan, patchers=(
+                    patch.object(self.D, '_no_lock'),
+                    patch.object(self.D, '_read_private_source', return_value=(c.source_bytes, {})),
+                    patch.object(time, 'monotonic', return_value=1),
+                ))
             audit = self.artifact(c, 'plain/comparison.json')
             self.assertIn('dbus-or-show-unavailable', audit['inspection_errors'])
             self.assertIn('snapshots-unavailable', audit['issues'])
@@ -1666,15 +1786,16 @@ class CaptureContracts(Offline):
             return c.directory / name
 
         c.save.side_effect = saving
-        with patch.object(os, 'open', side_effect=opening), \
-                patch.object(os, 'read', side_effect=reading), \
-                patch.object(os, 'close', side_effect=closing), \
-                patch.object(os, 'readlink', side_effect=readlink):
-            try:
-                result = c.capture(unit, sample)
-            finally:
-                self.assertEqual(live, {}, 'All FDs must close even on refusal/errors')
-                self.assertEqual(len(closed), len(opened))
+        try:
+            result = self.invoke(c.capture, unit, sample, patchers=(
+                patch.object(os, 'open', side_effect=opening),
+                patch.object(os, 'read', side_effect=reading),
+                patch.object(os, 'close', side_effect=closing),
+                patch.object(os, 'readlink', side_effect=readlink),
+            ))
+        finally:
+            self.assertEqual(live, {}, 'All FDs must close even on refusal/errors')
+            self.assertEqual(len(closed), len(opened))
         self.assertFalse(any(path in ('maps', 'mem', 'environ', 'cmdline') for path, _ in opened))
         return result, opened, sizes
 
@@ -1854,9 +1975,12 @@ class ControllerContracts(Offline):
         c = self.controller()
         tcp, unix = Mock(), Mock()
         tcp.getsockname.return_value = ('127.0.0.1', 49173)
-        with patch.object(socket, 'socket', side_effect=[tcp, unix]) as factory, \
-                patch.object(secrets, 'token_hex', return_value='b' * 32):
-            self.assertEqual(c.reserve(), (49173, ABSTRACT))
+        factory = Mock(side_effect=[tcp, unix])
+        result = self.invoke(c.reserve, patchers=(
+            patch.object(socket, 'socket', factory),
+            patch.object(secrets, 'token_hex', return_value='b' * 32),
+        ))
+        self.assertEqual(result, (49173, ABSTRACT))
         self.assertEqual(factory.call_args_list[0].args, (socket.AF_INET, socket.SOCK_STREAM))
         self.assertEqual(factory.call_args_list[1].args, (socket.AF_UNIX, socket.SOCK_STREAM))
         tcp.bind.assert_called_once_with(('127.0.0.1', 0))
@@ -1882,8 +2006,11 @@ class ControllerContracts(Offline):
     def test_command_timeout_is_persisted_once_with_fixed_environment_and_no_retry(self):
         c = self.controller()
         exc = subprocess.TimeoutExpired(['fixture-only'], 3, output=b'partial', stderr=b'private')
-        with patch.object(subprocess, 'run', side_effect=exc) as runner:
-            self.assertEqual(c.command(['fixture-only'], timeout=99), (None, b'partial', b'private'))
+        runner = Mock(side_effect=exc)
+        result = self.invoke(c.command, ['fixture-only'], timeout=99, patchers=(
+            patch.object(subprocess, 'run', runner),
+        ))
+        self.assertEqual(result, (None, b'partial', b'private'))
         runner.assert_called_once_with(['fixture-only'], stdout=subprocess.PIPE,
                                       stderr=subprocess.PIPE, timeout=3,
                                       env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C', 'LC_ALL': 'C'},
@@ -2021,9 +2148,13 @@ class ControllerContracts(Offline):
         plan = self.plan(c)
         owned = self.probe(c, plan)
         foreign = dict(owned, Description='foreign-after-stop')
-        with patch.object(c, 'show', side_effect=[owned, foreign]), \
-                patch.object(c, 'command') as command, patch.object(time, 'monotonic', return_value=1):
-            self.assertFalse(c.cleanup_one(plan['unit']))
+        command = Mock()
+        result = self.invoke(c.cleanup_one, plan['unit'], patchers=(
+            patch.object(c, 'show', side_effect=[owned, foreign]),
+            patch.object(c, 'command', command),
+            patch.object(time, 'monotonic', return_value=1),
+        ))
+        self.assertFalse(result)
         command.assert_called_once_with(['/usr/bin/systemctl', 'stop', '--no-block', plan['unit']])
 
     def test_plain_is_default_trace_only_after_failure_and_profiles_not_mutated(self):
@@ -2034,8 +2165,10 @@ class ControllerContracts(Offline):
             c.prepare = Mock()
             c.run_phase = Mock(side_effect=[(status, None), ('failed', {'available': False, 'counts': []})])
             c.cleanup = Mock(return_value=True)
-            with patch.object(os.path, 'isfile', return_value=True), patch.object(self.D, '_secure_path'):
-                rc, out, err = self.main_with(c)
+            rc, out, err = self.main_with(c, patchers=(
+                patch.object(os.path, 'isfile', return_value=True),
+                patch.object(self.D, '_secure_path'),
+            ))
             self.assertEqual([call.args[0] for call in c.run_phase.call_args_list], phases)
             self.assertEqual(rc, 0 if status == 'observed-running' else 2)
             self.assertEqual(err, '')
@@ -2056,8 +2189,10 @@ class ControllerContracts(Offline):
         self.assertFalse(trace['available'])
         c.run_phase = Mock(side_effect=[('failed', None), ('failed', trace)])
         c.cleanup = Mock(return_value=True)
-        with patch.object(os.path, 'isfile', return_value=True), patch.object(self.D, '_secure_path'):
-            rc, out, err = self.main_with(c)
+        rc, out, err = self.main_with(c, patchers=(
+            patch.object(os.path, 'isfile', return_value=True),
+            patch.object(self.D, '_secure_path'),
+        ))
         self.assertEqual(rc, 2)
         self.assertEqual(err, '')
         self.assertIn('trace evidence: unavailable', out)
@@ -2082,8 +2217,9 @@ class ControllerContracts(Offline):
         c.prepare = Mock()
         c.run_phase = Mock(return_value=('failed', None))
         c.cleanup = Mock(return_value=True)
-        with patch.object(os.path, 'isfile', return_value=False):
-            rc, out, _ = self.main_with(c)
+        rc, out, _ = self.main_with(c, patchers=(
+            patch.object(os.path, 'isfile', return_value=False),
+        ))
         self.assertEqual(rc, 2)
         c.run_phase.assert_called_once_with('plain')
         self.assertIn('trace evidence: unavailable (strace not installed)', out)
@@ -2351,9 +2487,12 @@ class CapabilityBoundaryContracts(Offline):
         c.command.assert_not_called()
 
     def test_fixed_snapshot_limits_pid_and_anchors_bounded_reads_with_presence_only_environment(self):
-        with patch.object(os, 'getpid', return_value=99), patch.object(os, 'open') as opening:
-            with self.assertRaisesRegex(ValueError, 'fixed-pid'):
-                self.D.fixed_snapshot(100)
+        opening = Mock()
+        with self.assertRaisesRegex(ValueError, 'fixed-pid'):
+            self.invoke(self.D.fixed_snapshot, 100, patchers=(
+                patch.object(os, 'getpid', return_value=99),
+                patch.object(os, 'open', opening),
+            ))
         opening.assert_not_called()
         for pid in (1, 99):
             opened, streams, sizes = [], [], []
@@ -2379,12 +2518,15 @@ class CapabilityBoundaryContracts(Offline):
                 stream = BoundedStream(data)
                 streams.append(stream)
                 return stream
-            with patch.object(os, 'getpid', return_value=99), \
-                    patch.object(os, 'open', side_effect=opening), patch.object(os, 'fdopen', side_effect=fdopen), \
-                    patch.object(os, 'readlink', return_value='/usr/bin/python3.12') as link, \
-                    patch.object(os, 'close') as close, \
-                    patch.dict(os.environ, {'LD_PRELOAD': 'PRIVATE_ENV_VALUE'}, clear=True):
-                snapshot = self.D.fixed_snapshot(pid, environment=True)
+            link = Mock(return_value='/usr/bin/python3.12')
+            close = Mock()
+            snapshot = self.invoke(self.D.fixed_snapshot, pid, environment=True, patchers=(
+                patch.object(os, 'getpid', return_value=99),
+                patch.object(os, 'open', side_effect=opening),
+                patch.object(os, 'fdopen', side_effect=fdopen),
+                patch.object(os, 'readlink', link), patch.object(os, 'close', close),
+                patch.dict(os.environ, {'LD_PRELOAD': 'PRIVATE_ENV_VALUE'}, clear=True),
+            ))
             self.assertTrue(snapshot['available'])
             self.assertEqual(snapshot['status']['Pid'], pid)
             self.assertEqual(snapshot['status']['CapInh'], 0)
@@ -2415,13 +2557,17 @@ class CapabilityBoundaryContracts(Offline):
                     if str(path) == '/usr/bin' and refusal == 'parent-writable':
                         return SimpleNamespace(**{**vars(directory), 'st_mode': stat.S_IFDIR | 0o777})
                     return directory
-                with patch.object(Path, 'lstat', autospec=True, side_effect=info), \
-                        patch.object(Path, 'stat', autospec=True, side_effect=info), \
-                        patch.object(os, 'readlink', return_value='python3.12'), \
-                        patch.object(os, 'open', return_value=20) as opening, \
-                        patch.object(os, 'fstat', return_value=file), patch.object(os, 'close') as close, \
-                        patch.object(os, 'getxattr', side_effect=OSError(error, 'PRIVATE_XATTR')) as xattr:
-                    result = self.D.executable_metadata('/usr/bin/python3')
+                opening = Mock(return_value=20)
+                close = Mock()
+                xattr = Mock(side_effect=OSError(error, 'PRIVATE_XATTR'))
+                result = self.invoke(self.D.executable_metadata, '/usr/bin/python3', patchers=(
+                    patch.object(Path, 'lstat', autospec=True, side_effect=info),
+                    patch.object(Path, 'stat', autospec=True, side_effect=info),
+                    patch.object(os, 'readlink', return_value='python3.12'),
+                    patch.object(os, 'open', opening),
+                    patch.object(os, 'fstat', return_value=file),
+                    patch.object(os, 'close', close), patch.object(os, 'getxattr', xattr),
+                ))
                 with self.subTest(refusal=refusal, error=error):
                     if refusal:
                         self.assertFalse(result['available'])
@@ -2442,15 +2588,17 @@ class CapabilityBoundaryContracts(Offline):
         for stage in ('root', 'arch', 'pid1', 'os'):
             c = self.D.Controller()
             c.command = Mock()
-            with ExitStack() as stack:
-                for name in ('getuid', 'geteuid', 'getgid', 'getegid'):
-                    stack.enter_context(patch.object(os, name, return_value=1000 if stage == 'root' else 0))
-                stack.enter_context(patch.object(platform, 'machine', return_value='aarch64' if stage == 'arch' else 'x86_64'))
-                stack.enter_context(patch.object(Path, 'read_text', return_value='other' if stage == 'pid1' else 'systemd'))
-                stack.enter_context(patch.object(self.D, '_read_private_source', return_value=(b'ID=ubuntu\nVERSION_ID=22.04\n', {})))
-                snapshot = stack.enter_context(patch.object(self.D, 'fixed_snapshot'))
-                with self.subTest(stage=stage), self.assertRaises(self.D.Unsupported):
-                    c.prepare(cap_boundaries=True)
+            snapshot = Mock()
+            with self.subTest(stage=stage), self.assertRaises(self.D.Unsupported):
+                self.invoke(c.prepare, cap_boundaries=True, patchers=tuple(
+                    patch.object(os, name, return_value=1000 if stage == 'root' else 0)
+                    for name in ('getuid', 'geteuid', 'getgid', 'getegid')
+                ) + (
+                    patch.object(platform, 'machine', return_value='aarch64' if stage == 'arch' else 'x86_64'),
+                    patch.object(Path, 'read_text', return_value='other' if stage == 'pid1' else 'systemd'),
+                    patch.object(self.D, '_read_private_source', return_value=(b'ID=ubuntu\nVERSION_ID=22.04\n', {})),
+                    patch.object(self.D, 'fixed_snapshot', snapshot),
+                ))
             snapshot.assert_not_called()
             c.command.assert_not_called()
             self.assertIsNone(c.directory)
@@ -2460,21 +2608,23 @@ class CapabilityBoundaryContracts(Offline):
         c.command = Mock(side_effect=AssertionError('No inventory command in controls mode'))
         c._audit_show = Mock(return_value=c.source)
         c._audit_fragment = Mock(return_value=(c.source_bytes, c.fragment, []))
-        with ExitStack() as stack:
-            for name in ('getuid', 'geteuid', 'getgid', 'getegid'):
-                stack.enter_context(patch.object(os, name, return_value=0))
-            stack.enter_context(patch.object(platform, 'machine', return_value='x86_64'))
-            stack.enter_context(patch.object(Path, 'read_text', return_value='systemd'))
-            private = stack.enter_context(patch.object(self.D, '_read_private_source',
-                                                      return_value=(b'ID=ubuntu\nVERSION_ID=24.04\n', {})))
-            snapshots = stack.enter_context(patch.object(self.D, 'fixed_snapshot', return_value={'available': False}))
-            stack.enter_context(patch.object(self.D, '_no_lock'))
-            stack.enter_context(patch.object(self.D, '_secure_path'))
-            stack.enter_context(patch.object(os, 'umask'))
-            stack.enter_context(patch.object(tempfile, 'mkdtemp', return_value=str(c.directory)))
-            stack.enter_context(patch.object(Path, 'stat', return_value=SimpleNamespace(st_mode=stat.S_IFDIR | 0o700)))
-            metadata = stack.enter_context(patch.object(self.D, 'executable_metadata', return_value={'available': False}))
-            c.prepare(cap_boundaries=True)
+        private = Mock(return_value=(b'ID=ubuntu\nVERSION_ID=24.04\n', {}))
+        snapshots = Mock(return_value={'available': False})
+        metadata = Mock(return_value={'available': False})
+        self.invoke(c.prepare, cap_boundaries=True, patchers=tuple(
+            patch.object(os, name, return_value=0)
+            for name in ('getuid', 'geteuid', 'getgid', 'getegid')
+        ) + (
+            patch.object(platform, 'machine', return_value='x86_64'),
+            patch.object(Path, 'read_text', return_value='systemd'),
+            patch.object(self.D, '_read_private_source', private),
+            patch.object(self.D, 'fixed_snapshot', snapshots),
+            patch.object(self.D, '_no_lock'), patch.object(self.D, '_secure_path'),
+            patch.object(os, 'umask'),
+            patch.object(tempfile, 'mkdtemp', return_value=str(c.directory)),
+            patch.object(Path, 'stat', return_value=SimpleNamespace(st_mode=stat.S_IFDIR | 0o700)),
+            patch.object(self.D, 'executable_metadata', metadata),
+        ))
         private.assert_called_once_with('/usr/lib/os-release', 65536)
         self.assertEqual(snapshots.call_count, 2)
         self.assertEqual(c.caps, CAPS3)
@@ -2535,9 +2685,11 @@ class CapabilityBoundaryContracts(Offline):
                                  ('cap-gated' if '-cap-gated.' in unit else 'cap-direct') + '/intent.json')
                 return 0, b'', b''
             c.command.side_effect = command
-            with patch.object(Path, 'mkdir') as mkdir, patch.object(self.D, '_no_lock'), \
-                    patch.object(time, 'monotonic', return_value=1), patch.object(time, 'sleep'):
-                outcomes = c.run_controls()
+            mkdir = Mock()
+            outcomes = self.invoke(c.run_controls, patchers=(
+                patch.object(Path, 'mkdir', mkdir), patch.object(self.D, '_no_lock'),
+                patch.object(time, 'monotonic', return_value=1), patch.object(time, 'sleep'),
+            ))
             self.assertEqual(outcomes, {'cap-gated': 'unavailable' if incomplete else 'recorded', 'cap-direct': 'recorded'})
             self.assertEqual(c.intents, [])
             self.assertEqual(c.cleanup_one.call_count, 2)
@@ -2616,6 +2768,211 @@ class CapabilityBoundaryContracts(Offline):
             self.assertIn('(not a root cause)', out)
             self.assertNotIn('plain startup:', out)
             self.assertNotIn('trace startup:', out)
+
+
+class HostBoundaryRegressions(unittest.TestCase):
+    """Reporting uses an ordinary TestCase, outside the diagnostic boundary."""
+
+    @staticmethod
+    def references():
+        return tuple((obj, name, getattr(obj, name)) for obj, name in (
+            (builtins, 'open'), (io, 'open'), (os, 'stat'), (os, 'open'),
+            (os, 'fdopen'), (Path, 'stat'), (Path, 'read_text'),
+            (Path, 'open'), (Path, 'lstat'), (Path, 'mkdir'),
+            (Path, 'readlink'), (Path, 'resolve'),
+        ))
+
+    def assert_restored(self, references):
+        for obj, name, original in references:
+            self.assertIs(getattr(obj, name), original, name)
+
+    def test_assertion_unwinds_local_overrides_before_real_traceback_formatting(self):
+        references = self.references()
+        fixture = Offline()
+        fixture.setUp()
+        opening = Mock(side_effect=AssertionError('controlled-boundary-failure'))
+        retained = None
+        try:
+            fixture.invoke(lambda: builtins.open('fixture-only'), patchers=(
+                patch.object(builtins, 'open', opening),
+            ))
+        except AssertionError:
+            # assertRaises clears exception.__traceback__; keep the REAL one.
+            retained = sys.exc_info()
+        self.assert_restored(references)
+        self.assertEqual(fixture.host.depth, 0)
+        self.assertIsNotNone(retained)
+        self.assertIsNotNone(retained[2])
+        opening.assert_called_once_with('fixture-only')
+        filename = HostBoundary.invoke.__code__.co_filename
+        missing = object()
+        cached = linecache.cache.get(filename, missing)
+        real_updatecache = linecache.updatecache
+        fetched = []
+
+        def updatecache(*args, **kwargs):
+            self.assert_restored(references)  # BEFORE actual checkout source IO.
+            self.assertEqual(fixture.host.depth, 0)
+            lines = real_updatecache(*args, **kwargs)
+            if (args[0] if args else kwargs['filename']) == filename:
+                self.assertTrue(lines, 'Real source lines must be retrieved')
+                source = ''.join(lines)
+                self.assertRegex(source, r'(?m)^\s*class\s+HostBoundary\s*:')
+                self.assertRegex(source, r'\breturn\s+operation\s*\(\s*\*args\s*,\s*\*\*kwargs\s*\)')
+                fetched.append(lines)
+            return lines
+
+        try:
+            # Reporting is outside the boundary: no host IO is patched here.
+            # Each formatter must retrieve actual source from a cold cache.
+            with patch.object(linecache, 'updatecache', side_effect=updatecache):
+                linecache.cache.pop(filename, None)
+                structured = ''.join(traceback.TracebackException(*retained).format())
+                linecache.cache.pop(filename, None)
+                formatted = ''.join(traceback.format_exception(*retained))
+            self.assertIs(linecache.updatecache, real_updatecache)
+            self.assertGreaterEqual(len(fetched), 2)
+            for text in (structured, formatted):
+                self.assertIn('controlled-boundary-failure', text)
+                self.assertIn('diagnose_haproxy_test.py', text)
+                self.assertRegex(text, r'\breturn\s+operation\s*\(\s*\*args\s*,\s*\*\*kwargs\s*\)')
+            self.assert_restored(references)
+        finally:
+            if cached is missing:
+                linecache.cache.pop(filename, None)
+            else:
+                linecache.cache[filename] = cached
+
+    def test_nested_invocations_preserve_local_fakes_and_constructor_api(self):
+        references = self.references()
+        fixture = Offline()
+        fixture.setUp()
+        outer_entropy = Mock(return_value='c' * 32)
+        inner_entropy = Mock(return_value='d' * 32)
+        opening = Mock(return_value='virtual')
+        observations = []
+
+        def grouped():
+            observations.append(fixture.D.Controller().nonce)
+            child = fixture.invoke(fixture.D.Controller, patchers=(
+                patch.object(secrets, 'token_hex', inner_entropy),
+            ))
+            observations.append(child.nonce)
+            observations.append(fixture.D.Controller().nonce)
+            observations.append(builtins.open('fixture-only'))
+            # Nested wrappers must not reinstall guards over these local fakes.
+            observations.append(fixture.D.parse_show('Id=fixture.service\n'))
+            raise AssertionError('controlled-nested-failure')
+
+        with self.assertRaisesRegex(AssertionError, 'controlled-nested-failure'):
+            fixture.invoke(grouped, patchers=(
+                patch.object(secrets, 'token_hex', outer_entropy),
+                patch.object(builtins, 'open', opening),
+            ))
+        self.assert_restored(references)
+        self.assertEqual(fixture.host.depth, 0)
+        self.assertEqual(observations, ['c' * 32, 'd' * 32, 'c' * 32,
+                                       'virtual', {'Id': 'fixture.service'}])
+        self.assertEqual(outer_entropy.call_count, 2)
+        inner_entropy.assert_called_once_with(16)
+        opening.assert_called_once_with('fixture-only')
+        self.assertIsInstance(fixture.D.Controller, type)
+        self.assertIs(fixture.D.Path, Path)
+        self.assertTrue(issubclass(fixture.D.Unsupported, ValueError))
+        self.assertFalse(hasattr(fixture.D.Unsupported, '__wrapped__'))
+        errors = []
+        fixture.D.collect_unsupported(errors=errors, operation=fixture.D.watchdog_behavior, value='5s')
+        self.assertEqual(errors, ['WatchdogUSec'])
+        for value in vars(fixture.D).values():
+            if isinstance(value, FunctionType) and value.__module__ == fixture.D.__name__:
+                self.assertTrue(hasattr(value, '__wrapped__'))
+        for value in vars(fixture.D.Controller).values():
+            if isinstance(value, FunctionType) and value.__module__ == fixture.D.__name__:
+                self.assertTrue(hasattr(value, '__wrapped__'))
+        self.assertEqual(fixture.D.Controller().nonce, NONCE)
+        self.assertEqual(fixture.D.Controller().nonce, NONCE)
+        self.assert_restored(references)
+
+    def test_import_failure_unwinds_before_handler_and_allows_fresh_setup(self):
+        references = self.references()
+        fixture = Offline()
+        failed_import = compile("raise RuntimeError('controlled-import-failure')",
+                                'fixture-import-failure', 'exec')
+        # Only the diagnostic code object changes; no host override surrounds
+        # the assertion handler, and setUp itself must unwind on import failure.
+        with patch.dict(Offline.setUp.__globals__, {'CODE': failed_import}):
+            with self.assertRaisesRegex(RuntimeError, 'controlled-import-failure'):
+                fixture.setUp()
+        self.assert_restored(references)
+        self.assertEqual(fixture.host.depth, 0)
+        fixture.setUp()
+        self.assertEqual(fixture.D.parse_show('Id=fixture.service\n'), {'Id': 'fixture.service'})
+        self.assert_restored(references)
+
+    def test_forbidden_operations_still_fail_only_inside_invocation(self):
+        references = self.references()
+        boundary = HostBoundary()
+        # No operation is attempted outside invoke, not even as a guard probe.
+        path_operations = tuple(
+            lambda name=name, args=args: getattr(Path('/fixture-forbidden'), name)(*args)
+            for name, args in (
+                ('open', ()), ('stat', ()), ('lstat', ()), ('mkdir', ()),
+                ('unlink', ()), ('rmdir', ()), ('rename', ('/fixture-target',)),
+                ('replace', ('/fixture-target',)), ('chmod', (0o600,)),
+                ('lchmod', (0o600,)), ('touch', ()),
+                ('symlink_to', ('/fixture-target',)), ('link_to', ('/fixture-target',)),
+                ('hardlink_to', ('/fixture-target',)), ('readlink', ()),
+                ('resolve', ()), ('exists', ()), ('is_dir', ()), ('is_file', ()),
+            ) if hasattr(Path, name)
+        )
+        for operation in (lambda: builtins.open('/fixture-forbidden'),
+                          lambda: io.open('/fixture-forbidden'),
+                          lambda: os.stat('/fixture-forbidden'),
+                          lambda: os.open('/fixture-forbidden', os.O_RDONLY),
+                          lambda: os.fdopen(-1),
+                          lambda: Path('/fixture-forbidden').read_text(),
+                          lambda: subprocess.run(['fixture-forbidden']),
+                          lambda: socket.socket()) + path_operations:
+            with self.assertRaisesRegex(AssertionError, 'Real host operation forbidden'):
+                boundary.invoke(operation)
+            self.assert_restored(references)
+            self.assertEqual(boundary.depth, 0)
+
+    def test_offline_failure_and_subtest_reporting_see_original_host_functions(self):
+        references = self.references()
+        outer = self
+
+        class ReportingResult(unittest.TestResult):
+            def addFailure(result, test, err):
+                outer.assert_restored(references)  # BEFORE real traceback formatting.
+                super().addFailure(test, err)
+
+            def addSubTest(result, test, subtest, err):
+                outer.assert_restored(references)  # BEFORE real subtest formatting.
+                super().addSubTest(test, subtest, err)
+
+        for as_subtest in (False, True):
+            opening = Mock(side_effect=AssertionError('expected-inner-failure'))
+
+            class FailingOffline(Offline):
+                def runTest(inner):
+                    def fail():
+                        builtins.open('fixture-only')
+                    if as_subtest:
+                        with inner.subTest(stage='expected-failure'):
+                            inner.invoke(fail, patchers=(patch.object(builtins, 'open', opening),))
+                    else:
+                        inner.invoke(fail, patchers=(patch.object(builtins, 'open', opening),))
+
+            result = ReportingResult()
+            FailingOffline().run(result)
+            self.assert_restored(references)
+            self.assertEqual(result.testsRun, 1)
+            self.assertEqual(result.errors, [])
+            self.assertEqual(len(result.failures), 1)
+            self.assertIn('expected-inner-failure', result.failures[0][1])
+            self.assertIn('diagnose_haproxy_test.py', result.failures[0][1])
+            opening.assert_called_once_with('fixture-only')
 
 
 if __name__ == '__main__':
