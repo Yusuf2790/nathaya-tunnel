@@ -23,7 +23,9 @@ Pure public interfaces:
   parse_show(text) -> dict[str, str]
   validate_fragment(text) -> dict[str, str] (audited directives)
   validate_effective(properties, fragment) -> frozenset[str] (source caps)
+  watchdog_behavior(value) -> 'disabled' (only raw '0' or 'infinity')
   restriction_differences(source, probe) -> sorted list[str]
+  Controller.audit_compatibility(...) -> private aggregate dict (pure, no IO)
   make_config(port, abstract_name) -> str
   trace_command(haproxy_argv) -> list[str]
   sanitise_trace(text) -> dict (no arguments, IDs or raw log text)
@@ -73,6 +75,60 @@ IDENTITY_CALLS = frozenset(('getuid', 'geteuid', 'getresuid', 'setuid',
 
 class Unsupported(ValueError):
     """Messages are constant labels or validated property NAMES, never values."""
+    def __init__(self, message, *, labels=None):
+        self.labels = tuple(labels) if labels is not None else (message,)
+        super().__init__(';'.join(self.labels))
+
+
+def collect_unsupported(errors, operation, *args, **kwargs):
+    """Collect independent known validation failures; never hide programming errors."""
+    try:
+        return operation(*args, **kwargs)
+    except Unsupported as exc:
+        errors.extend(exc.labels)
+        return None
+
+
+def _raise_unsupported(errors):
+    if errors:
+        raise Unsupported('aggregate', labels=sorted(set(errors)))
+
+
+def watchdog_behavior(value):
+    """Only the two proven v255 disabled representations are equivalent.
+
+    service.c: service_start_watchdog/service_get_watchdog_usec; service.h:
+    watchdog_original_usec starts at USEC_INFINITY; time-util.h:
+    timestamp_is_set(t) is t > 0 && t != USEC_INFINITY. This normalizes timer
+    behavior only, never watchdog timestamps or a failure's root cause.
+    https://github.com/systemd/systemd/blob/v255/src/core/service.c
+    https://github.com/systemd/systemd/blob/v255/src/core/service.h
+    https://github.com/systemd/systemd/blob/v255/src/basic/time-util.h
+    """
+    if isinstance(value, str) and value in ('0', 'infinity'):
+        return 'disabled'
+    raise Unsupported('WatchdogUSec')
+
+
+def _watchdog_kind(properties):
+    if 'WatchdogUSec' not in properties:
+        return 'missing'
+    value = properties['WatchdogUSec']
+    if not isinstance(value, str):
+        return 'invalid-type'
+    if value == '0':
+        return 'zero'
+    if value == 'infinity':
+        return 'infinity'
+    if value == '':
+        return 'empty'
+    if re.fullmatch(r'[0-9]+(?:\.[0-9]+)?(?:us|ms|s|min|h|d|w)?', value):
+        return 'finite'
+    return 'unknown'
+
+
+def _property_name(key):
+    return key if isinstance(key, str) and re.fullmatch(r'[A-Za-z][A-Za-z0-9]*', key) else 'property-name'
 
 
 def parse_show(text):
@@ -89,6 +145,8 @@ def parse_show(text):
 
 
 def _capset(text):
+    if not isinstance(text, str):
+        raise Unsupported('CapabilityBoundingSet')
     tokens = text.split()
     normal = [token.upper() for token in tokens]
     if len(normal) != len(set(normal)) or any(not re.fullmatch(r'CAP_[A-Z0-9_]+', t) for t in normal):
@@ -154,7 +212,7 @@ def validate_fragment(text):
 
 
 def _require(properties, expected):
-    bad = [k for k, v in expected.items() if properties.get(k) != v]
+    bad = [_property_name(k) for k, v in expected.items() if properties.get(k) != v]
     if bad:
         raise Unsupported('properties:' + ','.join(sorted(bad)))
 
@@ -177,40 +235,44 @@ def _checked_empty_exec_fields(properties, fields):
         raise Unsupported('empty-hook-proof-scope') from None
     if not fields <= EMPTY_EXEC_FIELDS:
         raise Unsupported('empty-hook-proof-scope')
-    for key in sorted(fields):
-        if key in properties and properties[key] != '':
-            raise Unsupported('active-hook:' + key)
+    errors = ['active-hook:' + key for key in sorted(fields)
+              if key in properties and properties[key] != '']
+    _raise_unsupported(errors)
     return fields
 
 
 def _source_empty_exec_fields(properties, fragment):
-    # Runtime callers supply the dictionary returned by validate_fragment after
-    # _read_private_source. Reject partial/different fragment evidence, not merely
-    # a missing hook property. Missing DropInPaths is NOT proof of no drop-ins.
-    _require(properties, {'Id': MAIN, 'LoadState': 'loaded', 'FragmentPath': FRAGMENT,
-                          'DropInPaths': '', 'NeedDaemonReload': 'no'})
-    if not isinstance(fragment, dict):
-        raise Unsupported('source-hook-fragment-uncertain')
+    # Proof requires the whole audited fragment AND no drop-ins/reload/active
+    # unused hooks. Collect independent errors, but never issue partial proof.
+    errors = []
+    collect_unsupported(errors, _require, properties,
+                        {'Id': MAIN, 'LoadState': 'loaded', 'FragmentPath': FRAGMENT,
+                         'DropInPaths': '', 'NeedDaemonReload': 'no'})
     fields = frozenset(name + suffix for name in SOURCE_EMPTY_EXEC_HOOKS
                        for suffix in ('', 'Ex'))
-    for key in sorted(fields):
-        if key in fragment:
-            raise Unsupported('source-hook-defined-in-fragment:' + key)
-    expected_values = {**UNIT_FIELDS, **SERVICE_FIELDS, **INSTALL_FIELDS}
-    if set(fragment) != set(expected_values) | {'CapabilityBoundingSet'}:
-        raise Unsupported('source-hook-fragment-uncertain')
-    for key, value in fragment.items():
-        if not isinstance(value, str):
-            raise Unsupported('source-hook-fragment-uncertain')
-        if key == 'CapabilityBoundingSet':
-            if _capset(value) not in (CAPS3, CAPS4):
-                raise Unsupported('source-hook-fragment-uncertain')
-        elif key in ('StandardOutput', 'StandardError'):
-            if not value.startswith('append:') or not value[len('append:'):]:
-                raise Unsupported('source-hook-fragment-uncertain')
-        elif value != expected_values[key]:
-            raise Unsupported('source-hook-fragment-uncertain')
-    return _checked_empty_exec_fields(properties, fields)
+    collect_unsupported(errors, _checked_empty_exec_fields, properties, fields)
+    if not isinstance(fragment, dict):
+        errors.append('source-hook-fragment-uncertain')
+    else:
+        for key in sorted(fields & set(fragment)):
+            errors.append('source-hook-defined-in-fragment:' + key)
+        expected_values = {**UNIT_FIELDS, **SERVICE_FIELDS, **INSTALL_FIELDS}
+        if set(fragment) != set(expected_values) | {'CapabilityBoundingSet'}:
+            errors.append('source-hook-fragment-uncertain')
+        for key, value in fragment.items():
+            if not isinstance(value, str):
+                errors.append('source-hook-fragment-uncertain')
+            elif key == 'CapabilityBoundingSet':
+                caps = collect_unsupported(errors, _capset, value)
+                if caps not in (CAPS3, CAPS4):
+                    errors.append('source-hook-fragment-uncertain')
+            elif key in ('StandardOutput', 'StandardError'):
+                if not value.startswith('append:') or not value[len('append:'):]:
+                    errors.append('source-hook-fragment-uncertain')
+            elif key not in expected_values or value != expected_values[key]:
+                errors.append('source-hook-fragment-uncertain')
+    _raise_unsupported(errors)
+    return fields
 
 
 def _exec_struct(value, argv):
@@ -219,7 +281,9 @@ def _exec_struct(value, argv):
     Only bookkeeping fields may follow argv[]. No second command is allowed.
     The fields are read only, and no show value ever becomes command syntax.
     """
-    if not value.startswith('{ ') or not value.endswith(' }'):
+    if (not isinstance(value, str) or not isinstance(argv, (list, tuple)) or not argv
+            or any(not isinstance(arg, str) for arg in argv)
+            or not value.startswith('{ ') or not value.endswith(' }')):
         return False
     fields = value[2:-2].split(' ; ')
     if len(fields) < 3 or fields[:2] != ['path=' + argv[0], 'argv[]=' + ' '.join(argv)]:
@@ -254,8 +318,11 @@ def _exec_struct(value, argv):
 
 
 def validate_effective(properties, fragment):
-    """Validate production profile without reading its config, PEM, or logs."""
-    _require(properties, {
+    """Collect the complete unsupported profile, returning source caps if valid."""
+    if not isinstance(properties, dict):
+        raise Unsupported('source-snapshot-format')
+    errors = []
+    collect_unsupported(errors, _require, properties, {
         'Id': MAIN, 'LoadState': 'loaded', 'FragmentPath': FRAGMENT,
         'DropInPaths': '', 'NeedDaemonReload': 'no', 'User': 'root', 'Group': 'root',
         'Type': 'simple', 'NoNewPrivileges': 'yes', 'SecureBits': '0',
@@ -271,22 +338,27 @@ def validate_effective(properties, fragment):
         # The production log pathname is not needed and is not always exposed
         # by systemd's D-Bus interface. Never infer an absent property as empty.
     })
-    _source_empty_exec_fields(properties, fragment)
-    caps = _capset(properties.get('CapabilityBoundingSet', ''))
-    if caps not in (CAPS3, CAPS4) or caps != _capset(fragment['CapabilityBoundingSet']):
-        raise Unsupported('CapabilityBoundingSet')
-    families = properties.get('RestrictAddressFamilies', '').split()
+    collect_unsupported(errors, _source_empty_exec_fields, properties, fragment)
+    collect_unsupported(errors, watchdog_behavior, properties.get('WatchdogUSec'))
+    caps = collect_unsupported(errors, _capset, properties.get('CapabilityBoundingSet'))
+    fragment_caps = collect_unsupported(errors, _capset,
+                                       fragment.get('CapabilityBoundingSet') if isinstance(fragment, dict) else None)
+    if caps not in (CAPS3, CAPS4) or caps != fragment_caps:
+        errors.append('CapabilityBoundingSet')
+    families = properties.get('RestrictAddressFamilies')
+    families = families.split() if isinstance(families, str) else []
     if len(families) != 3 or set(families) != {'AF_INET', 'AF_INET6', 'AF_UNIX'}:
-        raise Unsupported('RestrictAddressFamilies')
+        errors.append('RestrictAddressFamilies')
     # Only an empty deny list is supported. Never translate an allow-list to deny.
     if properties.get('SystemCallFilter') != '~':
-        raise Unsupported('SystemCallFilter')
+        errors.append('SystemCallFilter')
     for name, argv in (('ExecStart', SERVICE_FIELDS['ExecStart'].split()),
                        ('ExecReload', ['/bin/kill', '-USR2', '$MAINPID'])):
-        if not _exec_struct(properties.get(name, ''), argv):
-            raise Unsupported(name)
+        if not _exec_struct(properties.get(name), argv):
+            errors.append(name)
         if name + 'Ex' in properties and not _exec_struct(properties[name + 'Ex'], argv):
-            raise Unsupported(name + 'Ex')
+            errors.append(name + 'Ex')
+    _raise_unsupported(errors)
     return caps
 
 
@@ -339,38 +411,96 @@ OPTIONAL_LOG_PROPERTIES = frozenset(('StandardOutputFile', 'StandardErrorFile'))
 
 
 def _equivalent(key, value):
+    if key == 'WatchdogUSec':
+        return watchdog_behavior(value)
     if key in ('CapabilityBoundingSet', 'AmbientCapabilities'):
         return _capset(value)
     if key == 'RestrictAddressFamilies':
+        if not isinstance(value, str):
+            raise Unsupported('RestrictAddressFamilies')
         return tuple(sorted(value.split()))
     # Empty allow-list output is NOT equivalent to the known empty deny-list '~'.
     return value
 
 
-def restriction_differences(source, probe, *, checked_empty_source=(), checked_empty_probe=()):
-    """Empty-hook representation equivalence needs explicit, scoped proof.
+def _comparison_inventory(source, probe, *, empty_source=(), empty_probe=(), pair=True):
+    """Private raw inventory; no value from here belongs on the console."""
+    rows, differences = [], []
+    ignored = {key: {'source': source.get(key), 'probe': probe.get(key),
+                     'category': 'intended' if key in INTENDED_PROPERTIES else 'runtime-metadata'}
+               for key in sorted(set(source) | set(probe))
+               if key in source and key in probe and source[key] != probe[key]
+               and key in RUNTIME_PROPERTIES | INTENDED_PROPERTIES}
+    keys = set(source) | set(probe)
+    for key in sorted(keys):
+        sp, pp = key in source, key in probe
+        sv, pv = source.get(key), probe.get(key)
+        bad, reason = False, 'equal'
+        if not sp or not pp:
+            classification = 'missing-source' if not sp else 'missing-probe'
+            if not pair:
+                reason = 'snapshot-not-supplied'
+            elif key in OPTIONAL_LOG_PROPERTIES:
+                classification, reason = 'intentional-metadata', 'optional-log-metadata'
+            elif ((key in INTENDED_PROPERTIES and key in set(empty_source) | set(empty_probe)) or
+                  (not sp and key in empty_source and pv == '') or
+                  (not pp and key in empty_probe and sv == '') or
+                  (not sp and not pp and key in set(empty_source) & set(empty_probe))):
+                classification, reason = 'validated-empty-exec', 'scoped-hook-proof'
+            else:
+                bad, reason = True, 'missing-property-no-validated-equivalence'
+        elif sv == '' and pv == '' and key in set(empty_source) & set(empty_probe):
+            classification, reason = 'validated-empty-exec', 'scoped-hook-proof'
+        elif key in RUNTIME_PROPERTIES | INTENDED_PROPERTIES:
+            classification, reason = 'intentional-metadata', (
+                'intended' if key in INTENDED_PROPERTIES else 'runtime-metadata')
+            if sv != pv:
+                ignored[key] = {'source': sv, 'probe': pv, 'category': reason}
+        else:
+            normalization_errors = []
+            a = collect_unsupported(normalization_errors, _equivalent, key, sv)
+            b = collect_unsupported(normalization_errors, _equivalent, key, pv)
+            if normalization_errors:
+                # A policy rejection is not proof that two identical raw values
+                # differ. Keep this separate from an observed value mismatch.
+                classification = 'unsupported-value' if sv == pv else 'value-different'
+                bad, reason = True, 'unsupported-normalization'
+            elif a == b:
+                classification = 'normalized-equal'
+                reason = 'equal' if sv == pv else 'explicit-normalization'
+            else:
+                classification, bad, reason = 'value-different', True, 'behavior-different'
+        row = {'property': key, 'source_present': sp, 'probe_present': pp,
+               'source': sv, 'probe': pv, 'raw_equal': sp and pp and sv == pv,
+               'classification': classification, 'unsupported': bad, 'reason': reason}
+        if key == 'WatchdogUSec':
+            row['source_kind'], row['probe_kind'] = _watchdog_kind(source), _watchdog_kind(probe)
+            row['source_behavior'] = 'disabled' if isinstance(sv, str) and sv in ('0', 'infinity') else None
+            row['probe_behavior'] = 'disabled' if isinstance(pv, str) and pv in ('0', 'infinity') else None
+        rows.append(row)
+        if bad:
+            differences.append(key)
+    return {'ignored': ignored, 'unsupported': differences, 'properties': rows,
+            'mismatches': [row for row in rows if row['unsupported']],
+            'validated_empty_exec': {
+                'source': sorted(empty_source), 'probe': sorted(empty_probe),
+                'source_absent': sorted(k for k in empty_source if k not in source),
+                'probe_absent': sorted(k for k in empty_probe if k not in probe)}}
 
-    Defaults remain strict (apart from the two optional log File metadata keys).
-    Callers MUST validate fragment/plan, active argv, ownership and drop-ins first.
-    Present nonempty hooks cannot claim empty proof. No Exec-prefix exemption.
-    This comparison never authorises execution by itself.
+
+def restriction_differences(source, probe, *, checked_empty_source=(), checked_empty_probe=()):
+    """Strict differences; unused-hook equivalence requires validated scoped proof.
+
+    No prefix exemptions and no security repairs. This is not authorization to
+    execute: required-field/command validation must also succeed independently.
     """
     empty_source = _checked_empty_exec_fields(source, checked_empty_source)
     empty_probe = _checked_empty_exec_fields(probe, checked_empty_probe)
-    missing = (set(source) ^ set(probe)) - OPTIONAL_LOG_PROPERTIES
-    for key in tuple(missing):
-        # Only Pre and Reload are intentional empty<->active context changes;
-        # active base commands/available Ex argv must already have been checked.
-        if key in INTENDED_PROPERTIES and key in (empty_source | empty_probe):
-            missing.remove(key)
-        elif key not in source and key in empty_source and probe[key] == '':
-            missing.remove(key)
-        elif key not in probe and key in empty_probe and source[key] == '':
-            missing.remove(key)
-    changed = {k for k in set(source) & set(probe)
-               if k not in RUNTIME_PROPERTIES | INTENDED_PROPERTIES
-               and _equivalent(k, source[k]) != _equivalent(k, probe[k])}
-    return sorted(missing | changed)
+    comparison = _comparison_inventory(source, probe, empty_source=empty_source,
+                                       empty_probe=empty_probe)
+    _raise_unsupported([_property_name(row['property']) for row in comparison['properties']
+                        if row['reason'] == 'unsupported-normalization'])
+    return comparison['unsupported']
 
 
 def make_config(port, abstract_name):
@@ -644,6 +774,38 @@ class Controller:
             raise Unsupported('dbus-or-show-unavailable')
         return properties
 
+    def _audit_show(self, unit, errors, timeout=3):
+        try:
+            return self.show(unit, timeout=timeout)
+        except Unsupported as exc:
+            errors.extend(exc.labels)
+        except OSError:
+            errors.append('source-show-unavailable' if unit == MAIN else 'probe-show-unavailable')
+        return None
+
+    def _audit_fragment(self, stem, metadata_name=None):
+        """Read/parse failures remain explicit; persistence failures propagate."""
+        errors = []
+        try:
+            raw, metadata = _read_private_source(FRAGMENT, 65536)
+        except Unsupported as exc:
+            errors.extend(exc.labels)
+            errors.append('source-fragment-read-unavailable')
+            return None, None, errors
+        except OSError:
+            return None, None, ['source-fragment-read-unavailable']
+        if stem == 'production.fragment':
+            self.save(stem, raw)  # Existing production-fragment evidence format.
+        else:
+            self.record(stem + '.json', {'raw_hex': raw.hex()})
+        self.record(metadata_name or stem + '.metadata.json', metadata)
+        try:
+            text = raw.decode('utf-8', 'strict')
+        except UnicodeError:
+            return raw, None, ['fragment-format']
+        fragment = collect_unsupported(errors, validate_fragment, text)
+        return raw, fragment, errors
+
     def prepare(self):
         if (os.geteuid() != 0 or os.getuid() != 0 or os.getegid() != 0 or os.getgid() != 0 or
                 platform.machine() != 'x86_64'):
@@ -663,14 +825,17 @@ class Controller:
         if stat.S_IMODE(self.directory.stat().st_mode) != 0o700:
             raise Unsupported('evidence-mode')
         self.save('gate.py', GATE_PROGRAM)
-        self.source = self.show(MAIN)
-        self.save('production.show', ''.join(k + '=' + v + '\n' for k, v in self.source.items()))
-        raw, metadata = _read_private_source(FRAGMENT, 65536)
-        self.source_bytes = raw
-        self.save('production.fragment', raw)
-        self.record('production.fragment.metadata.json', metadata)
-        self.fragment = validate_fragment(raw.decode('utf-8', 'strict'))
-        self.caps = validate_effective(self.source, self.fragment)
+        inspection_errors = []
+        self.source = self._audit_show(MAIN, inspection_errors)
+        if self.source is not None:
+            self.save('production.show', ''.join(k + '=' + v + '\n' for k, v in self.source.items()))
+        self.source_bytes, self.fragment, fragment_errors = self._audit_fragment('production.fragment')
+        inspection_errors.extend(fragment_errors)
+        audit = self.audit_compatibility(self.source, fragment=self.fragment,
+                                         inspection_errors=inspection_errors, allow_source_only=True)
+        self.record('source-audit.json', audit)
+        _raise_unsupported(audit['issues'])
+        self.caps = frozenset(audit['source_caps'])
         binary, metadata = _read_private_source(HAPROXY, 64 * 1024 * 1024)
         if not binary.startswith(b'\x7fELF\x02\x01') or binary[18:20] != b'\x3e\x00':
             raise Unsupported('haproxy-amd64-ELF-required')
@@ -740,7 +905,7 @@ class Controller:
             'CapabilityBoundingSet': ' '.join(sorted(self.caps)), 'AmbientCapabilities': '',
             'ReadWritePaths': LOGS, 'Restart': 'no', 'RestartSec': '3s',
             'RuntimeMaxSec': '8s', 'TimeoutStartSec': '5s', 'TimeoutStopSec': '2s',
-            'TimeoutAbortSec': '2s',
+            'TimeoutAbortSec': '2s', 'WatchdogSec': '0',
             'KillMode': 'control-group', 'SendSIGKILL': 'yes',
             'ExecStartPre': ' '.join(pre),
             'StandardOutput': 'append:' + str(output), 'StandardError': 'append:' + str(output),
@@ -758,69 +923,131 @@ class Controller:
                 'pre': pre, 'go': go, 'output': output, 'properties': properties}
 
     def validate_probe_logging(self, probe, plan):
-        # The declared destination comes only from this run, NOT production show
-        # metadata. systemd-run receives explicit append paths even on versions
-        # which do not expose Standard{Output,Error}File through D-Bus.
-        phase = plan['phase']
+        # Never borrow the production destination, even if File metadata exists.
+        phase = plan.get('phase')
         directory = str(self.directory)
-        if (phase not in ('plain', 'trace') or not re.fullmatch(
+        if (phase not in ('plain', 'trace') or not isinstance(self.directory, Path) or not re.fullmatch(
                 r'/run/nathaya-haproxy-probe\.[A-Za-z0-9_-]+', directory)):
             raise Unsupported('probe-output-plan')
         destination = str(self.directory / phase / 'combined.log')
-        if str(plan['output']) != destination:
+        errors = []
+        if str(plan.get('output')) != destination:
+            errors.append('probe-output-plan')
+        argv, declared = plan.get('command'), plan.get('properties')
+        if (not isinstance(argv, list) or any(not isinstance(a, str) for a in argv)
+                or not isinstance(declared, dict)):
             raise Unsupported('probe-output-plan')
-        argv = plan['command']
-        if not isinstance(argv, list) or any(not isinstance(a, str) for a in argv):
-            raise Unsupported('probe-output-plan')
+        assignments = collect_unsupported(errors, self._plan_assignments, plan)
         for key in ('StandardOutput', 'StandardError'):
             value = 'append:' + destination
             prefix = '--property=' + key + '='
-            if (plan['properties'].get(key) != value or
+            if (declared.get(key) != value or assignments is None or
+                    [v for name, v in assignments if name == key] != [value] or
                     [a for a in argv if a.startswith(prefix)] != [prefix + value]):
-                raise Unsupported('probe-output-plan')
-        for key in OPTIONAL_LOG_PROPERTIES:
+                errors.append('probe-output-plan:' + key)
+        for key in sorted(OPTIONAL_LOG_PROPERTIES):
             if key in probe and probe[key] != destination:
-                raise Unsupported(key)
+                errors.append(key)
+        _raise_unsupported(errors)
 
-    def empty_probe_exec_fields(self, probe, plan):
-        # No unused hook may be declared, even as an empty reset. Validate the
-        # actual property arguments too, not only the cached property mapping.
-        if not owned_unit(probe, plan['unit'], self.nonce):
-            raise Unsupported('probe-ownership')
-        _require(probe, {'LoadState': 'loaded', 'DropInPaths': '', 'NeedDaemonReload': 'no'})
-        fields = frozenset(name + suffix for name in PROBE_EMPTY_EXEC_HOOKS
-                           for suffix in ('', 'Ex'))
-        if not isinstance(plan['properties'], dict) or not isinstance(plan['command'], list):
+    def _plan_assignments(self, plan):
+        args = plan.get('command')
+        if not isinstance(args, list) or any(not isinstance(arg, str) for arg in args):
             raise Unsupported('probe-hook-plan-uncertain')
-        declarations = set(plan['properties'])
-        args = plan['command']
-        for index, arg in enumerate(args):
-            if not isinstance(arg, str):
-                raise Unsupported('probe-hook-plan-uncertain')
-            assignment = None
+        assignments, index = [], 0
+        while index < len(args):
+            arg, assignment = args[index], None
+            if arg == '--':
+                break
             if arg.startswith('--property='):
                 assignment = arg[len('--property='):]
             elif arg in ('--property', '-p'):
-                if index + 1 >= len(args) or not isinstance(args[index + 1], str):
+                index += 1
+                if index >= len(args):
                     raise Unsupported('probe-hook-plan-uncertain')
-                assignment = args[index + 1]
+                assignment = args[index]
             elif arg.startswith('-p') and arg != '-p':
                 assignment = arg[2:]
             if assignment is not None:
-                name, separator, _value = assignment.partition('=')
-                if not separator:
+                name, separator, value = assignment.partition('=')
+                if not separator or not re.fullmatch(r'[A-Za-z][A-Za-z0-9]*', name):
                     raise Unsupported('probe-hook-plan-uncertain')
-                declarations.add(name)
-        for key in sorted(fields):
-            if key in declarations:
-                raise Unsupported('probe-hook-declared:' + key)
-        return _checked_empty_exec_fields(probe, fields)
+                assignments.append((name, value))
+            index += 1
+        return assignments
+
+    def empty_probe_exec_fields(self, probe, plan):
+        errors = []
+        if not owned_unit(probe, plan.get('unit'), self.nonce):
+            errors.append('probe-ownership')
+        collect_unsupported(errors, _require, probe,
+                            {'LoadState': 'loaded', 'DropInPaths': '', 'NeedDaemonReload': 'no'})
+        fields = frozenset(name + suffix for name in PROBE_EMPTY_EXEC_HOOKS
+                           for suffix in ('', 'Ex'))
+        declared = plan.get('properties')
+        assignments = collect_unsupported(errors, self._plan_assignments, plan)
+        if not isinstance(declared, dict):
+            errors.append('probe-hook-plan-uncertain')
+        else:
+            declarations = set(declared) | {key for key, _ in assignments or ()}
+            errors.extend('probe-hook-declared:' + key for key in sorted(fields & declarations))
+        collect_unsupported(errors, _checked_empty_exec_fields, probe, fields)
+        _raise_unsupported(errors)
+        return fields
+
+    def _validate_probe_watchdog(self, probe, plan):
+        errors = []
+        collect_unsupported(errors, watchdog_behavior, probe.get('WatchdogUSec'))
+        declared = plan.get('properties')
+        assignments = collect_unsupported(errors, self._plan_assignments, plan)
+        if (not isinstance(declared, dict) or declared.get('WatchdogSec') != '0'
+                or assignments is None
+                or [value for key, value in assignments if key == 'WatchdogSec'] != ['0']
+                or plan.get('command', []).count('--property=WatchdogSec=0') != 1):
+            errors.append('probe-watchdog-plan:WatchdogSec')
+        # WatchdogUSec is the D-Bus alias; do not let a second spelling shadow
+        # the single audited WatchdogSec=0 request before startup updates its getter.
+        if ((isinstance(declared, dict) and 'WatchdogUSec' in declared) or
+                any(key == 'WatchdogUSec' for key, _value in assignments or ())):
+            errors.append('probe-watchdog-plan:WatchdogUSec')
+        _raise_unsupported(errors)
+
+    def _validate_probe_command_plan(self, plan):
+        phase = plan.get('phase')
+        if (phase not in ('plain', 'trace') or not isinstance(self.directory, Path) or not re.fullmatch(
+                r'/run/nathaya-haproxy-probe\.[A-Za-z0-9_-]+', str(self.directory))):
+            raise Unsupported('probe-command-plan')
+        expected = [HAPROXY, '-W', '-db', '-f', str(self.directory / phase / 'haproxy.cfg')]
+        if phase == 'trace':
+            expected = trace_command(expected)
+        pre = ['/usr/bin/python3', '-I', '-B', str(self.directory / 'gate.py'),
+               str(self.directory / phase / 'go')]
+        errors = []
+        args = plan.get('command')
+        if (plan.get('argv') != expected or not isinstance(args, list)
+                or '--' not in args or args[args.index('--') + 1:] != expected):
+            errors.append('probe-command-plan:ExecStart')
+        declared = plan.get('properties')
+        assignments = collect_unsupported(errors, self._plan_assignments, plan)
+        if (plan.get('pre') != pre or str(plan.get('go')) != pre[-1]
+                or not isinstance(declared, dict) or declared.get('ExecStartPre') != ' '.join(pre)
+                or assignments is None
+                or [v for k, v in assignments if k == 'ExecStartPre'] != [' '.join(pre)]):
+            errors.append('probe-command-plan:ExecStartPre')
+        _raise_unsupported(errors)
 
     def validate_probe(self, probe, plan):
-        unit = plan['unit']
+        """Collect independent effective/plan/log/hook/argv failures; return None."""
+        if not isinstance(probe, dict) or not isinstance(plan, dict):
+            raise Unsupported('probe-snapshot-or-plan-format')
+        errors = []
+        unit = plan.get('unit')
         if not owned_unit(probe, unit, self.nonce):
-            raise Unsupported('probe-ownership')
-        _require(probe, {
+            errors.append('probe-ownership')
+        if not isinstance(unit, str):
+            errors.append('probe-plan-unit')
+            unit = ''
+        collect_unsupported(errors, _require, probe, {
             'Id': unit, 'LoadState': 'loaded', 'DropInPaths': '', 'NeedDaemonReload': 'no',
             'Slice': 'system.slice', 'ControlGroup': '/system.slice/' + unit,
             'Transient': 'yes', 'User': 'root', 'Group': 'root', 'Type': 'simple',
@@ -828,88 +1055,188 @@ class Controller:
             'TimeoutStopUSec': '2s', 'TimeoutAbortUSec': '2s', 'CanReload': 'no',
             'KillMode': 'control-group', 'SendSIGKILL': 'yes',
             'StandardOutput': 'append', 'StandardError': 'append',
-            'SecureBits': '0', 'NoNewPrivileges': 'yes',
+            'SecureBits': '0', 'NoNewPrivileges': 'yes', 'AmbientCapabilities': '',
+            'UMask': '0077', 'ProtectSystem': 'strict', 'ProtectHome': 'yes',
+            'PrivateTmp': 'yes', 'ProtectKernelTunables': 'yes', 'ProtectKernelModules': 'yes',
+            'ProtectControlGroups': 'yes', 'RestrictSUIDSGID': 'yes', 'LockPersonality': 'yes',
+            'ReadWritePaths': LOGS, 'PrivateNetwork': 'no', 'PrivateUsers': 'no',
+            'JoinsNamespaceOf': '', 'RootDirectory': '', 'RootImage': '',
         })
-        self.validate_probe_logging(probe, plan)
-        for key, argv in (('ExecStart', plan['argv']), ('ExecStartPre', plan['pre'])):
-            if not _exec_struct(probe.get(key, ''), argv):
-                raise Unsupported(key)
+        caps = collect_unsupported(errors, _capset, probe.get('CapabilityBoundingSet'))
+        if caps not in (CAPS3, CAPS4):
+            errors.append('CapabilityBoundingSet')
+        families = probe.get('RestrictAddressFamilies')
+        families = families.split() if isinstance(families, str) else []
+        if len(families) != 3 or set(families) != {'AF_INET', 'AF_INET6', 'AF_UNIX'}:
+            errors.append('RestrictAddressFamilies')
+        if probe.get('SystemCallFilter') != '~':
+            errors.append('SystemCallFilter')
+        collect_unsupported(errors, self.validate_probe_logging, probe, plan)
+        collect_unsupported(errors, self._validate_probe_watchdog, probe, plan)
+        collect_unsupported(errors, self._validate_probe_command_plan, plan)
+        for key, argv in (('ExecStart', plan.get('argv')), ('ExecStartPre', plan.get('pre'))):
+            if not _exec_struct(probe.get(key), argv):
+                errors.append(key)
             if key + 'Ex' in probe and not _exec_struct(probe[key + 'Ex'], argv):
-                raise Unsupported(key + 'Ex')
-        self.empty_probe_exec_fields(probe, plan)
+                errors.append(key + 'Ex')
+        collect_unsupported(errors, self.empty_probe_exec_fields, probe, plan)
+        _raise_unsupported(errors)
+
+    def audit_compatibility(self, source=None, probe=None, *, fragment=None, plan=None,
+                            original=None, original_fragment=None,
+                            original_bytes=None, current_bytes=None,
+                            probe_source=False, inspection_errors=(), allow_source_only=False):
+        """PURE aggregate audit of every supplied property (private JSON result).
+
+        source/probe are parse_show dictionaries, not claims of full --all data.
+        For probe->live use probe_source=True and the same validated plan.
+        Original->current comparison additionally needs original_fragment; raw
+        bytes, when both supplied, establish exact fragment-change evidence.
+        No IO, execution, repairs, guessed hooks, or exception-based equivalence.
+        """
+        validation = {'source': [], 'probe': [], 'original': []}
+        source_caps = None
+        source_empty, probe_empty, original_empty = (), (), ()
+        if source is not None:
+            if probe_source:
+                collect_unsupported(validation['source'], self.validate_probe, source, plan)
+            else:
+                source_caps = collect_unsupported(validation['source'], validate_effective, source, fragment)
+            if not validation['source']:
+                source_empty = (self.empty_probe_exec_fields(source, plan) if probe_source else
+                                _source_empty_exec_fields(source, fragment))
+        if probe is not None:
+            collect_unsupported(validation['probe'], self.validate_probe, probe, plan)
+            if not validation['probe']:
+                probe_empty = self.empty_probe_exec_fields(probe, plan)
+        if original is not None:
+            collect_unsupported(validation['original'], validate_effective, original, original_fragment)
+            if not validation['original']:
+                original_empty = _source_empty_exec_fields(original, original_fragment)
+        # A failed validation/inspection stage cannot issue any hook proof for
+        # this aggregate. Conservative extra missing-hook reports are deliberate.
+        if (any(validation.values()) or inspection_errors or
+                (original_bytes is not None and current_bytes is not None and original_bytes != current_bytes)):
+            source_empty, probe_empty, original_empty = (), (), ()
+        # Invalid snapshots are never substituted as valid profiles. Empty maps
+        # here are inventory inputs ONLY; validation/availability remain explicit.
+        source_map = source if isinstance(source, dict) else {}
+        probe_map = probe if isinstance(probe, dict) else {}
+        pair = isinstance(source, dict) and isinstance(probe, dict)
+        result = _comparison_inventory(source_map, probe_map, empty_source=source_empty,
+                                       empty_probe=probe_empty, pair=pair)
+        profile = None
+        if original is not None and source is not None:
+            profile = _comparison_inventory(original if isinstance(original, dict) else {}, source_map,
+                                            empty_source=original_empty, empty_probe=source_empty)
+            profile['raw_fragment_changed'] = (original_bytes != current_bytes
+                                              if original_bytes is not None and current_bytes is not None else None)
+            profile['changed'] = bool(profile['unsupported'] or profile['raw_fragment_changed'])
+        validation = {key: sorted(set(values)) for key, values in validation.items()}
+        issues = list(inspection_errors)
+        for values in validation.values():
+            issues.extend(values)
+        if result['unsupported']:
+            issues.append('properties:' + ','.join(_property_name(k) for k in result['unsupported']))
+        if profile is not None and profile['changed']:
+            issues.append('source-profile-changed')
+        if source is None:
+            issues.append('source-snapshot-unavailable')
+        if probe is None and not allow_source_only:
+            issues.append('probe-snapshot-unavailable')
+        if source is None and probe is None:
+            issues.append('snapshots-unavailable')
+        if allow_source_only and probe is not None:
+            issues.append('ambiguous-audit-scope')
+        result.update({'validation': validation, 'inspection_errors': list(inspection_errors),
+                       'issues': sorted(set(issues)), 'ok': not issues,
+                       'snapshot_pair_supplied': pair,
+                       'scope': 'source-only-preflight' if allow_source_only else 'pair-required',
+                       'complete': pair and not issues and not allow_source_only,
+                       'coverage': 'supplied-properties-only' if pair else 'partial',
+                       'source_profile_change': profile,
+                       'original_inventory': (_comparison_inventory(original, {}, pair=False)
+                                              if isinstance(original, dict) else None),
+                       'source_caps': sorted(source_caps) if source_caps is not None else None,
+                       'hook_proof_valid': {'source': bool(source_empty), 'probe': bool(probe_empty)}})
+        return result
 
     def gate(self, plan):
         unit = plan['unit']
-        # This starts BEFORE systemd-run, hence before the child's four-second
-        # timer. Never mistake an expired/missed prestart gate for HAProxy failure.
+        # Starts before systemd-run; do not release a missed/expired prestart.
         deadline = plan['created_at'] + 3.4
-        probe = None
+        probe, inspection_errors = None, []
         while time.monotonic() < deadline:
-            probe = self.show(unit, timeout=max(0.01, deadline - time.monotonic()))
+            probe = self._audit_show(unit, inspection_errors,
+                                     timeout=max(0.01, deadline - time.monotonic()))
+            if probe is None:
+                break
             if not owned_unit(probe, unit, self.nonce):
-                raise Unsupported('probe-ownership')
+                inspection_errors.append('probe-ownership')
+                break
             if (probe.get('ActiveState') == 'activating' and
                     probe.get('SubState') == 'start-pre' and
                     probe.get('ControlPID', '0') != '0'):
                 break
             if probe.get('ActiveState') in ('failed', 'inactive'):
-                raise Unsupported('prestart-unavailable')
+                inspection_errors.append('prestart-unavailable')
+                break
             time.sleep(0.05)
         else:
-            raise Unsupported('prestart-unavailable')
-        # Re-read the production unit and bytes immediately before comparison.
-        _no_lock()
-        current = self.show(MAIN, timeout=max(0.01, deadline - time.monotonic()))
-        raw, metadata = _read_private_source(FRAGMENT, 65536)
-        current_fragment = validate_fragment(raw.decode('utf-8', 'strict'))
-        validate_effective(current, current_fragment)
-        source_empty = _source_empty_exec_fields(self.source, self.fragment)
-        current_empty = _source_empty_exec_fields(current, current_fragment)
-        if raw != self.source_bytes or restriction_differences(
-                self.source, current, checked_empty_source=source_empty, checked_empty_probe=current_empty):
-            raise Unsupported('source-profile-changed')
-        self.record(plan['phase'] + '/source-gate.metadata.json', metadata)
-        self.record(plan['phase'] + '/probe-gate.show.json', probe)
-        self.validate_probe(probe, plan)
+            inspection_errors.append('prestart-unavailable')
+        # Even a lock refusal must not hide already available probe/diff failures.
+        collect_unsupported(inspection_errors, _no_lock)
+        current = self._audit_show(MAIN, inspection_errors,
+                                  timeout=max(0.01, deadline - time.monotonic()))
+        raw, current_fragment, fragment_errors = self._audit_fragment(
+            plan['phase'] + '/source-gate.fragment', plan['phase'] + '/source-gate.metadata.json')
+        inspection_errors.extend(fragment_errors)
+        if probe is not None:
+            self.record(plan['phase'] + '/probe-gate.show.json', probe)
+        if current is not None:
+            self.record(plan['phase'] + '/source-gate.show.json', current)
+        audit = self.audit_compatibility(current, probe, fragment=current_fragment, plan=plan,
+                                         original=self.source, original_fragment=self.fragment,
+                                         original_bytes=self.source_bytes, current_bytes=raw,
+                                         inspection_errors=inspection_errors)
+        self.record(plan['phase'] + '/comparison.json', audit)
         self.record(plan['phase'] + '/logging-metadata.json', {
-            'source_file_properties_available': {k: k in current for k in sorted(OPTIONAL_LOG_PROPERTIES)},
-            'probe_file_properties_available': {k: k in probe for k in sorted(OPTIONAL_LOG_PROPERTIES)},
+            'source_file_properties_available': {k: current is not None and k in current
+                                                 for k in sorted(OPTIONAL_LOG_PROPERTIES)},
+            'probe_file_properties_available': {k: probe is not None and k in probe
+                                                for k in sorted(OPTIONAL_LOG_PROPERTIES)},
             'probe_destination': str(plan['output']),
             'destination_basis': 'explicit-private-transient-assignments',
-            # Absence means unavailable, NOT a verified empty pathname. If a
-            # probe File property is available, validate_probe_logging checks it.
         })
-        probe_empty = self.empty_probe_exec_fields(probe, plan)
-        differences = restriction_differences(current, probe, checked_empty_source=current_empty,
-                                             checked_empty_probe=probe_empty)
-        ignored = {k: {'source': current.get(k), 'probe': probe.get(k),
-                       'category': 'intended' if k in INTENDED_PROPERTIES else 'runtime-metadata'}
-                   for k in sorted(set(current) | set(probe))
-                   if current.get(k) != probe.get(k) and k in RUNTIME_PROPERTIES | INTENDED_PROPERTIES}
-        self.record(plan['phase'] + '/comparison.json', {
-            'ignored': ignored, 'unsupported': differences,
-            'validated_empty_exec': {
-                'source': sorted(current_empty), 'probe': sorted(probe_empty),
-                'source_absent': sorted(k for k in current_empty if k not in current),
-                'probe_absent': sorted(k for k in probe_empty if k not in probe),
-            },
-        })
-        if differences:
-            raise Unsupported('properties:' + ','.join(differences))
-        # Both comparison and gate must be live at the instant of release. The
-        # write uses O_EXCL: the complete empty, mode-0600 file appears atomically.
+        _raise_unsupported(audit['issues'])
+        # Persist a second aggregate, even if its ownership/argv/state is invalid.
+        live_errors = []
         if time.monotonic() >= deadline:
-            raise Unsupported('prestart-deadline')
-        live = self.show(unit, timeout=max(0.01, deadline - time.monotonic()))
-        self.validate_probe(live, plan)
-        live_empty = self.empty_probe_exec_fields(live, plan)
-        if (not owned_unit(live, unit, self.nonce) or
+            live_errors.append('prestart-deadline')
+        live = self._audit_show(unit, live_errors,
+                               timeout=max(0.01, deadline - time.monotonic()))
+        if live is not None:
+            self.record(plan['phase'] + '/probe-live.show.json', live)
+        if (live is None or not owned_unit(live, unit, self.nonce) or
                 live.get('ActiveState') != 'activating' or live.get('SubState') != 'start-pre' or
-                live.get('ControlPID') != probe.get('ControlPID') or
-                restriction_differences(probe, live, checked_empty_source=probe_empty,
-                                        checked_empty_probe=live_empty) or time.monotonic() >= deadline):
-            raise Unsupported('prestart-unavailable')
-        _no_lock()
+                live.get('ControlPID') != probe.get('ControlPID')):
+            live_errors.append('prestart-unavailable')
+        if time.monotonic() >= deadline:
+            live_errors.append('prestart-deadline')
+        collect_unsupported(live_errors, _no_lock)
+        live_audit = self.audit_compatibility(probe, live, plan=plan, probe_source=True,
+                                              inspection_errors=live_errors)
+        self.record(plan['phase'] + '/live-comparison.json', live_audit)
+        _raise_unsupported(live_audit['issues'])
+        release_errors = []
+        if time.monotonic() >= deadline:
+            release_errors.append('prestart-deadline')
+        collect_unsupported(release_errors, _no_lock)
+        self.record(plan['phase'] + '/release-audit.json', {
+            'issues': sorted(set(release_errors)), 'gate_released': False,
+            'purpose': 'last refusal check before atomic go creation',
+        })
+        _raise_unsupported(release_errors)
         self.release_reservations()
         self.save(plan['phase'] + '/go', b'')
 

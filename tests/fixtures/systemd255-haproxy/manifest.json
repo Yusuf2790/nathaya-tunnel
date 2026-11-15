@@ -1,0 +1,22 @@
+{
+  "audit": "PARTIAL",
+  "actual": {
+    "file": "reported-source.partial.show3lines",
+    "coverage": "partial",
+    "full_vps_snapshot_pair": false,
+    "source_keys": [
+      "WatchdogUSec",
+      "WatchdogTimestamp",
+      "WatchdogTimestampMonotonic"
+    ],
+    "probe_watchdog_value": "UNKNOWN",
+    "cause": "UNKNOWN"
+  },
+  "synthetic": {
+    "file": "synthetic-pair.json",
+    "tag": "SYNTHETIC",
+    "coverage": "supplied-renderer-profile-only",
+    "all_fields": "SYNTHETIC",
+    "actual_host_dump": false
+  }
+}

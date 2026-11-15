@@ -129,6 +129,27 @@ Exit 0 berarti worker plain teramati stabil pada probe minimal; bukan kesehatan 
 
 Sesudah restriction penyebab benar-benar terbukti dan perbaikannya direview, masih perlu uji manual VPS nyata: **cold startup dan UID/GID worker**, USR2 menghasilkan generasi baru dan mengakhiri generasi lama dengan benar, bind low ports, pairing socket abstract/PROXY, serta adopsi sertifikat fresh saat reload/reexec tanpa membuka permission. Probe high-port tidak membuktikan low ports, fixture tidak membuktikan systemd/setuid, dan `CAP_KILL` tidak menutup diagnosis UID yang belum diketahui.
 
+### Audit properti systemd 255 dan watchdog
+
+WatchdogUSec adalah pengaturan perilaku layanan, **bukan** metadata yang dikecualikan. Tool mewajibkan properti itu dan menetapkan `WatchdogSec=0` pada transient probe tepat sekali (dictionary dan argumen CLI); alias WatchdogUSec yang menimpa request ditolak. Pada source v255, service_start_watchdog menghentikan timer bila timestamp_is_set bernilai false: hanya `0` dan `infinity` yang terbukti sama-sama disabled. Getter dapat mengembalikan watchdog_original_usec yang awalnya infinity; ini bukan bukti bahwa unit file mengatur WatchdogSec=infinity. Nilai raw tetap disimpan, finite/empty/missing/format lain ditolak, dan kesetaraan ini **tidak** diterapkan pada timeout/limit/security field lain. RuntimeMaxSec 8s tetap guard terpisah.
+
+Sebelum menolak snapshot, auditor mengumpulkan kegagalan independen (properti wajib, capabilities, address families, argv, unused hook, logging, watchdog dan seluruh perbedaan key/value yang disuplai) ke satu hasil privat:
+
+- `source-audit.json`: pemeriksaan sumber, scope source-only-preflight; bukan persetujuan seluruh pasangan.
+- `plain/comparison.json` atau `trace/comparison.json`: source/original/current/probe, semua validation issues, presence flag, nilai raw dan inventory setiap properti yang disuplai.
+- `<phase>/live-comparison.json`: audit ulang snapshot gate terakhir; `<phase>/release-audit.json` merekam alasan penolakan deadline/lock terakhir sebelum file go dibuat. gate_released=false pada record itu berarti gate belum dilepas saat pengecekan, bukan bukti hasil proses kemudian.
+
+Klasifikasi membedakan missing-source/missing-probe, value-different, normalized-equal, unsupported-value (misalnya dua nilai finite identik yang tetap tidak didukung), metadata disengaja dan hook kosong dengan bukti. Properti runtime yang hilang tetap unsafe, bukan sekaligus dimasukkan sebagai ignored. Scope pair-required tidak boleh ok bila salah satu snapshot tidak tersedia; complete/coverage hanya mencakup input yang diberikan, **bukan sertifikasi snapshot VPS lengkap**. Console hanya berisi nama/reason yang disanitasi; nilai mentah tetap privat. Tidak ada prefix exception atau keamanan yang dibuat opsional. Logging juga memeriksa alias -p/--property agar duplicate assignment tidak menimpa tujuan privat.
+
+**Batas bukti saat checkpoint 14:** yang diterima hanya tiga baris pengguna (WatchdogUSec=infinity, WatchdogTimestamp kosong, WatchdogTimestampMonotonic=0). Full snapshot sumber/probe tidak terlampir/tertemukan; pengguna memilih lanjut audit parsial. Karena nilai probe tidak diketahui, tidak dapat dipastikan penolakan terdahulu disebabkan missing property atau value-different. Sebelumnya comparator memang menolak kedua kondisi itu dan tidak menormalisasi watchdog. Jangan menebak probe bernilai 0 dari pesannya.
+
+`tests/fixtures/systemd255-haproxy/` memisahkan partial report tersebut dari overlay pasangan **SYNTHETIC** yang tersanitasi dan berprovenance eksplisit. Overlay memakai profil renderer/fixture yang diketahui; bukan dump penuh atau hasil VPS. Tests menuntut audit seluruh supplied keys dan semua mismatch sekaligus, sekaligus memastikan restriction nyata, read failure, gate dan isolasi tetap fail-closed. Fixture baru belum dijalankan dalam sesi pengembangan ini; startup/setuid tetap belum terverifikasi.
+
+Referensi semantik v255:
+- https://raw.githubusercontent.com/systemd/systemd/v255/src/core/service.c (service_start_watchdog)
+- https://raw.githubusercontent.com/systemd/systemd/v255/src/core/service.h (service_get_watchdog_usec)
+- https://raw.githubusercontent.com/systemd/systemd/v255/src/basic/time-util.h (timestamp_is_set)
+
 ### Reinstall tepercaya dan recovery registry
 
 `checks.py` memvalidasi registry `/etc/nathaya-tunnel/managed-services.json` secara strict (schema/owner/hash/path dan privacy root:root 0700 parent/0600 file). Existing unit diperbolehkan bila **hash bytes saat ini cocok hash lama yang tercatat**, meskipun hash renderer baru berbeda: ini upgrade unit terkelola, bukan konflik semata karena source baru. Effective HAProxy harus `LoadState=loaded`, fragment persis `/etc/systemd/system/nathaya-haproxy.service`, **tanpa DropInPaths**; mask, runtime/vendor override dan fragment lain ditolak. Fresh unit hanya boleh `not-found` bila file/fragment benar-benar absent dan belum terdaftar; unit yang hash-nya tercatat tetapi file-nya hilang adalah drift, bukan fresh install. Pemeriksaan dilakukan saat preflight dan diulang **di bawah shared lock sebelum worker memutasi OS**. Ini bukan izin mengadopsi unit asing.

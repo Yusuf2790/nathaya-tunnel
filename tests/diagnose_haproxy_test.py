@@ -51,6 +51,11 @@ SPEC = importlib.util.spec_from_file_location('diagnostic_actual_renderer', ROOT
 R = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(R)
 PORTS = json.loads((ROOT / 'config/ports.json').read_text(encoding='utf-8'))
+# Discovery-only checkout reads: never open fixtures beneath Offline host guards.
+SNAPSHOT_DIR = ROOT / 'tests/fixtures/systemd255-haproxy'
+SNAPSHOT_MANIFEST = json.loads((SNAPSHOT_DIR / 'manifest.json').read_text(encoding='utf-8'))
+SYNTHETIC_PAIR = json.loads((SNAPSHOT_DIR / 'synthetic-pair.json').read_text(encoding='utf-8'))
+REPORTED_PARTIAL = (SNAPSHOT_DIR / 'reported-source.partial.show3lines').read_text(encoding='utf-8')
 # Deterministic, public fixture bytes, never generated entropy or a deployed key.
 FIXTURE_KEY = 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8='
 NONCE = 'a' * 32
@@ -92,6 +97,8 @@ def source_properties(old=False):
         'StandardOutput': 'append', 'StandardError': 'append',
         'StandardOutputFile': '/opt/nathaya/logs/nathaya-haproxy.log',
         'StandardErrorFile': '/opt/nathaya/logs/nathaya-haproxy.log',
+        'WatchdogUSec': 'infinity', 'WatchdogTimestamp': '',
+        'WatchdogTimestampMonotonic': '0',
         'RuntimeMaxUSec': 'infinity', 'TimeoutStartUSec': '1min 30s',
         'TimeoutStopUSec': '1min 30s', 'TimeoutAbortUSec': '1min 30s',
         'KillMode': 'control-group', 'SendSIGKILL': 'yes',
@@ -174,6 +181,8 @@ class Offline(unittest.TestCase):
             'ExecStart': exec_property(plan['argv']), 'ExecStartPre': exec_property(plan['pre']),
             'ExecReload': '',
         })
+        # Both disabled v255 spellings are valid: retain the source spelling
+        # here; the SYNTHETIC pair explicitly overrides the probe to '0'.
         # Preserve availability, not production argv: these aliases describe the
         # transient plan, whose Pre gate is active and Reload is unused.
         for key in ('ExecStart', 'ExecStartPre'):
@@ -810,6 +819,591 @@ class EmptyExecHookContracts(Offline):
             c.save.assert_not_called()
 
 
+class Systemd255SnapshotContracts(Offline):
+    """Supplied-property contracts only; no claim of an actual VPS snapshot pair."""
+
+    @staticmethod
+    def overlay(base, description):
+        result = dict(base)
+        result.update(description['set'])
+        for key in description['omit']:
+            result.pop(key, None)
+        return result
+
+    def fixture_pair(self):
+        fixture = copy.deepcopy(SYNTHETIC_PAIR)
+        c = self.controller(fixture['old'])
+        c.source = self.overlay(c.source, fixture['source'])
+        plan = self.plan(c, fixture['phase'])
+        probe = self.overlay(self.probe(c, plan), fixture['probe'])
+        return c, plan, probe
+
+    def artifact(self, c, name):
+        matches = [call.args[1] for call in c.record.call_args_list if call.args[0] == name]
+        self.assertEqual(len(matches), 1, 'Exactly one aggregate per inspection stage')
+        return matches[0]
+
+    def assert_names(self, labels, names):
+        text = ';'.join(labels)
+        for name in names:
+            self.assertIn(name, text)
+
+    def test_missing_snapshots_require_pair_unless_explicit_source_only_preflight(self):
+        c, plan, probe = self.fixture_pair()
+        c.save.reset_mock()
+        for source, candidate, missing in (
+                (None, probe, ('source-snapshot-unavailable',)),
+                (c.source, None, ('probe-snapshot-unavailable',)),
+                (None, None, ('source-snapshot-unavailable', 'probe-snapshot-unavailable',
+                              'snapshots-unavailable'))):
+            with self.subTest(missing=missing):
+                audit = c.audit_compatibility(source, candidate, fragment=c.fragment, plan=plan)
+                self.assertFalse(audit['ok'])
+                self.assertFalse(audit['complete'])
+                self.assertFalse(audit['snapshot_pair_supplied'])
+                self.assertEqual(audit['scope'], 'pair-required')
+                self.assertTrue(set(missing) <= set(audit['issues']))
+        preflight = c.audit_compatibility(c.source, fragment=c.fragment, allow_source_only=True)
+        self.assertTrue(preflight['ok'])
+        self.assertEqual(preflight['issues'], [])
+        self.assertEqual(preflight['scope'], 'source-only-preflight')
+        self.assertFalse(preflight['complete'])
+        self.assertFalse(preflight['snapshot_pair_supplied'])
+        self.assertEqual(preflight['source_caps'], sorted(CAPS3))
+        invalid = c.audit_compatibility(dict(c.source, NoNewPrivileges='no'),
+                                        fragment=c.fragment, allow_source_only=True)
+        self.assertFalse(invalid['ok'])
+        self.assertFalse(invalid['complete'])
+        self.assert_names(invalid['validation']['source'], ('NoNewPrivileges',))
+        missing = c.audit_compatibility(fragment=c.fragment, allow_source_only=True)
+        self.assertFalse(missing['ok'])
+        self.assertFalse(missing['complete'])
+        self.assertIn('source-snapshot-unavailable', missing['issues'])
+        ambiguous = c.audit_compatibility(c.source, probe, fragment=c.fragment, plan=plan,
+                                          allow_source_only=True)
+        self.assertFalse(ambiguous['ok'])
+        self.assertFalse(ambiguous['complete'])
+        self.assertIn('ambiguous-audit-scope', ambiguous['issues'])
+        c.save.assert_not_called()
+        c.record.assert_not_called()
+
+    def test_one_sided_runtime_mainpid_is_missing_not_ignored(self):
+        c, plan, probe = self.fixture_pair()
+        good = c.audit_compatibility(c.source, probe, fragment=c.fragment, plan=plan)
+        self.assertTrue(good['ok'])
+        self.assertIn('MainPID', good['ignored'])
+        equal = dict(probe, MainPID=c.source['MainPID'])
+        audit = c.audit_compatibility(c.source, equal, fragment=c.fragment, plan=plan)
+        self.assertTrue(audit['ok'])
+        self.assertNotIn('MainPID', audit['ignored'])
+        for side in ('source', 'probe'):
+            source, candidate = dict(c.source), dict(probe)
+            target = source if side == 'source' else candidate
+            del target['MainPID']
+            with self.subTest(side=side):
+                audit = c.audit_compatibility(source, candidate, fragment=c.fragment, plan=plan)
+                row = next(row for row in audit['properties'] if row['property'] == 'MainPID')
+                self.assertEqual(row['classification'], 'missing-' + side)
+                self.assertEqual(row['reason'], 'missing-property-no-validated-equivalence')
+                self.assertTrue(row['unsupported'])
+                self.assertIn('MainPID', audit['unsupported'])
+                self.assertNotIn('MainPID', audit['ignored'])
+                self.assertFalse(audit['ok'])
+                self.assertFalse(audit['complete'])
+
+    def test_alternate_cli_logging_duplicates_aggregate_without_file_metadata_or_go(self):
+        for form in ('--property', '-p', '-p-attached'):
+            c = self.controller()
+            plan = self.plan(c)
+            probe = dict(self.probe(c, plan), NoNewPrivileges='no', WatchdogUSec='5s')
+            for key in OptionalLoggingContracts.FILE_KEYS:
+                del probe[key]
+            for key in ('StandardOutput', 'StandardError'):
+                self.assertEqual(probe[key], 'append')
+                assignment = key + '=append:/opt/nathaya/logs/nathaya-haproxy.log'
+                extra = ['-p' + assignment] if form == '-p-attached' else [form, assignment]
+                boundary = plan['command'].index('--')
+                plan['command'][boundary:boundary] = extra
+            names = ('probe-output-plan:StandardOutput', 'probe-output-plan:StandardError',
+                     'NoNewPrivileges', 'WatchdogUSec')
+            with self.subTest(form=form):
+                with self.assertRaises(self.D.Unsupported) as direct:
+                    c.validate_probe(probe, plan)
+                self.assert_names(direct.exception.labels, names)
+                c.save.reset_mock()
+                c.release_reservations = Mock()
+                with self.assertRaises(self.D.Unsupported) as raised:
+                    self.gate(c, plan, probe=probe)
+                audit = self.artifact(c, 'plain/comparison.json')
+                self.assertFalse(audit['ok'])
+                self.assert_names(audit['validation']['probe'], names)
+                self.assertEqual(raised.exception.labels, tuple(audit['issues']))
+                c.release_reservations.assert_not_called()
+                c.save.assert_not_called()
+
+    def test_initial_lock_refusal_persists_independent_watchdog_and_security_errors(self):
+        c = self.controller()
+        plan = self.plan(c)
+        plan['created_at'] = 0
+        probe = dict(self.probe(c, plan), WatchdogUSec='5s', NoNewPrivileges='no',
+                     FutureSecurityKnob='synthetic-change')
+        c.save.reset_mock()
+        c.release_reservations = Mock()
+        label = 'fixture-setup-lock-present'
+        with patch.object(c, 'show', side_effect=[probe, c.source]) as show, \
+                patch.object(self.D, '_no_lock', side_effect=self.D.Unsupported(label)) as mock_no_lock, \
+                patch.object(self.D, '_read_private_source', return_value=(c.source_bytes, {})), \
+                patch.object(time, 'monotonic', return_value=1), \
+                self.assertRaises(self.D.Unsupported) as raised:
+            c.gate(plan)
+        audit = self.artifact(c, 'plain/comparison.json')
+        self.assertFalse(audit['ok'])
+        self.assertIn(label, audit['inspection_errors'])
+        self.assert_names(audit['validation']['probe'], ('WatchdogUSec', 'NoNewPrivileges'))
+        self.assert_names(audit['issues'], (label, 'WatchdogUSec', 'NoNewPrivileges', 'FutureSecurityKnob'))
+        self.assertEqual(raised.exception.labels, tuple(audit['issues']))
+        self.assertEqual(show.call_count, 2)
+        mock_no_lock.assert_called_once_with()
+        self.assertFalse(any(call.args[0] in ('plain/live-comparison.json', 'plain/release-audit.json')
+                             for call in c.record.call_args_list))
+        c.release_reservations.assert_not_called()
+        c.save.assert_not_called()
+
+    def test_late_lock_refusals_persist_live_or_release_audit_without_go(self):
+        for stage in ('live', 'release'):
+            c = self.controller()
+            plan = self.plan(c)
+            plan['created_at'] = 0
+            probe = self.probe(c, plan)
+            live = (dict(probe, WatchdogUSec='5s', NoNewPrivileges='no')
+                    if stage == 'live' else dict(probe))
+            label = 'fixture-' + stage + '-setup-lock-present'
+            refusals = [None, self.D.Unsupported(label)] if stage == 'live' else [
+                None, None, self.D.Unsupported(label)]
+            # Six clock reads reach the live audit; the seventh checks release.
+            ticks = [1] * 6 + ([] if stage == 'live' else [3.4])
+            c.save.reset_mock()
+            c.release_reservations = Mock()
+            with self.subTest(stage=stage):
+                with patch.object(c, 'show', side_effect=[probe, c.source, live]) as show, \
+                        patch.object(self.D, '_no_lock', side_effect=refusals) as mock_no_lock, \
+                        patch.object(self.D, '_read_private_source', return_value=(c.source_bytes, {})), \
+                        patch.object(time, 'monotonic', side_effect=ticks) as clock, \
+                        self.assertRaises(self.D.Unsupported) as raised:
+                    c.gate(plan)
+                self.assertTrue(self.artifact(c, 'plain/comparison.json')['ok'])
+                live_audit = self.artifact(c, 'plain/live-comparison.json')
+                if stage == 'live':
+                    audit = live_audit
+                    self.assertFalse(audit['ok'])
+                    self.assertIn(label, audit['inspection_errors'])
+                    self.assert_names(audit['validation']['probe'], ('WatchdogUSec', 'NoNewPrivileges'))
+                    self.assertFalse(any(call.args[0] == 'plain/release-audit.json'
+                                         for call in c.record.call_args_list))
+                else:
+                    self.assertTrue(live_audit['ok'])
+                    audit = self.artifact(c, 'plain/release-audit.json')
+                    self.assertFalse(audit['gate_released'])
+                    self.assertEqual(audit['issues'], sorted([label, 'prestart-deadline']))
+                self.assertIn(label, audit['issues'])
+                self.assertEqual(raised.exception.labels, tuple(audit['issues']))
+                self.assertEqual(show.call_count, 3)
+                self.assertEqual(mock_no_lock.call_count, len(refusals))
+                self.assertEqual(clock.call_count, len(ticks))
+                c.release_reservations.assert_not_called()
+                c.save.assert_not_called()
+
+    def test_actual_three_lines_are_partial_and_actual_probe_remains_unknown(self):
+        self.assertEqual(REPORTED_PARTIAL, 'WatchdogUSec=infinity\nWatchdogTimestamp=\n'
+                         'WatchdogTimestampMonotonic=0\n')
+        actual = SNAPSHOT_MANIFEST['actual']
+        self.assertEqual(actual['coverage'], 'partial')
+        self.assertFalse(actual['full_vps_snapshot_pair'])
+        self.assertEqual(actual['probe_watchdog_value'], 'UNKNOWN')
+        self.assertEqual(actual['cause'], 'UNKNOWN')
+        c = self.controller()
+        partial = self.D.parse_show(REPORTED_PARTIAL)
+        self.assertEqual(set(partial), set(actual['source_keys']))
+        with self.assertRaises(self.D.Unsupported):
+            self.D.validate_effective(partial, c.fragment)
+        audit = c.audit_compatibility(partial, fragment=c.fragment)
+        self.assertFalse(audit['ok'])
+        self.assertFalse(audit['complete'])
+        self.assertFalse(audit['snapshot_pair_supplied'])
+        self.assertEqual(audit['coverage'], 'partial')
+        row = next(row for row in audit['properties'] if row['property'] == 'WatchdogUSec')
+        self.assertFalse(row['probe_present'])
+        self.assertIsNone(row['probe'])
+        self.assertEqual(row['reason'], 'snapshot-not-supplied')
+        self.assertEqual(row['probe_kind'], 'missing')  # API input absent, NOT actual VPS evidence.
+        c.save.assert_not_called()
+        c.record.assert_not_called()
+
+    def test_synthetic_pair_audits_exactly_all_supplied_keys_not_a_full_host_dump(self):
+        self.assertEqual(SYNTHETIC_PAIR['tag'], 'SYNTHETIC')
+        self.assertEqual(SYNTHETIC_PAIR['all_fields'], 'SYNTHETIC')
+        self.assertFalse(SNAPSHOT_MANIFEST['synthetic']['actual_host_dump'])
+        self.assertEqual(SNAPSHOT_MANIFEST['synthetic']['tag'], 'SYNTHETIC')
+        self.assertEqual(SYNTHETIC_PAIR['base_provenance']['source'], 'source_properties(old=True)')
+        self.assertEqual(SYNTHETIC_PAIR['base_provenance']['probe'], 'Offline.probe(c, plan)')
+        c, plan, probe = self.fixture_pair()
+        before = copy.deepcopy((c.source, probe, plan))
+        audit = c.audit_compatibility(c.source, probe, fragment=c.fragment, plan=plan)
+        self.assertTrue(audit['ok'])
+        self.assertTrue(audit['snapshot_pair_supplied'])
+        self.assertEqual(audit['coverage'], 'supplied-properties-only')
+        self.assertEqual(audit['issues'], [])
+        self.assertEqual(audit['unsupported'], [])
+        rows = audit['properties']
+        self.assertEqual({row['property'] for row in rows}, set(c.source) | set(probe))
+        self.assertEqual(len(rows), len(set(c.source) | set(probe)))
+        self.assertEqual(audit['source_caps'], sorted(CAPS3))
+        self.assertEqual(audit['hook_proof_valid'], {'source': True, 'probe': True})
+        self.assertEqual((c.source, probe, plan), before)
+        for key in self.D.OPTIONAL_LOG_PROPERTIES:
+            self.assertNotIn(key, c.source)
+            self.assertNotIn(key, probe)
+        self.assertNotIn('ExecStartPre', c.source)
+        self.assertNotIn('ExecReload', probe)
+        self.assertIn('ExecStartPre', probe)
+        c.save.reset_mock()
+        self.gate(c, plan, probe=probe)
+        c.save.assert_called_once_with('plain/go', b'')
+        release = self.artifact(c, 'plain/release-audit.json')
+        self.assertEqual(release['issues'], [])
+        # This artifact precedes go creation; False is not a release failure.
+        self.assertFalse(release['gate_released'])
+
+    def test_only_zero_and_infinity_normalize_watchdog_disabled(self):
+        for source in ('0', 'infinity'):
+            self.assertEqual(self.D.watchdog_behavior(source), 'disabled')
+            for probe in ('0', 'infinity'):
+                self.assertEqual(self.D.restriction_differences(
+                    {'WatchdogUSec': source}, {'WatchdogUSec': probe}), [])
+        # SystemCallFilter remains a literal comparator, not watchdog normalization.
+        self.assertEqual(self.D.restriction_differences(
+            {'SystemCallFilter': '@mount'}, {'SystemCallFilter': '~'}), ['SystemCallFilter'])
+        self.assertEqual(self.D.restriction_differences(
+            {'SystemCallFilter': '@mount'}, {'SystemCallFilter': '@mount'}), [])
+
+    def test_invalid_watchdog_including_equal_finite_values_never_passes(self):
+        c = self.controller()
+        plan = self.plan(c)
+        for value in ('', '0us', '1us', '5s', '42', 'unknown', 'Infinity', ' 0',
+                      None, 0, False, [], {}):
+            with self.subTest(kind=type(value).__name__, value=value):
+                with self.assertRaisesRegex(self.D.Unsupported, 'WatchdogUSec'):
+                    self.D.watchdog_behavior(value)
+                source = dict(c.source, WatchdogUSec=value)
+                probe = dict(self.probe(c, plan), WatchdogUSec=value)
+                with self.assertRaisesRegex(self.D.Unsupported, 'WatchdogUSec'):
+                    self.D.validate_effective(source, c.fragment)
+                with self.assertRaisesRegex(self.D.Unsupported, 'WatchdogUSec'):
+                    c.validate_probe(probe, plan)
+                with self.assertRaisesRegex(self.D.Unsupported, 'WatchdogUSec'):
+                    self.D.restriction_differences(source, probe)
+                audit = c.audit_compatibility(source, probe, fragment=c.fragment, plan=plan)
+                self.assertFalse(audit['ok'])
+                self.assert_names(audit['validation']['source'], ('WatchdogUSec',))
+                self.assert_names(audit['validation']['probe'], ('WatchdogUSec',))
+                self.assertIn('WatchdogUSec', audit['unsupported'])
+
+    def test_watchdog_is_required_even_when_both_inventories_omit_it(self):
+        c = self.controller()
+        plan = self.plan(c)
+        source, probe = dict(c.source), self.probe(c, plan)
+        del source['WatchdogUSec']
+        del probe['WatchdogUSec']
+        self.assertNotIn('WatchdogUSec', set(source) | set(probe))
+        with self.assertRaisesRegex(self.D.Unsupported, 'WatchdogUSec'):
+            self.D.validate_effective(source, c.fragment)
+        with self.assertRaisesRegex(self.D.Unsupported, 'WatchdogUSec'):
+            c.validate_probe(probe, plan)
+        audit = c.audit_compatibility(source, probe, fragment=c.fragment, plan=plan)
+        self.assertFalse(audit['ok'])
+        self.assert_names(audit['validation']['source'], ('WatchdogUSec',))
+        self.assert_names(audit['validation']['probe'], ('WatchdogUSec',))
+        self.assertFalse(any(row['property'] == 'WatchdogUSec' for row in audit['properties']))
+        # A valid comparator inventory alone is never permission to execute.
+        c.save.reset_mock()
+        with self.assertRaisesRegex(self.D.Unsupported, 'WatchdogUSec'):
+            self.gate(c, plan, current=source, probe=probe)
+        c.save.assert_not_called()
+
+    def test_factory_explicit_disabled_watchdog_preserves_root_caps_and_runtime(self):
+        for old, caps in ((True, CAPS3), (False, CAPS4)):
+            c = self.controller(old)
+            before = copy.deepcopy((c.source, c.fragment, c.source_bytes, c.caps))
+            for phase in ('plain', 'trace'):
+                plan = self.plan(c, phase)
+                self.assertEqual(plan['properties']['WatchdogSec'], '0')
+                self.assertEqual([arg for arg in plan['command'] if arg.startswith('--property=Watchdog')],
+                                 ['--property=WatchdogSec=0'])
+                self.assertEqual((plan['properties']['User'], plan['properties']['Group']), ('root', 'root'))
+                self.assertEqual(frozenset(plan['properties']['CapabilityBoundingSet'].split()), caps)
+                self.assertEqual(plan['properties']['RuntimeMaxSec'], '8s')
+                self.assertEqual(plan['properties']['ReadWritePaths'], '/opt/nathaya/logs')
+                self.assertEqual(plan['properties']['StandardOutput'], 'append:' + str(plan['output']))
+                self.assertEqual(plan['properties']['StandardError'], 'append:' + str(plan['output']))
+            self.assertEqual((c.source, c.fragment, c.source_bytes, c.caps), before)
+        for names in (self.D.RUNTIME_PROPERTIES, self.D.INTENDED_PROPERTIES,
+                      self.D.OPTIONAL_LOG_PROPERTIES):
+            self.assertNotIn('WatchdogUSec', names)
+
+    def test_watchdog_plan_requires_dictionary_and_exactly_one_cli_assignment(self):
+        c = self.controller()
+        good = self.plan(c)
+        probe = self.probe(c, good)
+        for variant in ('dict-missing', 'dict-finite', 'cli-missing', 'cli-finite', 'duplicate', 'split'):
+            plan = copy.deepcopy(good)
+            if variant == 'dict-missing':
+                del plan['properties']['WatchdogSec']
+            elif variant == 'dict-finite':
+                plan['properties']['WatchdogSec'] = '5s'
+            elif variant == 'cli-missing':
+                plan['command'].remove('--property=WatchdogSec=0')
+            elif variant == 'cli-finite':
+                index = plan['command'].index('--property=WatchdogSec=0')
+                plan['command'][index] = '--property=WatchdogSec=5s'
+            elif variant == 'duplicate':
+                plan['command'].insert(plan['command'].index('--'), '--property=WatchdogSec=0')
+            else:
+                index = plan['command'].index('--property=WatchdogSec=0')
+                plan['command'][index:index + 1] = ['-p', 'WatchdogSec=0']
+            with self.subTest(variant=variant), self.assertRaisesRegex(
+                    self.D.Unsupported, 'probe-watchdog-plan:WatchdogSec'):
+                c.validate_probe(probe, plan)
+
+    def test_watchdog_plan_must_not_accept_usec_alias_shadow_assignments(self):
+        # Both the mapping and every supported property CLI spelling must
+        # reject a WatchdogUSec alias shadowing the audited WatchdogSec=0.
+        c = self.controller()
+        good = self.plan(c)
+        probe = self.probe(c, good)
+        variants = (['--property=WatchdogUSec=5s'], ['--property', 'WatchdogUSec=5s'],
+                    ['-p', 'WatchdogUSec=5s'], ['-pWatchdogUSec=5s'])
+        for placement in ('dict', 'cli', 'both'):
+            for args in variants:
+                plan = copy.deepcopy(good)
+                if placement in ('dict', 'both'):
+                    plan['properties']['WatchdogUSec'] = '5s'
+                if placement in ('cli', 'both'):
+                    boundary = plan['command'].index('--')
+                    plan['command'][boundary:boundary] = args
+                with self.subTest(placement=placement, args=args), self.assertRaisesRegex(
+                        self.D.Unsupported, 'probe-watchdog-plan:WatchdogUSec'):
+                    c.validate_probe(probe, plan)
+
+    def test_effective_disabled_spellings_validate_and_release_at_both_snapshots(self):
+        for value in ('0', 'infinity'):
+            c = self.controller(True)
+            c.source['WatchdogUSec'] = value
+            self.assertEqual(self.D.validate_effective(c.source, c.fragment), CAPS3)
+            plan = self.plan(c)
+            for effective in ('0', 'infinity'):
+                probe = dict(self.probe(c, plan), WatchdogUSec=effective)
+                live = dict(probe, WatchdogUSec='infinity' if effective == '0' else '0')
+                c.validate_probe(probe, plan)
+                c.save.reset_mock()
+                self.gate(c, plan, probe=probe, live=live)
+                c.save.assert_called_once_with('plain/go', b'')
+
+    def test_detailed_watchdog_classification_uses_supplied_values_not_guesses(self):
+        c = self.controller()
+        plan = self.plan(c)
+        cases = (
+            ({}, {'WatchdogUSec': '0'}, 'missing-source', 'missing', 'zero', True),
+            ({'WatchdogUSec': 'infinity'}, {}, 'missing-probe', 'infinity', 'missing', True),
+            ({'WatchdogUSec': 'infinity'}, {'WatchdogUSec': '0'},
+             'normalized-equal', 'infinity', 'zero', False),
+            ({'WatchdogUSec': '0'}, {'WatchdogUSec': '5s'}, 'value-different', 'zero', 'finite', True),
+            ({'WatchdogUSec': '5s'}, {'WatchdogUSec': '5s'}, 'unsupported-value', 'finite', 'finite', True),
+            ({'WatchdogUSec': ''}, {'WatchdogUSec': '0'}, 'value-different', 'empty', 'zero', True),
+            ({'WatchdogUSec': 'unexpected'}, {'WatchdogUSec': '0'},
+             'value-different', 'unknown', 'zero', True),
+            ({'WatchdogUSec': 0}, {'WatchdogUSec': '0'}, 'value-different', 'invalid-type', 'zero', True),
+        )
+        for left, right, classification, sk, pk, unsupported in cases:
+            source, probe = dict(c.source), self.probe(c, plan)
+            source.pop('WatchdogUSec')
+            probe.pop('WatchdogUSec')
+            source.update(left)
+            probe.update(right)
+            audit = c.audit_compatibility(source, probe, fragment=c.fragment, plan=plan)
+            row = next(row for row in audit['properties'] if row['property'] == 'WatchdogUSec')
+            with self.subTest(source_kind=sk, probe_kind=pk):
+                self.assertEqual(row['classification'], classification)
+                self.assertEqual((row['source_kind'], row['probe_kind']), (sk, pk))
+                self.assertEqual((row['source_present'], row['probe_present']),
+                                 ('WatchdogUSec' in left, 'WatchdogUSec' in right))
+                self.assertEqual((row['source'], row['probe']), (left.get('WatchdogUSec'), right.get('WatchdogUSec')))
+                self.assertEqual(row['unsupported'], unsupported)
+                if classification == 'normalized-equal':
+                    self.assertEqual((row['source_behavior'], row['probe_behavior']), ('disabled', 'disabled'))
+                    self.assertFalse(row['raw_equal'])
+                elif sk == pk == 'finite':
+                    self.assertTrue(row['raw_equal'])
+                    self.assertEqual(row['reason'], 'unsupported-normalization')
+
+    def test_multi_mutations_persist_one_aggregate_before_first_or_live_refusal(self):
+        names = ('NoNewPrivileges', 'SystemCallFilter', 'RootImage', 'FutureSecurityKnob',
+                 'ExecStart', 'ExecStartPre', 'ExecStopEx', 'StandardOutput', 'WatchdogUSec')
+        for stage in ('first', 'live'):
+            c = self.controller(True)
+            plan = self.plan(c)
+            good = self.probe(c, plan)
+            bad = dict(good, NoNewPrivileges='no', SystemCallFilter='@mount',
+                       FutureSecurityKnob='synthetic-change', ExecStart='malformed',
+                       ExecStartPre='malformed', ExecStopEx=exec_property(['/bin/true']),
+                       StandardOutput='journal', WatchdogUSec='5s')
+            del bad['RootImage']
+            c.save.reset_mock()
+            c.release_reservations = Mock()
+            with self.subTest(stage=stage), self.assertRaises(self.D.Unsupported) as raised:
+                self.gate(c, plan, probe=bad if stage == 'first' else good,
+                          live=bad if stage == 'live' else good)
+            name = 'plain/comparison.json' if stage == 'first' else 'plain/live-comparison.json'
+            audit = self.artifact(c, name)
+            self.assertFalse(audit['ok'])
+            self.assert_names(audit['issues'], names)
+            self.assert_names(audit['validation']['probe'],
+                              ('NoNewPrivileges', 'SystemCallFilter', 'ExecStart', 'ExecStartPre',
+                               'active-hook:ExecStopEx', 'StandardOutput', 'WatchdogUSec'))
+            self.assertTrue(set(('FutureSecurityKnob', 'RootImage', 'WatchdogUSec')) <= set(audit['unsupported']))
+            self.assertEqual(raised.exception.labels, tuple(audit['issues']))
+            self.assertEqual(list(raised.exception.labels), sorted(set(raised.exception.labels)))
+            c.release_reservations.assert_not_called()
+            c.save.assert_not_called()
+            if stage == 'first':
+                self.assertFalse(any(call.args[0] == 'plain/live-comparison.json'
+                                     for call in c.record.call_args_list))
+            else:
+                self.assertTrue(self.artifact(c, 'plain/comparison.json')['ok'])
+
+    def test_default_validators_collect_independent_categories_without_early_exit(self):
+        c = self.controller()
+        plan = self.plan(c)
+        source = dict(c.source, User='haproxy', Group='haproxy', CapabilityBoundingSet='bad',
+                      RestrictAddressFamilies='AF_UNIX', SystemCallFilter='@mount',
+                      ExecStart='malformed', ExecReloadEx='malformed',
+                      ExecStopEx='active', WatchdogUSec='5s', StandardError='journal')
+        with self.assertRaises(self.D.Unsupported) as raised:
+            self.D.validate_effective(source, c.fragment)
+        self.assert_names(raised.exception.labels, ('User', 'Group', 'CapabilityBoundingSet',
+                          'RestrictAddressFamilies', 'SystemCallFilter', 'ExecStart', 'ExecReloadEx',
+                          'active-hook:ExecStopEx', 'WatchdogUSec', 'StandardError'))
+        probe = dict(self.probe(c, plan), User='haproxy', Group='haproxy', CapabilityBoundingSet='bad',
+                     RestrictAddressFamilies='AF_UNIX', SystemCallFilter='@mount', ExecStart='malformed',
+                     ExecStartPreEx='malformed', ExecStopEx='active', WatchdogUSec='5s', StandardError='journal')
+        bad_plan = copy.deepcopy(plan)
+        bad_plan['properties']['WatchdogSec'] = '5s'
+        bad_plan['properties']['StandardOutput'] = 'journal'
+        bad_plan['argv'] = ['/bin/true']
+        bad_plan['pre'] = ['/bin/true']
+        with self.assertRaises(self.D.Unsupported) as raised:
+            c.validate_probe(probe, bad_plan)
+        self.assert_names(raised.exception.labels, ('User', 'Group', 'CapabilityBoundingSet',
+                          'RestrictAddressFamilies', 'SystemCallFilter', 'ExecStart', 'ExecStartPreEx',
+                          'active-hook:ExecStopEx', 'WatchdogUSec', 'StandardError',
+                          'probe-watchdog-plan', 'probe-output-plan:StandardOutput',
+                          'probe-command-plan:ExecStart', 'probe-command-plan:ExecStartPre'))
+        errors = []
+        self.D.collect_unsupported(errors, self.D.watchdog_behavior, '5s')
+        self.D.collect_unsupported(errors, self.D._require, source, {'User': 'root', 'Group': 'root'})
+        self.D.collect_unsupported(errors, self.D._checked_empty_exec_fields, source, ('ExecStopEx',))
+        self.assert_names(errors, ('WatchdogUSec', 'User', 'Group', 'active-hook:ExecStopEx'))
+        left = {'WatchdogUSec': '5s', 'CapabilityBoundingSet': None, 'RestrictAddressFamilies': None}
+        right = dict(left)
+        with self.assertRaises(self.D.Unsupported) as raised:
+            self.D.restriction_differences(left, right)
+        self.assertEqual(set(raised.exception.labels),
+                         {'WatchdogUSec', 'CapabilityBoundingSet', 'RestrictAddressFamilies'})
+
+    def test_invalid_current_source_cannot_hide_probe_diff_or_original_issues(self):
+        c = self.controller()
+        plan = self.plan(c)
+        current = dict(c.source, NoNewPrivileges='no', ExecReload='malformed', WatchdogUSec='5s')
+        original = dict(c.source, ExecStart='malformed')
+        probe = dict(self.probe(c, plan), ProtectSystem='no', StandardError='journal',
+                     ExecStartPre='malformed', FutureSecurityKnob='synthetic-change')
+        del probe['RootImage']
+        audit = c.audit_compatibility(current, probe, fragment=c.fragment, plan=plan,
+                                      original=original, original_fragment=c.fragment,
+                                      original_bytes=c.source_bytes, current_bytes=c.source_bytes)
+        self.assert_names(audit['validation']['source'], ('NoNewPrivileges', 'ExecReload', 'WatchdogUSec'))
+        self.assert_names(audit['validation']['probe'], ('ProtectSystem', 'StandardError', 'ExecStartPre'))
+        self.assert_names(audit['validation']['original'], ('ExecStart',))
+        self.assertTrue(set(('FutureSecurityKnob', 'RootImage', 'WatchdogUSec')) <= set(audit['unsupported']))
+        self.assertIn('source-profile-changed', audit['issues'])
+        self.assertTrue(audit['source_profile_change']['changed'])
+        self.assertFalse(audit['source_profile_change']['raw_fragment_changed'])
+        self.assertIsNotNone(audit['original_inventory'])
+        self.assertEqual(audit['hook_proof_valid'], {'source': False, 'probe': False})
+        c.save.reset_mock()
+        with self.assertRaises(self.D.Unsupported) as raised:
+            self.gate(c, plan, current=current, probe=probe)
+        gated = self.artifact(c, 'plain/comparison.json')
+        self.assert_names(raised.exception.labels, ('NoNewPrivileges', 'ExecReload', 'WatchdogUSec',
+                          'ProtectSystem', 'StandardError', 'ExecStartPre', 'FutureSecurityKnob', 'RootImage'))
+        self.assertEqual(raised.exception.labels, tuple(gated['issues']))
+        c.save.assert_not_called()
+
+    def test_show_nonzero_and_timeout_persist_read_errors_without_fake_watchdog(self):
+        for code in (1, None):
+            c = self.controller()
+            plan = self.plan(c)
+            plan['created_at'] = 0
+            # Even parseable partial stdout is NOT accepted as a successful read.
+            c.command = Mock(return_value=(code, REPORTED_PARTIAL.encode(), b'PRIVATE_SYNTHETIC_STDERR'))
+            c.save.reset_mock()
+            c.release_reservations = Mock()
+            with patch.object(self.D, '_no_lock'), \
+                    patch.object(self.D, '_read_private_source', return_value=(c.source_bytes, {})), \
+                    patch.object(time, 'monotonic', return_value=1), \
+                    self.assertRaises(self.D.Unsupported) as raised:
+                c.gate(plan)
+            audit = self.artifact(c, 'plain/comparison.json')
+            self.assertIn('dbus-or-show-unavailable', audit['inspection_errors'])
+            self.assertIn('snapshots-unavailable', audit['issues'])
+            self.assertEqual(audit['properties'], [])
+            self.assertFalse(audit['snapshot_pair_supplied'])
+            self.assertEqual(audit['coverage'], 'partial')
+            self.assertFalse(audit['complete'])
+            self.assertNotIn('WatchdogUSec', ';'.join(audit['issues']))
+            self.assertNotIn('PRIVATE_SYNTHETIC_STDERR', str(raised.exception))
+            self.assertEqual(c.command.call_count, 2)
+            for call in c.command.call_args_list:
+                self.assertEqual(call.args[0][:4], ['/usr/bin/systemctl', 'show', '--all', '--no-pager'])
+            c.release_reservations.assert_not_called()
+            c.save.assert_not_called()
+
+    def test_main_console_exposes_only_labels_not_private_raw_watchdog_values(self):
+        c = self.controller(True)
+        plan = self.plan(c)
+        probe = dict(self.probe(c, plan), WatchdogUSec='PRIVATE_SYNTHETIC_WATCHDOG',
+                     FutureSecurityKnob='PRIVATE_SYNTHETIC_SECURITY', ExecStart='PRIVATE_SYNTHETIC_COMMAND')
+        c.prepare = Mock()
+        c.run_phase = Mock(side_effect=lambda phase: self.gate(c, plan, probe=probe))
+        c.cleanup = Mock(return_value=True)
+        c.save.reset_mock()
+        rc, out, err = self.main_with(c)
+        self.assertEqual(rc, 2)
+        self.assertEqual(err, '')
+        self.assertIn('unsupported:', out)
+        self.assertIn('WatchdogUSec', out)
+        self.assertIn('FutureSecurityKnob', out)
+        self.assertNotIn('PRIVATE_SYNTHETIC', out + err)
+        audit = self.artifact(c, 'plain/comparison.json')
+        row = next(row for row in audit['properties'] if row['property'] == 'WatchdogUSec')
+        self.assertEqual(row['probe'], 'PRIVATE_SYNTHETIC_WATCHDOG')
+        self.assertEqual(row['probe_kind'], 'unknown')
+        self.assertEqual(row['source_kind'], 'infinity')
+        self.assertEqual(row['classification'], 'value-different')
+        c.run_phase.assert_called_once_with('plain')
+        c.cleanup.assert_called_once_with()
+        c.save.assert_not_called()
+
+
 class PureContracts(Offline):
     def test_parse_show_preserves_equals_and_empty_values(self):
         self.assertEqual(self.D.parse_show('Id=fixture.service\nEmpty=\nValue=a=b\n'),
@@ -1306,7 +1900,9 @@ class ControllerContracts(Offline):
             c.save.assert_not_called()
 
     def test_gate_expired_and_missed_prestart_are_not_haproxy_failure(self):
-        for clock, inactive in ((10, False), ([1, 1, 1, 4], False), (1, True)):
+        # The aggregate gate now reads current evidence before the live check;
+        # keep the mock clock expired for all live audit/deadline reads.
+        for clock, inactive in ((10, False), ([1, 1, 1, 4, 4, 4], False), (1, True)):
             c = self.controller()
             plan = self.plan(c)
             p = self.probe(c, plan)

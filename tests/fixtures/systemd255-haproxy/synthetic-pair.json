@@ -1,0 +1,50 @@
+{
+  "tag": "SYNTHETIC",
+  "all_fields": "SYNTHETIC",
+  "base_provenance": {
+    "source": "source_properties(old=True)",
+    "probe": "Offline.probe(c, plan)",
+    "fragment": "actual renderer, historical CAPS3 overlay",
+    "plan": "Controller.factory(plain), mocked files and reservations"
+  },
+  "old": true,
+  "phase": "plain",
+  "source": {
+    "set": {
+      "WatchdogUSec": "infinity"
+    },
+    "omit": [
+      "StandardOutputFile",
+      "StandardErrorFile",
+      "ExecStartPre",
+      "ExecStartPreEx",
+      "ExecStartPost",
+      "ExecStartPostEx",
+      "ExecCondition",
+      "ExecConditionEx",
+      "ExecStop",
+      "ExecStopEx",
+      "ExecStopPost",
+      "ExecStopPostEx"
+    ]
+  },
+  "probe": {
+    "set": {
+      "WatchdogUSec": "0"
+    },
+    "omit": [
+      "StandardOutputFile",
+      "StandardErrorFile",
+      "ExecReload",
+      "ExecReloadEx",
+      "ExecStartPost",
+      "ExecStartPostEx",
+      "ExecCondition",
+      "ExecConditionEx",
+      "ExecStop",
+      "ExecStopEx",
+      "ExecStopPost",
+      "ExecStopPostEx"
+    ]
+  }
+}
