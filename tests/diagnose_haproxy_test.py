@@ -300,7 +300,7 @@ def assert_launcher_contract(case, shell):
         r'nathaya_diagnose_haproxy_main\s*\(\s*\)\s*\{\s*'
         r'case\s+"\$#:\$\{1-\}"\s+in\s*'
         r'1:--help\s*\)(?P<help>.*?)\s*;;\s*'
-        r'1:--run\s*\|\s*1:--cap-boundaries\s*\)\s*;;\s*'
+        r'1:--run\s*\|\s*1:--cap-boundaries\s*\|\s*1:--cap-matrix\s*\)\s*;;\s*'
         r'\*\s*\)(?P<default>.*?)\s*;;\s*'
         r'esac\s+(?P<dispatch>.*?)\s*\Z', flat, re.S)
     case.assertIsNotNone(structure, 'One-argument allowlist before dispatch')
@@ -344,21 +344,26 @@ class ImportAndShellContracts(Offline):
             SHELL.replace(') ;;', ')\n            ;;')
                  .replace('return 64 ;;', 'return\t64\n            ;;')
                  .replace('    exec /usr/bin/env', '\texec\t/usr/bin/env'),
-            SHELL.replace('case "$#:${1-}" in', 'case\t"$#:${1-}"\tin')
+            SHELL.replace('1:--run|1:--cap-boundaries|1:--cap-matrix)',
+                          '1:--run | 1:--cap-boundaries | 1:--cap-matrix )')
+                 .replace('case "$#:${1-}" in', 'case\t"$#:${1-}"\tin')
                  .replace(' -i PATH=', '  -i\tPATH=')
                  .replace(' -I -B - "$1"', '\t-I  -B\t-  "$1"')
                  .replace("<<'" + MARKER + "'\n", "<<  '" + MARKER + "'  \n"),
         )
         for variant in variants:
+            self.assertNotEqual(variant, SHELL, 'Layout mutation must exercise the prefix')
             assert_launcher_contract(self, variant)
         for before, after in (('-i PATH=', 'PATH='), (' -I -B ', ' -B '),
                               ('- "$1"', '- $1'), ('- "$1"', '- "$@"'),
                               ('return 64 ;;', 'return 0 ;;'),
-                              ('1:--run|1:--cap-boundaries)', '*)'),
+                              ('1:--run|1:--cap-boundaries|1:--cap-matrix)', '*)'),
                               ('\n' + MARKER + '\n', '\n' + MARKER + ' \n'),
                               ('\n' + MARKER + '\n', '\n' + MARKER + '\t\n')):
+            mutated = SHELL.replace(before, after)
+            self.assertNotEqual(mutated, SHELL, 'Negative mutation must not be a no-op')
             with self.subTest(change=after), self.assertRaises(AssertionError):
-                assert_launcher_contract(self, SHELL.replace(before, after))
+                assert_launcher_contract(self, mutated)
 
     def test_host_guards_reject_accidental_real_operations(self):
         for operation in (lambda: Path('/proc/1/comm').read_text(),
@@ -371,7 +376,8 @@ class ImportAndShellContracts(Offline):
 
     def test_main_invalid_arguments_never_construct_controller(self):
         factory = Mock()
-        for args in ([], ['--help'], ['--run', 'extra'], ['--trace']):
+        for args in ([], ['--help'], ['--run', 'extra'], ['--trace'],
+                     ['--cap-matrix', 'extra'], ['--cap-matrix=PrivateTmp']):
             result = self.invoke(self.D.main, args, patchers=(
                 patch.object(self.D, 'Controller', factory),
                 patch.object(sys, 'stderr', io.StringIO()),
@@ -2768,6 +2774,724 @@ class CapabilityBoundaryContracts(Offline):
             self.assertIn('(not a root cause)', out)
             self.assertNotIn('plain startup:', out)
             self.assertNotIn('trace startup:', out)
+
+
+class CapabilityMatrixContracts(Offline):
+    """Synthetic requested-profile experiments, not live capability evidence."""
+
+    KNOBS = ('NoNewPrivileges', 'PrivateTmp', 'ProtectSystem', 'ProtectHome',
+             'ProtectKernelTunables', 'ProtectKernelModules', 'ProtectControlGroups',
+             'RestrictSUIDSGID', 'LockPersonality', 'RestrictAddressFamilies', 'ReadWritePaths')
+
+    def mx_plan(self, c, enabled=(), index=0):
+        return self.D.matrix_plan(c.directory, c.nonce, c.caps, index, enabled)
+
+    def mx_profile(self, c, plan):
+        # Show is separate evidence, not the request mapping itself. Individual
+        # tests deliberately override this synthetic request-matching default.
+        p = self.probe(c, plan)
+        p.update({k: plan['properties'][k] for k in self.KNOBS})
+        p.update(ActiveState='active', SubState='running', MainPID='101', ControlPID='0')
+        return p
+
+    def mx_records(self, c, *, missing=False, nnp=1, phase='mx00'):
+        mask = 0x4c0 if c.caps == CAPS3 else 0x4e0
+        active = mask & ~0x80 if missing else mask
+        raw = CaptureContracts.status_bytes(self, caps=active).decode()
+        raw = re.sub(r'CapBnd:\t[0-9a-f]+', 'CapBnd:\t%x' % mask, raw)
+        raw = raw.replace('NoNewPrivs:\t1', 'NoNewPrivs:\t%d' % nnp)
+        rows = [dict(tag=self.D.BOUNDARY_TAG, stage=stage,
+                     token=str(c.directory / phase), status=raw + 'TracerPid:\t0\nSeccomp:\t2\n',
+                     exe='/usr/bin/python3.12', env_present=dict.fromkeys(self.D.ENV_NAMES, False))
+                for stage in ('control-entry', 'after-exec')]
+        return self.D.boundary_records('\n'.join(json.dumps(r) for r in rows),
+                                       str(c.directory / phase), control=True)
+
+    @staticmethod
+    def python_metadata():
+        return dict(available=True, resolved='/usr/bin/python3.12', uid=0, gid=0,
+                    mode='0o755', device=2, inode=3, size=4, mtime_ns=5,
+                    filecap={'available': True, 'present': False, 'errno': errno.ENODATA})
+
+    def attempt_fixture(self, c, *, missing=False, forced_nnp=False, clean=True,
+                        show_nnp=None, proc_nnp=None):
+        """Configure IO only; run the REAL matrix_attempt and validators."""
+        c.matrix_report = {'attempts': []}
+        plan = self.mx_plan(c)
+        profile = self.mx_profile(c, plan)
+        if forced_nnp or show_nnp is not None:
+            profile['NoNewPrivileges'] = 'yes' if show_nnp is None else show_nnp
+        records = self.mx_records(c, missing=missing,
+                                  nnp=(1 if forced_nnp else 0) if proc_nnp is None else proc_nnp)
+        c.matrix_source = Mock(return_value=c.source)
+        c.matrix_python = Mock(return_value=self.python_metadata())
+        c.show = Mock(side_effect=[{'LoadState': 'not-found'}, profile, dict(profile),
+                                  {'LoadState': 'not-found'}])
+        c.read_boundaries = Mock(side_effect=[records[:1], records])
+        c.command = Mock(return_value=(0, b'', b''))
+        c.cleanup_one = Mock(return_value=clean)
+        c.reserve = Mock(side_effect=AssertionError('No matrix listener reservation'))
+        patchers = (patch.object(Path, 'mkdir'), patch.object(self.D, '_no_lock'),
+                    patch.object(time, 'monotonic', return_value=1))
+        return plan, profile, records, patchers
+
+    def schedule(self, missing, *, unstable=False):
+        """Mock attempts, not the scheduler/edge comparator. Copy raw show data."""
+        c = self.controller()
+        requests = []
+        counts = collections.Counter()
+
+        def attempt(enabled):
+            requested = frozenset(enabled)
+            counts[requested] += 1
+            plan = self.mx_plan(c, enabled, len(requests))
+            requests.append(requested)
+            absent = missing(requested)
+            if unstable and counts[requested] > 1:
+                absent = not absent
+            nnp = int('NoNewPrivileges' in requested)
+            records = self.mx_records(c, missing=absent, nnp=nnp, phase=plan['phase'])
+            result = dict(phase=plan['phase'], enabled=list(plan['enabled']),
+                          profile=copy.deepcopy(self.mx_profile(c, plan)),
+                          state=self.D.matrix_entry_state(records, c.caps, '/usr/bin/python3.12'),
+                          layers={'NoNewPrivileges': {'requested': plan['properties']['NoNewPrivileges'],
+                                                      'show': plan['properties']['NoNewPrivileges'],
+                                                      'proc_entry': nnp, 'proc_after_exec': nnp}},
+                          actual_NNP_off=not bool(nnp))
+            c.matrix_report['attempts'].append(dict(phase=plan['phase'], enabled=list(plan['enabled']),
+                                                    status='recorded', missing=absent))
+            return result
+
+        c.matrix_attempt = Mock(side_effect=attempt)
+        return c, requests, (patch.object(self.D, 'executable_metadata', return_value=self.python_metadata()),)
+
+    def test_fixed_eleven_explicit_off_and_source_production_on_plans_are_immutable(self):
+        self.assertEqual(self.D.MATRIX_KNOBS, self.KNOBS)
+        self.assertEqual(len(self.KNOBS), 11)
+        for old, mask in ((True, 0x4c0), (False, 0x4e0)):
+            c = self.controller(old)
+            before = copy.deepcopy((c.source, c.fragment, c.source_bytes, c.caps))
+            minimal, production = self.mx_plan(c), self.mx_plan(c, self.KNOBS, 1)
+            for key in self.KNOBS:
+                self.assertEqual(minimal['properties'][key],
+                                 '' if key in ('RestrictAddressFamilies', 'ReadWritePaths') else 'no')
+                self.assertEqual(production['properties'][key], c.source[key])
+            for plan in (minimal, production):
+                p = plan['properties']
+                self.assertEqual(frozenset(p['CapabilityBoundingSet'].split()), c.caps)
+                self.assertEqual(sum(1 << self.D.CAP_BITS[k] for k in c.caps), mask)
+                self.assertEqual((p['User'], p['Group'], p['AmbientCapabilities']), ('root', 'root', ''))
+                self.assertEqual({k: p[k] for k in ('RuntimeMaxSec', 'TimeoutStartSec', 'TimeoutStopSec',
+                                                   'TimeoutAbortSec', 'WatchdogSec', 'Restart')},
+                                 dict(RuntimeMaxSec='8s', TimeoutStartSec='5s', TimeoutStopSec='2s',
+                                      TimeoutAbortSec='2s', WatchdogSec='0', Restart='no'))
+                self.assertEqual(plan['required_effective_defaults'], {'SecureBits': '0', 'SystemCallFilter': '~'})
+                self.assertEqual(plan['pre'], [])
+                self.assertEqual(plan['argv'], ['/usr/bin/python3', '-I', '-B',
+                                 str(c.directory / 'control.py'), str(plan['control_go'])])
+                self.assertEqual(plan['command'], self.D.transient_command(plan['unit'], p, plan['argv']))
+                for key in ('StandardOutput', 'StandardError'):
+                    self.assertEqual(p[key], 'append:' + str(plan['output']))
+                for forbidden in ('/usr/sbin/haproxy', '/usr/bin/strace', '/bin/sh', 'abns@', '127.0.0.1', '-c'):
+                    self.assertNotIn(forbidden, plan['command'])
+            self.assertEqual((c.source, c.fragment, c.source_bytes, c.caps), before)
+
+    def test_all_twenty_eight_roles_are_owned_and_unknown_inputs_rejected(self):
+        c = self.controller()
+        for index in range(28):
+            plan = self.mx_plan(c, index=index)
+            profile = self.mx_profile(c, plan)
+            self.assertEqual(plan['phase'], 'mx%02d' % index)
+            self.assertTrue(self.D.owned_unit(profile, plan['unit'], c.nonce))
+            self.assertTrue(self.D._capture_unit(plan['unit'], c.nonce))
+            c.validate_matrix(profile, plan)
+        for directory, nonce in ((Path('/tmp/foreign'), c.nonce), (c.directory, 'A' * 32),
+                                 (c.directory, 'a' * 31), (c.directory, None)):
+            with self.subTest(nonce=nonce), self.assertRaises(self.D.Unsupported):
+                self.D.matrix_plan(directory, nonce, c.caps, 0, ())
+        for index in (-1, 28, 29, True, '0', None):
+            with self.subTest(index=index), self.assertRaises(self.D.Unsupported):
+                self.mx_plan(c, index=index)
+        for enabled in (('FutureKnob',), ('NoNewPrivileges', 'NoNewPrivileges'), 'PrivateTmp', None):
+            with self.subTest(enabled=enabled), self.assertRaises(self.D.Unsupported):
+                self.mx_plan(c, enabled)
+        for role in ('mx28', 'mx99', 'mx1', 'mx000', 'foreign'):
+            unit = 'nathaya-haproxy-probe-' + c.nonce + '-' + role + '.service'
+            self.assertFalse(self.D._capture_unit(unit, c.nonce))
+            self.assertFalse(self.D.owned_unit(self.mx_profile(c, self.mx_plan(c)), unit, c.nonce))
+            c.command = Mock()
+            with self.assertRaises(self.D.Unsupported):
+                c.show(unit)
+            c.command.assert_not_called()
+        with self.assertRaises(ValueError):
+            self.D.matrix_plan(c.directory, c.nonce, CAPS4 | {'CAP_SYS_ADMIN'}, 0, ())
+
+    def test_effective_knobs_require_requested_known_domains_except_implicit_nnp(self):
+        c = self.controller()
+        off, on = self.mx_plan(c), self.mx_plan(c, self.KNOBS, 1)
+        for plan, opposite in ((off, on), (on, off)):
+            good = self.mx_profile(c, plan)
+            for key in self.KNOBS:
+                value = opposite['properties'][key]
+                with self.subTest(enabled=plan['enabled'], key=key):
+                    self.assertTrue(self.invoke(self.D._matrix_allowed, key, value))
+                    changed = dict(good, **{key: value})
+                    if key == 'NoNewPrivileges' and plan is off:
+                        self.invoke(c.validate_matrix, changed, plan)
+                    else:
+                        with self.assertRaisesRegex(self.D.Unsupported, '^matrix-effective-value:' + key + '$'):
+                            self.invoke(c.validate_matrix, changed, plan)
+        # Known aliases are equality, not permission to switch another knob.
+        for plan in (off, on):
+            aliases = self.mx_profile(c, plan)
+            for key in self.KNOBS:
+                if aliases[key] in ('yes', 'no'):
+                    aliases[key] = 'true' if aliases[key] == 'yes' else 'false'
+            if plan is on:
+                aliases['RestrictAddressFamilies'] = 'AF_UNIX AF_INET6 AF_INET'
+            self.invoke(c.validate_matrix, aliases, plan)
+        invalid = [('ReadWritePaths', '/foreign'), ('ReadWritePaths', '/opt/nathaya/logs /foreign'),
+                   ('ProtectSystem', 'weird'), ('ProtectSystem', 'yes'),
+                   ('RestrictAddressFamilies', 'AF_INET'),
+                   ('RestrictAddressFamilies', 'AF_INET AF_INET6'),
+                   ('RestrictAddressFamilies', 'AF_INET AF_INET6 AF_UNIX AF_UNIX'),
+                   ('RestrictAddressFamilies', 'AF_PACKET')]
+        invalid += [(key, 'unknown') for key in self.KNOBS]
+        good = self.mx_profile(c, off)
+        for key, value in invalid:
+            bad = dict(good, **{key: value})
+            with self.subTest(key=key, value=value):
+                self.assertFalse(self.invoke(self.D._matrix_allowed, key, value))
+                with self.assertRaisesRegex(self.D.Unsupported, '^matrix-effective-value:' + key + '$'):
+                    self.invoke(c.validate_matrix, bad, off)
+                # Even equal unknown values must block variable inventory.
+                for left, right in ((good, bad), (bad, good), (bad, dict(bad))):
+                    inventory = self.invoke(c.matrix_inventory, left, right, variable=True)
+                    self.assertIn(key, inventory['matrix_issues'])
+                    row = next(r for r in inventory['properties'] if r['property'] == key)
+                    self.assertFalse(row['known_matrix_values'])
+                    self.assertEqual(row['classification'], 'matrix-unsupported-value')
+
+    def test_matrix_ownership_defaults_private_append_and_safety_values_remain_mandatory(self):
+        for old in (True, False):
+            c = self.controller(old)
+            plan = self.mx_plan(c)
+            good = self.mx_profile(c, plan)
+            changes = dict(Id=MAIN, Transient='no', Description='foreign', FragmentPath=FRAGMENT,
+                           ControlGroup='/system.slice/foreign.service', User='haproxy', Group='haproxy',
+                           SecureBits='1', AmbientCapabilities='CAP_SETUID', UMask='0000',
+                           PrivateNetwork='yes', PrivateUsers='yes', RootImage='/foreign',
+                           SystemCallFilter='@mount', RuntimeMaxUSec='infinity', Restart='always',
+                           TimeoutStartUSec='infinity', TimeoutStopUSec='infinity', TimeoutAbortUSec='infinity',
+                           KillMode='process', SendSIGKILL='no', WatchdogUSec='5s',
+                           StandardOutput='journal', StandardErrorFile='/opt/nathaya/logs/production.log',
+                           CapabilityBoundingSet=' '.join(sorted(c.caps | {'CAP_SYS_ADMIN'})))
+            for key, value in changes.items():
+                with self.subTest(old=old, key=key), self.assertRaises(self.D.Unsupported):
+                    c.validate_matrix(dict(good, **{key: value}), plan)
+            for key in self.KNOBS + ('User', 'Group', 'SystemCallFilter', 'WatchdogUSec'):
+                bad = dict(good)
+                del bad[key]
+                with self.subTest(missing=key), self.assertRaises(self.D.Unsupported):
+                    c.validate_matrix(bad, plan)
+            if old:
+                with self.assertRaises(self.D.Unsupported):
+                    c.validate_matrix(dict(good, CapabilityBoundingSet=' '.join(sorted(CAPS4))), plan)
+
+    def test_matrix_command_aliases_and_all_unused_hook_declarations_fail_closed(self):
+        c = self.controller()
+        plan = self.mx_plan(c)
+        good = self.mx_profile(c, plan)
+        c.validate_matrix(dict(good, ExecStartEx=good['ExecStart']), plan)
+        hooks = self.D.PROBE_EMPTY_EXEC_HOOKS + ('ExecStartPre',)
+        for name in ('ExecStart',) + hooks:
+            for suffix in ('', 'Ex'):
+                key = name + suffix
+                with self.subTest(key=key), self.assertRaises(self.D.Unsupported):
+                    c.validate_matrix(dict(good, **{key: exec_property(['/bin/true'])}), plan)
+        for name in hooks:
+            for suffix in ('', 'Ex'):
+                key = name + suffix
+                absent = dict(good)
+                absent.pop(key, None)
+                c.validate_matrix(absent, plan)
+                for form in (None, ['--property=' + key + '='], ['--property', key + '='],
+                             ['-p', key + '='], ['-p' + key + '=']):
+                    bad = copy.deepcopy(plan)
+                    if form is None:
+                        bad['properties'][key] = ''
+                    else:
+                        i = bad['command'].index('--')
+                        bad['command'][i:i] = form
+                    with self.subTest(key=key, form=form), self.assertRaises(self.D.Unsupported):
+                        c.validate_matrix(good, bad)
+        for key in ('argv', 'command', 'unit', 'phase', 'go', 'output', 'properties'):
+            bad = copy.deepcopy(plan)
+            if key == 'argv':
+                bad[key] = ['/bin/true']
+            elif key == 'command':
+                bad[key].append('--unexpected')
+            elif key == 'properties':
+                bad[key]['RuntimeMaxSec'] = 'infinity'
+            else:
+                bad[key] = 'foreign'
+            with self.subTest(plan_key=key), self.assertRaises(self.D.Unsupported):
+                c.validate_matrix(good, bad)
+
+    def test_inventory_covers_every_property_and_only_present_known_knobs_may_vary(self):
+        c = self.controller()
+        a = self.mx_profile(c, self.mx_plan(c))
+        b = self.mx_profile(c, self.mx_plan(c, self.KNOBS, 1))
+        before = copy.deepcopy((a, b))
+        inventory = c.matrix_inventory(a, b, variable=True)
+        self.assertEqual({r['property'] for r in inventory['properties']}, set(a) | set(b))
+        self.assertEqual(inventory['matrix_issues'], [])
+        self.assertTrue(set(self.KNOBS) <= set(inventory['effective_differences']))
+        self.assertEqual((a, b), before)
+        for key in ('FutureSecurityKnob', 'SystemCallFilter', 'RootImage', 'MemoryMax',
+                    'IPAddressDeny', 'ExecFutureHook', 'NoNewPrivileges'):
+            left = dict(a, **{key: 'required'})
+            right = dict(left, **{key: 'changed'})
+            row = c.matrix_inventory(left, right, variable=True)
+            self.assertIn(key, row['matrix_issues'])
+            for first, second in ((left, {k: v for k, v in left.items() if k != key}),
+                                  ({k: v for k, v in left.items() if k != key}, left)):
+                self.assertIn(key, c.matrix_inventory(first, second, variable=True)['matrix_issues'])
+        aliases = dict(a, PrivateTmp='false', RestrictAddressFamilies='')
+        self.assertEqual(c.matrix_inventory(a, aliases)['matrix_issues'], [])
+
+    def test_matrix_does_not_relax_legacy_production_or_control_gates(self):
+        c = self.controller()
+        for key in self.KNOBS:
+            changed = dict(c.source, **{key: '' if key in ('RestrictAddressFamilies', 'ReadWritePaths') else 'no'})
+            with self.subTest(key=key), self.assertRaises(self.D.Unsupported):
+                self.D.validate_effective(changed, c.fragment)
+        for phase in ('plain', 'trace'):
+            plan = self.plan(c, phase)
+            with self.assertRaises(self.D.Unsupported):
+                c.validate_probe(dict(self.probe(c, plan), NoNewPrivileges='no'), plan)
+        for phase in ('cap-gated', 'cap-direct'):
+            plan = self.D.control_plan(c.directory, c.nonce, c.caps, phase)
+            with self.assertRaises(self.D.Unsupported):
+                c.validate_control(dict(self.probe(c, plan), NoNewPrivileges='no'), plan)
+        matrix = self.mx_plan(c)
+        with self.assertRaises(self.D.Unsupported):
+            c.validate_probe(self.mx_profile(c, matrix), matrix)
+
+    def test_entry_setuid_bit_is_bit_seven_not_cap_kill_and_rejects_anomalies(self):
+        for old, mask in ((True, 0x4c0), (False, 0x4e0)):
+            c = self.controller(old)
+            for missing in (False, True):
+                records = self.mx_records(c, missing=missing)
+                before = copy.deepcopy(records)
+                state = self.D.matrix_entry_state(records, c.caps, '/usr/bin/python3.12')
+                self.assertEqual(state['missing'], missing)
+                self.assertFalse(state['selfexec_capability_changed'])
+                self.assertEqual(state['entry'], state['after_exec'])
+                self.assertIsNot(state['entry'], state['after_exec'])
+                self.assertEqual(state['entry']['CapBnd'], mask)
+                self.assertEqual(state['entry']['CapEff'], mask & ~0x80 if missing else mask)
+                self.assertEqual(bool(state['entry']['CapEff'] & 0x20), not old)
+                self.assertEqual(records, before)
+            records = self.mx_records(c)
+            for stage in (0, 1):
+                for key, value in (('Uid', (0, 1, 0, 0)), ('Gid', (0, 1, 0, 0)),
+                                   ('CapBnd', mask | 1), ('CapInh', 0x80), ('CapAmb', 0x80),
+                                   ('CapEff', mask | 1), ('CapPrm', mask & ~0x80), ('NoNewPrivs', 2)):
+                    bad = copy.deepcopy(records)
+                    bad[stage]['status'][key] = value
+                    with self.subTest(old=old, stage=stage, key=key), self.assertRaisesRegex(
+                            self.D.Unsupported, '^matrix-anomalous-credentials$'):
+                        self.invoke(self.D.matrix_entry_state, bad, c.caps, '/usr/bin/python3.12')
+            for kind in ('tracer', 'exe', 'environment', 'pid', 'sequence', 'duplicate'):
+                bad = copy.deepcopy(records)
+                if kind == 'tracer':
+                    bad[0]['optional_status']['TracerPid'] = 9
+                elif kind == 'exe':
+                    bad[0]['exe'] = '/tmp/python3'
+                elif kind == 'environment':
+                    bad[0]['env_present']['LD_PRELOAD'] = True
+                elif kind == 'pid':
+                    bad[1]['status']['Pid'] += 1
+                elif kind == 'sequence':
+                    bad.reverse()
+                else:
+                    bad.append(copy.deepcopy(bad[-1]))
+                with self.subTest(kind=kind), self.assertRaises(self.D.Unsupported):
+                    self.D.matrix_entry_state(bad, c.caps, '/usr/bin/python3.12')
+
+    def test_entry_only_optional_coverage_and_selfexec_invariants(self):
+        executable = '/usr/bin/python3.12'
+        for old, mask in ((True, 0x4c0), (False, 0x4e0)):
+            c = self.controller(old)
+            for entry_missing in (False, True):
+                for after_missing in (False, True):
+                    for seccomp in (0, 1, 2):
+                        records = self.mx_records(c, missing=entry_missing, nnp=0)
+                        after = mask & ~0x80 if after_missing else mask
+                        records[1]['status'].update(CapEff=after, CapPrm=after)
+                        for record in records:
+                            record['optional_status']['Seccomp'] = seccomp
+                        with self.subTest(old=old, entry=entry_missing, after=after_missing, seccomp=seccomp):
+                            state = self.invoke(self.D.matrix_entry_state, records, c.caps, executable)
+                            self.assertEqual(state['missing'], entry_missing)
+                            self.assertEqual(state['selfexec_capability_changed'], entry_missing != after_missing)
+                            self.assertEqual(state['after_exec']['CapEff'], after)
+                            entry = self.invoke(self.D.matrix_entry_state, records[:1], c.caps,
+                                                executable, entry_only=True)
+                            self.assertEqual(entry['entry'], state['entry'])
+                            self.assertEqual(entry['missing'], entry_missing)
+                            self.assertIsNone(entry['after_exec'])
+                            self.assertIsNone(entry['selfexec_capability_changed'])
+            records = self.mx_records(c)
+            for wrong in ([], records, records[1:], list(reversed(records))):
+                with self.assertRaisesRegex(self.D.Unsupported, '^matrix-record-sequence$'):
+                    self.invoke(self.D.matrix_entry_state, wrong, c.caps, executable, entry_only=True)
+            for stage in (0, 1):
+                for key in ('TracerPid', 'Seccomp'):
+                    bad = copy.deepcopy(records)
+                    del bad[stage]['optional_status'][key]
+                    with self.subTest(old=old, stage=stage, missing=key):
+                        with self.assertRaisesRegex(self.D.Unsupported, '^matrix-status-coverage$'):
+                            self.invoke(self.D.matrix_entry_state, bad, c.caps, executable)
+                        if stage == 0:
+                            with self.assertRaisesRegex(self.D.Unsupported, '^matrix-status-coverage$'):
+                                self.invoke(self.D.matrix_entry_state, bad[:1], c.caps,
+                                            executable, entry_only=True)
+                for key, value in (('TracerPid', 9), ('Seccomp', 3)):
+                    bad = copy.deepcopy(records)
+                    bad[stage]['optional_status'][key] = value
+                    with self.assertRaisesRegex(self.D.Unsupported, '^matrix-anomalous-credentials$'):
+                        self.invoke(self.D.matrix_entry_state, bad, c.caps, executable)
+            for key, value in (('Pid', 202), ('PPid', 2), ('Groups', (0, 1)), ('NoNewPrivs', 0)):
+                bad = copy.deepcopy(records)
+                bad[1]['status'][key] = value
+                with self.subTest(old=old, transition=key), self.assertRaisesRegex(
+                        self.D.Unsupported, '^matrix-selfexec-unstable$'):
+                    self.invoke(self.D.matrix_entry_state, bad, c.caps, executable)
+            bad = copy.deepcopy(records)
+            bad[1]['optional_status']['Seccomp'] = 1
+            with self.assertRaisesRegex(self.D.Unsupported, '^matrix-selfexec-unstable$'):
+                self.invoke(self.D.matrix_entry_state, bad, c.caps, executable)
+
+    def test_selfexec_after_status_is_recorded_not_assumed_identical_to_entry(self):
+        c = self.controller()
+        records = self.mx_records(c, missing=True, nnp=0)
+        records[1]['status'].update(CapEff=0x4e0, CapPrm=0x4e0)
+        original = copy.deepcopy(records)
+        # A valid later recovery is evidence, not an unstable ENTRY. This
+        # regression intentionally requires distinct before/after observations.
+        state = self.D.matrix_entry_state(records, c.caps, '/usr/bin/python3.12')
+        self.assertTrue(state['missing'])
+        self.assertTrue(state['selfexec_capability_changed'])
+        self.assertEqual(state['entry']['NoNewPrivs'], 0)
+        self.assertEqual(state['entry']['CapEff'], 0x460)
+        self.assertEqual(state['after_exec']['CapEff'], 0x4e0)
+        self.assertEqual(records, original)
+        # The full attempt must retain both observations too, even if the unit
+        # has already vanished by the final show read.
+        _, _, records, patchers = self.attempt_fixture(c, missing=True)
+        records[1]['status'].update(CapEff=0x4e0, CapPrm=0x4e0)
+        result = self.invoke(c.matrix_attempt, (), patchers=patchers)
+        self.assertTrue(result['state']['missing'])
+        self.assertTrue(result['state']['selfexec_capability_changed'])
+        self.assertTrue(result['actual_NNP_off'])
+        self.assertEqual(result['state']['after_exec']['CapEff'], 0x4e0)
+        saved = {call.args[0]: call.args[1] for call in c.record.call_args_list}
+        self.assertEqual(saved['mx00/boundaries.json'], records)
+
+    def test_attempt_requested_nnp_no_show_yes_proc_one_is_not_actual_off(self):
+        c = self.controller(True)
+        plan, profile, records, patchers = self.attempt_fixture(c, missing=True, forced_nnp=True)
+        release_evidence = []
+
+        def save(name, content):
+            if name.endswith('/control-go'):
+                release_evidence.append(dict(
+                    records=[call.args[0] for call in c.record.call_args_list],
+                    source=[call.args[1] for call in c.matrix_source.call_args_list],
+                    python=[call.args[1] for call in c.matrix_python.call_args_list]))
+            return c.directory / name
+
+        c.save.side_effect = save
+        result = self.invoke(c.matrix_attempt, (), patchers=patchers)
+        layer = result['layers']['NoNewPrivileges']
+        self.assertEqual((layer['requested'], layer['show'], layer['proc_entry'], layer['proc_after_exec']),
+                         ('no', 'yes', 1, 1))
+        self.assertFalse(layer['request_matches_show'])
+        self.assertTrue(layer['show_matches_proc'])
+        self.assertTrue(layer['forced_or_inherited'])
+        self.assertFalse(result['actual_NNP_off'])
+        self.assertIn('NoNewPrivileges', result['unexpected_requested_values'])
+        self.assertEqual(result['state']['entry']['CapEff'], 0x440)
+        self.assertEqual(result['state']['entry']['CapBnd'], 0x4c0)
+        self.assertEqual(c.matrix_source.call_args_list[0].args[0]['phase'], plan['phase'])
+        self.assertEqual([call.args[1] for call in c.matrix_source.call_args_list], ['source-before', 'source-release'])
+        self.assertEqual([call.args[1] for call in c.matrix_python.call_args_list], ['before', 'release', 'after'])
+        self.assertEqual(len(release_evidence), 1)
+        self.assertEqual(release_evidence[0]['source'], ['source-before', 'source-release'])
+        self.assertEqual(release_evidence[0]['python'], ['before', 'release'])
+        for name in ('entry.json', 'entry.show.json', 'source-comparison.json',
+                     'release.show.json', 'release-comparison.json'):
+            self.assertIn('mx00/' + name, release_evidence[0]['records'])
+        c.command.assert_called_once_with(plan['command'])
+        c.cleanup_one.assert_called_once_with(plan['unit'])
+        c.reserve.assert_not_called()
+        self.assertEqual(c.intents, [])
+        self.assertEqual(c.matrix_report['attempts'][0]['status'], 'recorded')
+        evidence = {call.args[0]: call.args[1] for call in c.record.call_args_list}
+        self.assertEqual(evidence['mx00/boundaries.json'], records)
+        self.assertEqual(evidence['mx00/after.show.json'], {'LoadState': 'not-found'})
+        self.assertEqual(evidence['mx00/result.json']['profile'], profile)
+
+    def test_attempt_entry_refusals_precede_show_and_nnp_consistency_precedes_go(self):
+        # Core/coverage refusals must not even ask for the helper profile, let
+        # alone release control-go. All host overrides are invocation-local.
+        cases = [('Uid', (0, 1, 0, 0)), ('CapBnd', 0), ('CapEff', 0),
+                 ('CapInh', 0x80), ('CapAmb', 0x80), ('NoNewPrivs', 2),
+                 ('exe', '/tmp/python3'), ('environment', True),
+                 ('TracerPid', None), ('Seccomp', None)]
+        for key, value in cases:
+            c = self.controller()
+            plan, _, records, patchers = self.attempt_fixture(c)
+            if key in ('TracerPid', 'Seccomp'):
+                del records[0]['optional_status'][key]
+                label = 'matrix-status-coverage'
+            elif key == 'exe':
+                records[0]['exe'] = value
+                label = 'matrix-anomalous-credentials'
+            elif key == 'environment':
+                records[0]['env_present']['PYTHONPATH'] = value
+                label = 'matrix-environment-confounded'
+            else:
+                records[0]['status'][key] = value
+                label = 'matrix-anomalous-credentials'
+            with self.subTest(entry=key), self.assertRaisesRegex(self.D.Unsupported, '^' + label + '$'):
+                self.invoke(c.matrix_attempt, (), patchers=patchers)
+            c.show.assert_called_once_with(plan['unit'], absent=True)
+            c.read_boundaries.assert_called_once()
+            self.assertEqual([call.args[1] for call in c.matrix_python.call_args_list], ['before'])
+            evidence = {call.args[0]: call.args[1] for call in c.record.call_args_list}
+            self.assertEqual(evidence['mx00/entry.json'], records[:1])
+            self.assertNotIn('mx00/entry.show.json', evidence)
+            self.assertNotIn('mx00/control-go', [call.args[0] for call in c.save.call_args_list])
+            c.cleanup_one.assert_not_called()
+        for spelling in ('yes', 'true'):
+            c = self.controller()
+            plan, profile, records, patchers = self.attempt_fixture(c, show_nnp=spelling, proc_nnp=0)
+            with self.subTest(show=spelling), self.assertRaisesRegex(
+                    self.D.Unsupported, '^matrix-NNP-inconsistent$'):
+                self.invoke(c.matrix_attempt, (), patchers=patchers)
+            # Refusal retains the private root process and show evidence, not
+            # just a classification with its contradictory inputs discarded.
+            evidence = {call.args[0]: call.args[1] for call in c.record.call_args_list}
+            self.assertEqual(evidence['mx00/entry.json'], records[:1])
+            self.assertEqual(evidence['mx00/entry.show.json'], profile)
+            self.assertEqual(profile['User'], 'root')
+            self.assertEqual(records[0]['status']['Uid'], (0,) * 4)
+            self.assertEqual(c.show.call_count, 2)
+            c.read_boundaries.assert_called_once()
+            self.assertNotIn('mx00/control-go', [call.args[0] for call in c.save.call_args_list])
+            self.assertNotIn('mx00/release.show.json', evidence)
+            c.cleanup_one.assert_not_called()
+        for spelling, proc_nnp in (('false', 0), ('true', 1)):
+            c = self.controller()
+            _, _, _, patchers = self.attempt_fixture(c, show_nnp=spelling, proc_nnp=proc_nnp)
+            result = self.invoke(c.matrix_attempt, (), patchers=patchers)
+            with self.subTest(normalized_show=spelling):
+                self.assertEqual(result['actual_NNP_off'], proc_nnp == 0)
+                self.assertTrue(result['layers']['NoNewPrivileges']['show_matches_proc'])
+                self.assertEqual(result['layers']['NoNewPrivileges']['forced_or_inherited'], proc_nnp == 1)
+
+    def test_attempt_source_python_logs_inventory_and_live_validation_precede_release(self):
+        for failure in ('source', 'python', 'sequence', 'environment', 'credentials',
+                        'logging', 'unknown', 'live', 'pid'):
+            c = self.controller()
+            plan, profile, records, patchers = self.attempt_fixture(c)
+            if failure == 'source':
+                c.matrix_source.side_effect = self.D.Unsupported('fixture-source')
+            elif failure == 'python':
+                c.matrix_python.side_effect = self.D.Unsupported('fixture-python')
+            elif failure == 'sequence':
+                c.read_boundaries.side_effect = [records]
+            elif failure == 'environment':
+                records[0]['env_present']['PYTHONPATH'] = True
+            elif failure == 'credentials':
+                records[0]['status']['Uid'] = (0, 1, 0, 0)
+            elif failure in ('logging', 'unknown'):
+                profile['StandardOutputFile' if failure == 'logging' else 'FutureSecurityKnob'] = 'foreign'
+            elif failure == 'live':
+                c.show.side_effect = [{'LoadState': 'not-found'}, profile, dict(profile, SystemCallFilter='@mount')]
+            else:
+                profile['MainPID'] = '202'
+                c.show.side_effect = [{'LoadState': 'not-found'}, profile, dict(profile)]
+            with self.subTest(failure=failure), self.assertRaises(self.D.Unsupported):
+                self.invoke(c.matrix_attempt, (), patchers=patchers)
+            self.assertNotIn('mx00/control-go', [call.args[0] for call in c.save.call_args_list])
+            self.assertEqual(len(c.matrix_report['attempts']), 1)
+            self.assertEqual(c.matrix_report['attempts'][0]['status'], 'unavailable')
+            c.cleanup_one.assert_not_called()
+
+    def test_source_and_python_revalidation_do_not_invent_unchanged_evidence(self):
+        c = self.controller()
+        plan = self.mx_plan(c)
+        c._audit_fragment = Mock(return_value=(c.source_bytes, c.fragment, []))
+        c._audit_show = Mock(return_value=c.source)
+        self.assertEqual(self.invoke(c.matrix_source, plan, 'before', patchers=(
+            patch.object(self.D, '_no_lock'),)), c.source)
+        for kind in ('bytes', 'security', 'missing'):
+            c._audit_fragment.return_value = (c.source_bytes + (b'\n' if kind == 'bytes' else b''), c.fragment, [])
+            c._audit_show.return_value = (None if kind == 'missing' else
+                                         dict(c.source, NoNewPrivileges='no') if kind == 'security' else c.source)
+            with self.subTest(kind=kind), self.assertRaises(self.D.Unsupported):
+                self.invoke(c.matrix_source, plan, kind, patchers=(patch.object(self.D, '_no_lock'),))
+        c.matrix_python_initial = self.python_metadata()
+        self.assertEqual(self.invoke(c.matrix_python, plan, 'before', patchers=(
+            patch.object(self.D, 'executable_metadata', return_value=self.python_metadata()),)), self.python_metadata())
+        for changed in ({'available': False}, dict(self.python_metadata(), inode=99),
+                        dict(self.python_metadata(), filecap={'available': False, 'present': None})):
+            with self.assertRaisesRegex(self.D.Unsupported, 'matrix-python-changed'):
+                self.invoke(c.matrix_python, plan, 'changed', patchers=(
+                    patch.object(self.D, 'executable_metadata', return_value=changed),))
+
+    def test_initial_python_filecap_must_be_known_absent_before_any_attempt(self):
+        for metadata in ({'available': False}, dict(self.python_metadata(), filecap={}),
+                         dict(self.python_metadata(), filecap={'available': False, 'present': None}),
+                         dict(self.python_metadata(), filecap={'available': True, 'present': True})):
+            c = self.controller()
+            c.matrix_attempt = Mock()
+            with self.assertRaisesRegex(self.D.Unsupported, 'matrix-python-filecap-unavailable-or-present'):
+                self.invoke(c.run_matrix, patchers=(
+                    patch.object(self.D, 'executable_metadata', return_value=metadata),))
+            c.matrix_attempt.assert_not_called()
+            self.assertEqual(c.matrix_report['attempts'], [])
+        # Actual ENODATA versus EPERM handling is covered by the real metadata
+        # API test above; an unknown result is never replaced with this fixture.
+
+    def test_failed_creation_consumes_all_twenty_eight_slots_and_cleanup_failure_stops(self):
+        c = self.controller()
+        _, _, _, patchers = self.attempt_fixture(c)
+        c.show.side_effect = None
+        c.show.return_value = {'LoadState': 'not-found'}
+        c.command.return_value = (1, b'', b'')
+        for index in range(28):
+            with self.assertRaisesRegex(self.D.Unsupported, 'transient-create-unavailable'):
+                self.invoke(c.matrix_attempt, (), patchers=patchers)
+            self.assertEqual(len(c.matrix_report['attempts']), index + 1)
+        with self.assertRaisesRegex(self.D.Unsupported, 'matrix-attempt-limit'):
+            c.matrix_attempt(())
+        self.assertEqual(c.command.call_count, 28)
+        self.assertEqual(len(set(c.intents)), 28)
+        self.assertTrue(all(row['status'] == 'unavailable' for row in c.matrix_report['attempts']))
+        c = self.controller()
+        _, _, _, patchers = self.attempt_fixture(c, clean=False)
+        with self.assertRaisesRegex(self.D.Unsupported, 'cleanup-unconfirmed'):
+            self.invoke(c.run_matrix, patchers=patchers + (
+                patch.object(self.D, 'executable_metadata', return_value=self.python_metadata()),))
+        self.assertFalse(c.cleanup_confirmed)
+        self.assertEqual(len(c.matrix_report['attempts']), 1)
+        self.assertEqual(c.command.call_count, 1, 'No production attempt after unconfirmed cleanup')
+        self.assertEqual(len(c.intents), 1)
+
+    def test_scheduler_minimal_already_missing_confirms_and_stops_after_three(self):
+        c, requests, patchers = self.schedule(lambda enabled: True)
+        self.assertEqual(self.invoke(c.run_matrix, patchers=patchers), 0)
+        self.assertEqual(requests, [frozenset(), frozenset(self.KNOBS), frozenset()])
+        self.assertEqual(c.matrix_report['status'], 'confirmed-zero-optional-settings')
+        self.assertEqual(c.matrix_report['minimum_tested_requested_profile'], [])
+        self.assertTrue(any('after Python initialization' in s for s in c.matrix_report['limits']))
+        self.assertTrue(any('not a global minimum' in s for s in c.matrix_report['limits']))
+
+    def test_scheduler_nnp_single_repeats_reference_candidate_then_minus_nnp_supplement(self):
+        nnp = self.KNOBS[0]
+        c, requests, patchers = self.schedule(lambda enabled: nnp in enabled)
+        self.assertEqual(self.invoke(c.run_matrix, patchers=patchers), 0)
+        self.assertEqual(requests, [frozenset(), frozenset(self.KNOBS), frozenset((nnp,)),
+                                    frozenset(), frozenset((nnp,)), frozenset(self.KNOBS[1:])])
+        self.assertEqual(c.matrix_report['minimum_tested_requested_profile'], [nnp])
+        self.assertFalse(c.matrix_report['interaction']['production_fix_claimed'])
+        self.assertFalse(c.matrix_report['interaction']['missing'])
+        self.assertEqual(c.matrix_report['status'], 'confirmed-tested-requested-profile')
+
+    def test_scheduler_non_nnp_single_gets_only_nnp_interaction_supplement(self):
+        nnp, knob = self.KNOBS[:2]
+        c, requests, patchers = self.schedule(lambda enabled: knob in enabled)
+        self.assertEqual(self.invoke(c.run_matrix, patchers=patchers), 0)
+        self.assertEqual(requests, [frozenset(), frozenset(self.KNOBS), frozenset((nnp,)),
+                                    frozenset((knob,)), frozenset(), frozenset((knob,)),
+                                    frozenset((nnp, knob))])
+        self.assertEqual(c.matrix_report['minimum_tested_requested_profile'], [knob])
+        self.assertTrue(c.matrix_report['interaction']['missing'])
+        self.assertFalse(c.matrix_report['interaction']['production_fix_claimed'])
+
+    def test_scheduler_nnp_pair_requires_both_healthy_components_and_repeats_pair(self):
+        pair = frozenset(self.KNOBS[:2])
+        c, requests, patchers = self.schedule(lambda enabled: pair <= enabled)
+        self.assertEqual(self.invoke(c.run_matrix, patchers=patchers), 0)
+        self.assertEqual(requests[:2], [frozenset(), frozenset(self.KNOBS)])
+        self.assertEqual(requests[2:13], [frozenset((k,)) for k in self.KNOBS])
+        self.assertEqual(requests[13:], [pair, frozenset((self.KNOBS[1],)), pair])
+        self.assertEqual(c.matrix_report['minimum_tested_requested_profile'], sorted(pair))
+        self.assertEqual(len(c.matrix_report['interaction']['healthy_components']), 2)
+        edges = [call.args[1] for call in c.record.call_args_list if '/against-' in call.args[0]]
+        self.assertTrue(all(len(edge['request_delta']) <= 1 for edge in edges))
+        self.assertEqual(sum(edge['observation'] == 'mx13' for edge in edges), 2)
+
+    def test_scheduler_none_found_has_only_twenty_three_directed_explorations(self):
+        c, requests, patchers = self.schedule(lambda enabled: len(enabled) == 11)
+        self.assertEqual(self.invoke(c.run_matrix, patchers=patchers), 2)
+        expected = [frozenset(), frozenset(self.KNOBS)] + [frozenset((k,)) for k in self.KNOBS]
+        expected += [frozenset((self.KNOBS[0], k)) for k in self.KNOBS[1:]]
+        self.assertEqual(requests, expected)
+        self.assertEqual(len(requests), 23)
+        self.assertLessEqual(len(requests), c.matrix_report['attempt_limit'])
+        self.assertEqual(c.matrix_report['status'], 'higher-order-unresolved')
+        self.assertIsNone(c.matrix_report['minimum_tested_requested_profile'])
+        c, requests, patchers = self.schedule(lambda enabled: False)
+        self.assertEqual(self.invoke(c.run_matrix, patchers=patchers), 2)
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(c.matrix_report['status'], 'not-reproduced-inconclusive')
+
+    def test_scheduler_unstable_repeat_aborts_before_candidate_or_supplement_continuation(self):
+        c, requests, patchers = self.schedule(lambda enabled: self.KNOBS[0] in enabled, unstable=True)
+        with self.assertRaisesRegex(self.D.Unsupported, 'matrix-repeat-unstable'):
+            self.invoke(c.run_matrix, patchers=patchers)
+        self.assertEqual(len(requests), 4)
+        self.assertNotIn('interaction', c.matrix_report)
+        # Repetition also rejects a full-inventory change with unchanged masks.
+        a = c.matrix_attempt(self.KNOBS[:1])
+        b = copy.deepcopy(a)
+        b['profile']['FutureSecurityKnob'] = 'changed'
+        with self.assertRaises(self.D.Unsupported):
+            c.matrix_edge(a, b, repeat=True)
+        b = copy.deepcopy(a)
+        b['enabled'] = list(self.KNOBS[1:3])
+        with self.assertRaisesRegex(self.D.Unsupported, 'matrix-request-delta'):
+            c.matrix_edge(a, b)
+
+    def test_main_matrix_dispatch_has_no_application_trace_controls_or_reservations(self):
+        for clean in (True, False):
+            c = self.controller()
+            c.prepare = Mock()
+            c.matrix_report = {'status': 'confirmed-zero-optional-settings', 'attempts': []}
+            c.run_matrix = Mock(return_value=0)
+            c.cleanup = Mock(return_value=clean)
+            c.run_phase, c.run_controls, c.reserve, c.command = Mock(), Mock(), Mock(), Mock()
+            c.boundary_report = Mock()
+            rc, out, err = self.main_with(c, ['--cap-matrix'])
+            self.assertEqual(rc, 0 if clean else 2)
+            self.assertEqual(err, '')
+            c.prepare.assert_called_once_with(cap_boundaries=True)
+            c.run_matrix.assert_called_once_with()
+            c.cleanup.assert_called_once_with()
+            for operation in (c.run_phase, c.run_controls, c.reserve, c.command, c.boundary_report):
+                operation.assert_not_called()
+            report = next(call.args[1] for call in c.record.call_args_list if call.args[0] == 'matrix.report.json')
+            self.assertEqual(report['cleanup_confirmed'], clean)
+            self.assertEqual(report['attempt_count'], 0)
+            self.assertNotIn('plain startup:', out)
+            self.assertNotIn('trace startup:', out)
+            self.assertNotIn('control gated/direct:', out)
 
 
 class HostBoundaryRegressions(unittest.TestCase):

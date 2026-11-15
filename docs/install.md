@@ -131,7 +131,7 @@ Sesudah restriction penyebab benar-benar terbukti dan perbaikannya direview, mas
 
 ### Bukti capability terbaru dan kontrol opsional `--cap-boundaries`
 
-**Bukti runtime dari pengguna, bukan fixture:** worker mencatat `setgid(112) = 0` lalu `setuid(109) = -1 EPERM`. Snapshot gate Python, strace dan HAProxy menunjukkan `CapEff=CapPrm=0x440`, `CapBnd=0x4c0`, `NoNewPrivs=1`. Jadi bit `CAP_SETUID=0x80` sudah tidak ada di E/P **sebelum HAProxy**, bukan kehilangan yang unik pada kode HAProxy. Bounding masih memuat bit itu tetapi **batas bukan grant**. Titik kehilangan paling awal dan penyebabnya tetap UNKNOWN; ini bukan bukti perbaikan produksi atau keberhasilan core/full.
+**Laporan runtime sebelumnya dari pengguna, bukan fixture** (kontrol terbaru dirinci pada bagian matriks di bawah): worker mencatat `setgid(112) = 0` lalu `setuid(109) = -1 EPERM`. Snapshot gate Python, strace dan HAProxy menunjukkan `CapEff=CapPrm=0x440`, `CapBnd=0x4c0`, `NoNewPrivs=1`. Jadi bit `CAP_SETUID=0x80` sudah tidak ada di E/P **sebelum HAProxy**, bukan kehilangan yang unik pada kode HAProxy. Bounding masih memuat bit itu tetapi **batas bukan grant**. Titik kehilangan paling awal dan penyebabnya tetap UNKNOWN; ini bukan bukti perbaikan produksi atau keberhasilan core/full.
 
 `prctl(0x17, ...)` adalah `PR_CAPBSET_READ`, query bounding set, bukan mutasi capability. Whitelist literal trace sudah mencakup `capset`; `trace/selector.json` kini mencatat selector aktual dan jumlah kemunculannya, sementara `trace/sanitised.json` memuat `capset_records`. Angka itu hanya jumlah record lengkap yang dikenali dari **combined output**, bukan autentikasi/coverage proof. Tidak terlihat dalam cuplikan, atau hitungan nol, tidak membuktikan tidak pernah terjadi. Strace baru mulai **sesudah PID 1 menyiapkan kredensial unit**; bahkan trace lengkap tidak dapat membuktikan tidak ada perubahan capability sebelumnya.
 
@@ -153,7 +153,72 @@ Artefak baru: `boundaries.initial.json`, `boundaries.executables.json`, `boundar
 
 Kontrol mempertahankan `RuntimeMaxSec=8s`, start timeout **5s**, stop/abort **2s**, Restart=no dan cleanup berbatas berbasis ownership nonce/cgroup; tidak kill PID lepas atau menyentuh layanan utama. Artefak **dipertahankan**, bukan dihapus cleanup; `/run` volatil, simpan salinan privat sebelum reboot. Exit 0 mode ini hanya berarti kedua urutan kontrol tercatat dan cleanup terkonfirmasi, **bukan HAProxy sehat atau UID fixed**; unavailable/refusal/cleanup tak terkonfirmasi exit 2, argumen salah 64, interupsi 130.
 
-Akar masalah dan production fix tetap belum terbukti. Jangan menjadikan NNP opsional, menambah capability, melonggarkan hardening atau mempertahankan worker root untuk memaksa sukses. Tes baru hanya fixture/mock statis; menurut laporan agen tes kini ada **111 metode (20 baru)**, belum dijalankan pada revisi ini. Review read-only dan 22 kontrak tekstual file-tools/JavaScript selesai; itu bukan syntax check atau eksekusi unittest. Tidak ada klaim PASS, startup/reload VPS atau full-scope success.
+Akar masalah dan production fix tetap belum terbukti. Jangan menjadikan NNP/gate produksi opsional, menambah capability, melonggarkan hardening produksi atau mempertahankan worker root untuk memaksa sukses. Variasi restriction hanya di fixed Python unit `--cap-matrix` yang terpisah di bawah. Angka **111 metode (20 baru)** dan **22 kontrak tekstual** adalah catatan historis checkpoint 15, bukan validasi revisi matriks; baseline checkpoint 16 **117 metode** juga hitungan statis, bukan PASS. Jumlah fixture final dan review/hasil revisi baru menunggu parent. Tidak ada klaim PASS, startup/reload VPS atau full-scope success.
+
+### Matriks request terbatas `--cap-matrix` — Python saja, staging opsional
+
+**Laporan runtime pengguna terbaru, bukan hasil fixture/agen:** kontrol `cap-gated` dan `cap-direct` sama-sama menunjukkan `CapBnd=0x4c0`, `CapEff=CapPrm=0x440`, seluruh UID/GID real/effective/saved/fs root, `NoNewPrivs=1`, `Seccomp=2` dan `TracerPid=0`. Tidak teramati injection pada nama environment yang diperiksa atau file capability; keadaan entry/self-exec stabil. Jadi kehilangan bit SETUID E/P dapat direproduksi **tanpa HAProxy, tracing atau gate**. Ini mempersempit observasi, **belum membuktikan restriction tertentu sebagai penyebab**. Entry kedua kontrol tetap sesudah inisialisasi Python; tidak ada operasi UID/GID, dan ini bukan observasi sebelum exec Python.
+
+Mode baru adalah eksperimen request terbatas, bukan installer, production gate atau perbaikan. **Operator root saja, dari akar checkout tepercaya yang sama, pada VPS staging Ubuntu 24.04 x86_64/amd64 dengan systemd PID 1**, sesudah review source dan hasil fixture aktual. Jangan jalankan di Acode/Android/Termux/proot. Contoh berikut petunjuk operator, bukan command yang dijalankan agen:
+
+```sh
+# HANYA operator root pada staging tersebut, dari akar checkout yang sama:
+bash tools/diagnose-haproxy.sh --cap-matrix
+```
+
+#### Ruang eksperimen dan invariants
+
+- Payload selalu helper Python tetap `/usr/bin/python3 -I -B`: `control-entry`, tunggu release berbatas, satu self-exec tetap, `after-exec`. Tidak ada listener/reservasi endpoint, HAProxy (termasuk `-vv`), strace, operasi akun atau perubahan unit produksi/PID 1. File renderer, rendered unit dan konfigurasi produksi **tidak diubah**.
+- `matrix_plan(directory, nonce, caps, index, enabled_knob_names)` menghasilkan plan/argv/properties tetap; `matrix_entry_state(records, caps, executable, entry_only=True)` memvalidasi entry sebelum release; pemanggilan default memvalidasi kedua tahap. `Controller.validate_matrix` terpisah dari validator lama. Hanya CLI `--cap-matrix` dengan fixed Python unit boleh meminta variasi restriction ini; gate produksi `--run` dan kontrol lama tidak dijadikan opsional atau dilonggarkan.
+- Semua attempt tetap `User=root`/`Group=root`, `UMask=0077`, append stdout/stderr ke FD/log privat, bounding **persis sumber tiga/empat capability** (0x4c0/0x4e0), tanpa tambahan capability, ambient kosong. `SecureBits=0` wajib diverifikasi sebagai effective default, **bukan** mengarang request transient nol. Runtime 8s, start 5s, stop/abort 2s, `Restart=no`, watchdog disabled serta cleanup nonce/ownership/cgroup tetap.
+- Source fragment/effective profile diaudit sebelum setiap attempt dan sebelum release terhadap baseline; perubahan source ditolak, bukan disalin sebagai baseline baru. Metadata Python actual-resolved melalui path root-owned tepercaya dibandingkan sebelum/release/sesudah. Filecap Python wajib **terbukti absent**, bukan unavailable; metadata berubah, filecap present/tak terbaca atau repeat tidak stabil menolak eksperimen. P/E boleh berubah saat self-exec dan direkam sebagai `selfexec_capability_changed`; identitas/PID/PPid, bounding, credential lain dan metadata tetap wajib konsisten. Penentuan missing memakai **control-entry**, bukan after-exec. Jangan memodifikasi binary/xattr atau memakai `setcap` untuk melewati guard.
+
+Ada tepat **11 knob**, dalam urutan berikut. Semua yang tidak dipilih diberi request **OFF eksplisit**, bukan dibiarkan memakai default. Minimal berarti nol knob opsional yang diminta ON dengan invariants di atas; **bukan profil produksi lengkap dikurangi NNP**.
+
+| Knob (urutan pengujian) | Request OFF | Request ON |
+| --- | --- | --- |
+| NoNewPrivileges | no | yes |
+| PrivateTmp | no | yes |
+| ProtectSystem | no | strict |
+| ProtectHome | no | yes |
+| ProtectKernelTunables | no | yes |
+| ProtectKernelModules | no | yes |
+| ProtectControlGroups | no | yes |
+| RestrictSUIDSGID | no | yes |
+| LockPersonality | no | yes |
+| RestrictAddressFamilies | string kosong | AF_INET AF_INET6 AF_UNIX |
+| ReadWritePaths | string kosong | /opt/nathaya/logs |
+
+Label production dalam matriks berarti seluruh sebelas request ON pada **helper Python**, bukan menjalankan HAProxy/unit produksi. Variasi hardening hanya pada transient unit eksperimen ini.
+
+#### Urutan terarah, konfirmasi dan STOP
+
+1. Jalankan minimal lalu production-request. Jika minimal sudah missing SETUID E/P, **ulang minimal lalu STOP**: hasil stabil hanya `confirmed-zero-optional-settings`, bukan menyalahkan restriction. Repeat gagal/tidak stabil tetap inconclusive. Jika production-request tidak mereproduksi kehilangan, STOP `not-reproduced-inconclusive`.
+2. Bila minimal sehat dan production-request missing, uji **NoNewPrivileges sendiri dahulu**, kemudian tiap knob lain sendiri hanya bila diperlukan. Berhenti pada kandidat missing pertama; tidak mencoba arbitrary subsets.
+3. Hanya bila tidak ada single culprit, uji pasangan **NNP + satu knob lain**. Kedua komponen tunggal harus sudah sehat; bandingkan pasangan terhadap masing-masing komponen. Tidak ada pasangan lain, powerset, rekursi atau pencarian orde lebih tinggi. Bila tidak ditemukan kandidat, STOP `higher-order-unresolved`/exit 2, bukan menyatakan semua restriction aman.
+4. Untuk kandidat satu/dua knob, **ulang kedua sisi** perbandingan (reference sehat dan kandidat missing), cek kestabilan runtime dan effective snapshots. Kegagalan repeat bukan confirmed finding.
+5. Supplement kondisional hanya untuk kandidat single: jika NNP sendiri kandidat, uji production-minus-NNP; jika single X kandidat, uji X+NNP. Untuk kandidat pasangan, simpan bukti kedua komponen sehat. Ini pemeriksaan interaksi NNP terbatas, bukan membuktikan actual NNP off atau memberi rekomendasi produksi. Setelah konfirmasi/supplement yang diperlukan, STOP.
+
+Batas keras **28 attempt pembuatan** dengan suffix `mx00`–`mx27`, termasuk pembuatan gagal. Jalur terarah maksimal **23 eksplorasi + dua repeat + satu supplement**; sisa headroom tidak mengizinkan perluasan pencarian. Cleanup unit milik nonce harus terkonfirmasi **sebelum attempt berikutnya**; bila tak terkonfirmasi, STOP tanpa membuat unit baru, pertahankan bukti dan periksa secara privat. Tidak kill PID lepas atau menyentuh unit produksi.
+
+#### Request bukan keadaan kernel: cara membaca hasil
+
+Pisahkan tiga lapisan: **requested properties**, seluruh effective properties dari `systemctl show --all`, dan **actual `NoNewPrivs`/`Seccomp` serta capability/credential `/proc`** pada entry dan sesudah self-exec. `NoNewPrivileges=no` hanya request; bahkan root tidak dapat menghapus NNP yang sudah diwarisi. Jangan menyebut NNP off hanya dari request atau show: baca `layers`, `forced_or_inherited`, `actual_NNP_off` dan kedua snapshot proses. Seccomp=2 sendiri tidak mengidentifikasi filter atau syscall yang ditolak.
+
+Perbandingan menyimpan inventory raw semua properti yang disuplai, expected/request versus applied/show, presence/mismatch dan `effective_differences`; `unexpected_requested_values` bukan dihapus agar terlihat cocok. Baca perubahan efektif turunan (termasuk NNP/Seccomp runtime) bersama request delta: **satu knob request dapat menghasilkan beberapa perubahan efektif**, bukan bukti satu mekanisme kernel. Audit terbatas pada snapshot/input aktual. Field runtime/intended yang tersimpan sebagai ignored tetap evidence, bukan pembuktian ekuivalensi; unknown/missing tidak boleh diasumsikan aman. Validator hanya menerima domain OFF/ON tetap dan applied value sesuai request, kecuali request NNP=no dapat menjadi show=yes. Mismatch lain atau nilai di luar domain ditolak sebelum release. TracerPid/Seccomp harus tersedia, entry divalidasi sebelum release, dan show NNP=yes dengan proc=0 ditolak. Unknown non-knob differences juga menghentikan eksperimen; fixture yang menyalin baseline sintetis belum membuktikan semua default/metadata VPS kompatibel. Jangan mengklaim audit seluruh perilaku kernel selesai.
+
+`minimum_tested_requested_profile` hanya profil **minimum TESTED REQUESTED** dengan nol/satu/dua setting opsional yang teramati, bukan global minimum, set restriction efektif minimal atau root cause. Nol berarti kehilangan sudah pada minimal; satu/dua berarti kandidat dalam pencarian terarah dan repeat ini. Higher-order tetap unresolved bila jalur terbatas tidak menemukan kandidat. Tidak ada production fix sebelum repeat VPS membedakan kedua sisi.
+
+Menurut dokumentasi kernel [no_new_privs](https://docs.kernel.org/userspace-api/no_new_privs.html), NNP diwariskan melalui fork/clone/exec dan tidak dapat di-unset; ia membatasi privilege baru lewat exec (set-ID/filecap), **tidak dengan sendirinya melarang privileged `setuid(2)`** atau perubahan credential non-exec yang memang diizinkan. Jadi NNP=1 tidak membuktikan penyebab EPERM ini. Halaman referensi kernel dibaca penuh sebagai riset web read-only pada tugas ini. Tidak ada klaim versi upstream systemd tertentu sebagai akar masalah atau jalur exec-invoke telah terbukti.
+
+#### Artefak, exit dan status validasi
+
+- Run privat yang sama menyimpan `matrix.report.json` dan `matrix.python.initial.json`, ditambah `boundaries.initial.json`, `boundaries.executables.json`, `production.show`, `production.fragment` dan `source-audit.json` dari preflight.
+- Per-attempt `mxNN/`: `request.json`, `intent.json` bila creation diminta, `source-before/source-release.fragment`, `*.show.json`/`*.audit.json` source, `before/release/after.python.json`, `entry.json`, `entry/release/after.show.json` bila tersedia, `source-comparison.json`, `release-comparison.json`, `after-comparison.json` bila relevan, `boundaries.json` dan `result.json` (state/layers/requested values). Perbandingan sisi/repeat disimpan sebagai `against-mxNN.json`; `combined.log` tetap privat. Attempt yang ditolak dapat memiliki bukti parsial saja, bukan hasil sukses yang dikarang.
+- File root:root **0600**, direktori run/attempt **0700**, evidence dipertahankan oleh cleanup; `/run` volatil. Console metadata/status saja; jangan menyalin raw logs, secret, nilai environment atau path runtime privat ke chat. Environment hanya presence nama terpilih, bukan seluruh environment atau nilainya.
+- Exit **0** hanya confirmed finding (termasuk zero-optional baseline) **dan cleanup terkonfirmasi**, bukan fix, HAProxy startup atau keberhasilan installer. Exit **2** untuk inconclusive/refusal/error/cleanup unconfirmed, **130** interupsi, **64** argumen salah. Baca status/limits/report bersama exit; jangan menyamakan bukti parsial dengan konfirmasi.
+
+Baseline historis checkpoint 16 adalah **117 metode menurut hitungan statis**, bukan PASS; dua kegagalan tes VPS yang dilaporkan di sana tidak ditulis ulang sebagai PASS. Buffer akhir kini **140 metode, termasuk 23 regresi matriks**. Review read-only dan **40 kontrak tekstual JavaScript** selesai; syntax check dan unittest belum dijalankan, jadi bukan klaim PASS. Tidak menjalankan command, tes, Git, probe, installer atau layanan; riset web hanya membaca referensi publik. Full tetap BLOCKED (artefak OpenVPN/provenance UDP Custom/BadVPN), IP enforcement lintas transport dan panel CRUD Xray tetap belum tersedia/terbukti; cold start/reload/renewal dan sukses VPS full tetap belum terverifikasi.
 
 ### Audit properti systemd 255 dan watchdog
 

@@ -4,7 +4,8 @@ nathaya_diagnose_haproxy_main() {
     case "$#:${1-}" in
         1:--help)
             builtin printf '%s\n' \
-                'Usage: bash tools/diagnose-haproxy.sh --help | --run | --cap-boundaries' \
+                'Usage: bash tools/diagnose-haproxy.sh --help | --run | --cap-boundaries | --cap-matrix' \
+                '--cap-matrix tests a finite requested-restriction matrix using fixed Python only.' \
                 '--cap-boundaries runs only fixed Python controls; no HAProxy, strace or listeners.' \
                 '--help is read-only. --run requires root Ubuntu 24.04 amd64, systemd PID 1.' \
                 'Creates bounded, private transient probes; never changes the production unit.' \
@@ -13,8 +14,8 @@ nathaya_diagnose_haproxy_main() {
                 'Tracing changes privilege/timing; traced results do not represent an untraced run.'
             return 0
             ;;
-        1:--run|1:--cap-boundaries) ;;
-        *) builtin printf '%s\n' 'Usage: bash tools/diagnose-haproxy.sh --help | --run | --cap-boundaries' >&2; return 64 ;;
+        1:--run|1:--cap-boundaries|1:--cap-matrix) ;;
+        *) builtin printf '%s\n' 'Usage: bash tools/diagnose-haproxy.sh --help | --run | --cap-boundaries | --cap-matrix' >&2; return 64 ;;
     esac
     exec /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C \
         /usr/bin/python3 -I -B - "$1" <<'NATHAYA_HAPROXY_DIAG_PY'
@@ -31,6 +32,8 @@ Pure public interfaces:
   trace_command(haproxy_argv) -> list[str]
   sanitise_trace(text) -> dict (no arguments, IDs or raw log text)
   owned_unit(properties, unit, nonce) -> bool
+  matrix_plan(directory, nonce, caps, index, enabled_knob_names) -> fixed plan
+  matrix_entry_state(records, caps, executable, entry_only=False) -> validated observation state
 Controller is the bounded runtime/evidence owner; main(argv=None) is opt-in.
 Unknown effective differences are unsupported, never a reason to weaken a probe.
 """
@@ -587,7 +590,7 @@ def owned_unit(properties, unit, nonce):
     if (not isinstance(properties, dict) or not isinstance(unit, str) or
             not isinstance(nonce, str) or not re.fullmatch(r'[0-9a-f]{32}', nonce)):
         return False
-    match = re.fullmatch(r'nathaya-haproxy-probe-' + nonce + r'-(plain|trace|cap-gated|cap-direct)\.service', unit)
+    match = re.fullmatch(r'nathaya-haproxy-probe-' + nonce + r'-(plain|trace|cap-gated|cap-direct|mx(?:0[0-9]|1[0-9]|2[0-7]))\.service', unit)
     if not match:
         return False
     expected = {
@@ -722,7 +725,7 @@ def _capture_unit(unit, nonce):
     return (isinstance(unit, str) and isinstance(nonce, str) and
             re.fullmatch(r'[0-9a-f]{32}', nonce) is not None and
             re.fullmatch(r'nathaya-haproxy-probe-' + nonce +
-                         r'-(plain|trace|cap-gated|cap-direct)\.service', unit) is not None)
+                         r'-(plain|trace|cap-gated|cap-direct|mx(?:0[0-9]|1[0-9]|2[0-7]))\.service', unit) is not None)
 
 
 def _proc_identity(raw):
@@ -786,6 +789,89 @@ def control_plan(directory, nonce, caps, phase):
         properties['ExecStartPre'] = ' '.join(pre)
     return dict(phase=phase, unit=unit, argv=argv, pre=pre, go=go, control_go=control_go,
                 output=output, properties=properties, command=transient_command(unit, properties, argv))
+
+
+# Fixed, directed request space: OFF is explicit, never inferred from absence.
+MATRIX_KNOBS = ('NoNewPrivileges', 'PrivateTmp', 'ProtectSystem', 'ProtectHome',
+                'ProtectKernelTunables', 'ProtectKernelModules', 'ProtectControlGroups',
+                'RestrictSUIDSGID', 'LockPersonality', 'RestrictAddressFamilies', 'ReadWritePaths')
+
+
+def matrix_plan(directory, nonce, caps, index, enabled_knob_names):
+    if (type(index) is not int or not 0 <= index < 28 or not isinstance(nonce, str)
+            or not re.fullmatch(r'[0-9a-f]{32}', nonce)
+            or not re.fullmatch(r'/run/nathaya-haproxy-probe\.[A-Za-z0-9_-]+', str(directory))
+            or not isinstance(enabled_knob_names, (list, tuple, set, frozenset))
+            or any(k not in MATRIX_KNOBS for k in enabled_knob_names)
+            or len(set(enabled_knob_names)) != len(enabled_knob_names)):
+        raise Unsupported('matrix-plan')
+    phase = 'mx%02d' % index
+    directory, enabled = Path(directory), frozenset(enabled_knob_names)
+    output, go = directory / phase / 'combined.log', directory / phase / 'control-go'
+    properties = restriction_properties(caps)
+    for key in MATRIX_KNOBS:
+        if key not in enabled:
+            properties[key] = '' if key in ('RestrictAddressFamilies', 'ReadWritePaths') else 'no'
+    # As in the existing factory, do not send unsupported transient zero syntax.
+    # SecureBits=0 is a required audited default, not an invented request value.
+    properties.update(Description='Nathaya HAProxy probe ' + nonce + ' ' + phase,
+                      StandardOutput='append:' + str(output), StandardError='append:' + str(output))
+    argv = ['/usr/bin/python3', '-I', '-B', str(directory / 'control.py'), str(go)]
+    return dict(phase=phase, index=index, enabled=sorted(enabled), unit='nathaya-haproxy-probe-' + nonce + '-' + phase + '.service',
+                properties=properties, required_effective_defaults={'SecureBits': '0', 'SystemCallFilter': '~'},
+                argv=argv, pre=[], go=go, control_go=go, output=output,
+                command=transient_command('nathaya-haproxy-probe-' + nonce + '-' + phase + '.service', properties, argv))
+
+
+def _matrix_value(key, value):
+    # Normalize only known boolean/AF/path spellings; unknown strings stay raw.
+    if key in MATRIX_KNOBS and key not in ('RestrictAddressFamilies', 'ReadWritePaths'):
+        return {'true': 'yes', 'false': 'no'}.get(value, value)
+    if key == 'RestrictAddressFamilies' and isinstance(value, str):
+        words = value.split()
+        if len(words) == len(set(words)) and set(words) <= {'AF_INET', 'AF_INET6', 'AF_UNIX'}:
+            return tuple(sorted(words))
+    if key == 'ReadWritePaths' and value in ('', LOGS):
+        return tuple(value.split())
+    return value
+
+
+def _matrix_allowed(key, value):
+    on = restriction_properties(CAPS3)[key]
+    off = '' if key in ('RestrictAddressFamilies', 'ReadWritePaths') else 'no'
+    return _matrix_value(key, value) in (_matrix_value(key, off), _matrix_value(key, on))
+
+
+def matrix_entry_state(records, caps, executable, *, entry_only=False):
+    stages = ['control-entry'] if entry_only else ['control-entry', 'after-exec']
+    if [r['stage'] for r in records] != stages:
+        raise Unsupported('matrix-record-sequence')
+    mask = sum(1 << CAP_BITS[c] for c in caps)
+    states = []
+    for record in records:
+        s, optional = record['status'], record['optional_status']
+        if not {'TracerPid', 'Seccomp'} <= set(optional):
+            raise Unsupported('matrix-status-coverage')
+        if (record['exe'] != executable or s['Pid'] <= 0 or s['Uid'] != (0,) * 4 or s['Gid'] != (0,) * 4
+                or s['CapBnd'] != mask or s['CapAmb'] or s['CapInh']
+                or optional['TracerPid'] != 0 or optional['Seccomp'] not in (0, 1, 2)
+                or s['NoNewPrivs'] not in (0, 1) or s['CapEff'] != s['CapPrm']
+                or s['CapEff'] not in (mask, mask & ~0x80)):
+            raise Unsupported('matrix-anomalous-credentials')
+        if any(record['env_present'].values()):
+            raise Unsupported('matrix-environment-confounded')
+        states.append({k: v for k, v in s.items() if k not in ('Pid', 'PPid')})
+    if not entry_only:
+        invariant = lambda s: {k: v for k, v in s.items() if k not in ('CapEff', 'CapPrm')}
+        if (records[0]['status']['Pid'] != records[1]['status']['Pid']
+                or records[0]['status']['PPid'] != records[1]['status']['PPid']
+                or invariant(states[0]) != invariant(states[1])
+                or records[0]['optional_status'] != records[1]['optional_status']):
+            raise Unsupported('matrix-selfexec-unstable')
+    return {'entry': states[0], 'after_exec': None if entry_only else states[1],
+            'optional': records[0]['optional_status'],
+            'selfexec_capability_changed': None if entry_only else states[0] != states[1],
+            'missing': not bool(states[0]['CapEff'] & 0x80)}
 
 
 def fixed_snapshot(pid, environment=False):
@@ -972,7 +1058,7 @@ class Controller:
         return code, out, err
 
     def show(self, unit, absent=False, timeout=3):
-        if unit != MAIN and not re.fullmatch(r'nathaya-haproxy-probe-' + self.nonce + r'-(?:plain|trace|cap-gated|cap-direct)\.service', unit):
+        if unit != MAIN and not re.fullmatch(r'nathaya-haproxy-probe-' + self.nonce + r'-(?:plain|trace|cap-gated|cap-direct|mx(?:0[0-9]|1[0-9]|2[0-7]))\.service', unit):
             raise Unsupported('unit-name')
         code, out, _ = self.command(['/usr/bin/systemctl', 'show', '--all', '--no-pager', unit], timeout=timeout)
         if len(out) > SHOW_LIMIT:
@@ -1134,7 +1220,8 @@ class Controller:
         # Never borrow the production destination, even if File metadata exists.
         phase = plan.get('phase')
         directory = str(self.directory)
-        if (phase not in ('plain', 'trace', 'cap-gated', 'cap-direct') or not isinstance(self.directory, Path) or not re.fullmatch(
+        if ((phase not in ('plain', 'trace', 'cap-gated', 'cap-direct') and
+             not (isinstance(phase, str) and re.fullmatch(r'mx(?:0[0-9]|1[0-9]|2[0-7])', phase))) or not isinstance(self.directory, Path) or not re.fullmatch(
                 r'/run/nathaya-haproxy-probe\.[A-Za-z0-9_-]+', directory)):
             raise Unsupported('probe-output-plan')
         destination = str(self.directory / phase / 'combined.log')
@@ -1755,7 +1842,9 @@ class Controller:
         _secure_path(plan['output'])
         with plan['output'].open('rb') as stream:
             raw = stream.read(65536)  # Snapshots precede unrelated HAProxy output.
-        return boundary_records(raw, str(self.directory / plan['phase']), plan['phase'] in ('cap-gated', 'cap-direct'))
+        return boundary_records(raw, str(self.directory / plan['phase']),
+                                plan['phase'] in ('cap-gated', 'cap-direct') or
+                                re.fullmatch(r'mx(?:0[0-9]|1[0-9]|2[0-7])', plan['phase']) is not None)
 
     def run_controls(self):
         outcomes = {}
@@ -1819,6 +1908,249 @@ class Controller:
             _raise_unsupported(restriction_differences(a, b, checked_empty_source=ea, checked_empty_probe=eb))
         return outcomes
 
+    def validate_matrix(self, probe, plan):
+        """Separate fixed Python validator; never weaken the production/control gate."""
+        if not isinstance(probe, dict) or not isinstance(plan, dict):
+            raise Unsupported('matrix-snapshot-or-plan-format')
+        expected = matrix_plan(self.directory, self.nonce, self.caps, plan.get('index'), plan.get('enabled'))
+        if any(plan.get(k) != v for k, v in expected.items()):
+            raise Unsupported('matrix-plan')
+        if not owned_unit(probe, plan['unit'], self.nonce):
+            raise Unsupported('matrix-ownership')
+        _require(probe, {
+            'LoadState': 'loaded', 'DropInPaths': '', 'NeedDaemonReload': 'no',
+            'User': 'root', 'Group': 'root', 'Type': 'simple', 'Slice': 'system.slice',
+            'SecureBits': '0', 'AmbientCapabilities': '', 'UMask': '0077',
+            'RuntimeMaxUSec': '8s', 'TimeoutStartUSec': '5s', 'TimeoutStopUSec': '2s',
+            'TimeoutAbortUSec': '2s', 'Restart': 'no', 'RestartUSec': '3s', 'CanReload': 'no',
+            'KillMode': 'control-group', 'SendSIGKILL': 'yes', 'StandardOutput': 'append',
+            'StandardError': 'append', 'PrivateNetwork': 'no', 'PrivateUsers': 'no',
+            'RootDirectory': '', 'RootImage': '', 'JoinsNamespaceOf': '', 'SystemCallFilter': '~',
+        })
+        if _capset(probe.get('CapabilityBoundingSet')) != self.caps:
+            raise Unsupported('matrix-bounding')
+        if any(k not in probe for k in MATRIX_KNOBS):
+            raise Unsupported('matrix-missing-knob')
+        for key in MATRIX_KNOBS:
+            requested = _matrix_value(key, expected['properties'][key])
+            applied = _matrix_value(key, probe[key])
+            implied_nnp = key == 'NoNewPrivileges' and requested == 'no' and applied == 'yes'
+            if not _matrix_allowed(key, probe[key]) or (requested != applied and not implied_nnp):
+                raise Unsupported('matrix-effective-value:' + key)
+        for key in ('ExecStart', 'ExecStartEx'):
+            if (key == 'ExecStart' or key in probe) and not _exec_struct(probe.get(key), expected['argv']):
+                raise Unsupported('matrix-command')
+        self._empty_exec_fields(probe, plan, PROBE_EMPTY_EXEC_HOOKS + ('ExecStartPre',))
+        self.validate_probe_logging(probe, plan)
+        self._validate_probe_watchdog(probe, plan)
+
+    def matrix_inventory(self, a, b, variable=False, source=False):
+        hooks = frozenset(n + suffix for n in PROBE_EMPTY_EXEC_HOOKS + ('ExecStartPre',) for suffix in ('', 'Ex'))
+        inventory = _comparison_inventory(a, b, empty_source=(_source_empty_exec_fields(a, self.fragment) if source else hooks),
+                                          empty_probe=hooks)
+        for row in inventory['properties']:
+            key = row['property']
+            if key in MATRIX_KNOBS and row['source_present'] and row['probe_present']:
+                known = _matrix_allowed(key, row['source']) and _matrix_allowed(key, row['probe'])
+                equal = _matrix_value(key, row['source']) == _matrix_value(key, row['probe'])
+                row.update(unsupported=not (equal and known),
+                           classification=('matrix-unsupported-value' if not known else
+                                           'matrix-equal' if equal else 'matrix-effective-difference'),
+                           reason='unsupported-value' if not known else 'known-normalization' if equal else 'effective-value-different')
+                row['known_matrix_values'], row['requested_variable'] = known, variable
+        inventory['unsupported'] = [r['property'] for r in inventory['properties'] if r['unsupported']]
+        inventory['mismatches'] = [r for r in inventory['properties'] if r['unsupported']]
+        inventory['matrix_issues'] = [r['property'] for r in inventory['properties'] if r['unsupported']
+                                     and not (variable and r['property'] in MATRIX_KNOBS and r.get('known_matrix_values')
+                                              and r['source_present'] and r['probe_present'])]
+        inventory['effective_differences'] = [r['property'] for r in inventory['properties'] if not r['raw_equal']]
+        return inventory
+
+    def matrix_source(self, plan, stem):
+        _no_lock()
+        raw, fragment, errors = self._audit_fragment(plan['phase'] + '/' + stem + '.fragment')
+        current = self._audit_show(MAIN, errors)
+        audit = self.audit_compatibility(current, fragment=fragment, original=self.source,
+                                        original_fragment=self.fragment, original_bytes=self.source_bytes,
+                                        current_bytes=raw, inspection_errors=errors, allow_source_only=True)
+        self.record(plan['phase'] + '/' + stem + '.show.json', current)
+        self.record(plan['phase'] + '/' + stem + '.audit.json', audit)
+        _raise_unsupported(audit['issues'])
+        if raw != self.source_bytes or frozenset(audit['source_caps']) != self.caps:
+            raise Unsupported('matrix-source-changed')
+        return current
+
+    def matrix_python(self, plan, stem):
+        metadata = executable_metadata('/usr/bin/python3')
+        self.record(plan['phase'] + '/' + stem + '.python.json', metadata)
+        if metadata != self.matrix_python_initial:
+            raise Unsupported('matrix-python-changed')
+        return metadata
+
+    def matrix_attempt(self, enabled):
+        index = len(self.matrix_report['attempts'])
+        if index >= 28:
+            raise Unsupported('matrix-attempt-limit')
+        plan = matrix_plan(self.directory, self.nonce, self.caps, index, enabled)
+        row = {'phase': plan['phase'], 'enabled': plan['enabled'], 'status': 'unavailable'}
+        self.matrix_report['attempts'].append(row)  # Failed creation consumes an index too.
+        base = self.directory / plan['phase']
+        base.mkdir(mode=0o700)
+        self.save(plan['phase'] + '/combined.log', b'')
+        self.record(plan['phase'] + '/request.json', {'properties': plan['properties'], 'required_effective_defaults': plan['required_effective_defaults'],
+                                                     'command': plan['command'], 'argv': plan['argv']})
+        source = self.matrix_source(plan, 'source-before')
+        metadata = self.matrix_python(plan, 'before')
+        if self.show(plan['unit'], absent=True).get('LoadState') != 'not-found':
+            raise Unsupported('unit-name-conflict')
+        _no_lock()
+        self.intents.append(plan['unit'])
+        self.record(plan['phase'] + '/intent.json', {'unit': plan['unit'], 'nonce': self.nonce, 'command': plan['command']})
+        plan['created_at'] = time.monotonic()
+        code, _, _ = self.command(plan['command'])
+        if code != 0:
+            raise Unsupported('transient-create-unavailable')
+        self.creation_confirmed.add(plan['unit'])
+        deadline = plan['created_at'] + 3.4
+        while time.monotonic() < deadline:
+            records = self.read_boundaries(plan)
+            if records:
+                break
+            time.sleep(0.025)
+        else:
+            raise Unsupported('matrix-entry-unavailable')
+        self.record(plan['phase'] + '/entry.json', records)
+        entry = matrix_entry_state(records, self.caps, metadata['resolved'], entry_only=True)
+        profile = self.show(plan['unit'], timeout=max(0.01, deadline - time.monotonic()))
+        self.record(plan['phase'] + '/entry.show.json', profile)
+        self.validate_matrix(profile, plan)
+        if _matrix_value('NoNewPrivileges', profile['NoNewPrivileges']) == 'yes' and entry['entry']['NoNewPrivs'] != 1:
+            raise Unsupported('matrix-NNP-inconsistent')
+        comparison = self.matrix_inventory(source, profile, variable=True, source=True)
+        self.record(plan['phase'] + '/source-comparison.json', comparison)
+        _raise_unsupported(comparison['matrix_issues'])
+        self.matrix_source(plan, 'source-release')
+        self.matrix_python(plan, 'release')
+        live = self.show(plan['unit'], timeout=max(0.01, deadline - time.monotonic()))
+        self.record(plan['phase'] + '/release.show.json', live)
+        self.validate_matrix(live, plan)
+        comparison = self.matrix_inventory(profile, live)
+        self.record(plan['phase'] + '/release-comparison.json', comparison)
+        _raise_unsupported(comparison['matrix_issues'])
+        if (live.get('ActiveState') != 'active' or live.get('SubState') != 'running'
+                or live.get('MainPID') != str(records[0]['status']['Pid'])
+                or live.get('ControlGroup') != '/system.slice/' + plan['unit']):
+            raise Unsupported('matrix-helper-unavailable')
+        _no_lock()
+        if time.monotonic() >= deadline:
+            raise Unsupported('matrix-release-deadline')
+        self.save(plan['phase'] + '/control-go', b'')
+        deadline = min(plan['created_at'] + 6.8, time.monotonic() + 3.0)
+        while time.monotonic() < deadline:
+            records = self.read_boundaries(plan)
+            if any(r['stage'] == 'after-exec' for r in records):
+                break
+            time.sleep(0.025)
+        self.record(plan['phase'] + '/boundaries.json', records)
+        state = matrix_entry_state(records, self.caps, metadata['resolved'])
+        self.matrix_python(plan, 'after')
+        after = self.show(plan['unit'], absent=True)
+        self.record(plan['phase'] + '/after.show.json', after)
+        if after.get('LoadState') != 'not-found':
+            self.validate_matrix(after, plan)
+            comparison = self.matrix_inventory(live, after)
+            self.record(plan['phase'] + '/after-comparison.json', comparison)
+            _raise_unsupported(comparison['matrix_issues'])
+        layers = {k: {'requested': plan['properties'][k], 'show': live[k],
+                       'request_matches_show': _matrix_value(k, plan['properties'][k]) == _matrix_value(k, live[k])}
+                  for k in MATRIX_KNOBS}
+        layers['NoNewPrivileges'].update(proc_entry=records[0]['status']['NoNewPrivs'], proc_after_exec=records[1]['status']['NoNewPrivs'],
+                                         show_matches_proc=_matrix_value('NoNewPrivileges', live['NoNewPrivileges']) == ('yes' if state['entry']['NoNewPrivs'] else 'no'),
+                                         forced_or_inherited=plan['properties']['NoNewPrivileges'] == 'no' and
+                                         (_matrix_value('NoNewPrivileges', live['NoNewPrivileges']) != 'no' or state['entry']['NoNewPrivs'] != 0))
+        result = dict(phase=plan['phase'], enabled=plan['enabled'], profile=live, state=state, layers=layers,
+                      requested_properties=plan['properties'], unexpected_requested_values=[k for k in MATRIX_KNOBS if not layers[k]['request_matches_show']],
+                      actual_NNP_off=_matrix_value('NoNewPrivileges', live['NoNewPrivileges']) == 'no' and state['entry']['NoNewPrivs'] == 0)
+        self.record(plan['phase'] + '/result.json', result)
+        if not self.cleanup_one(plan['unit']):
+            self.cleanup_confirmed = False
+            raise Unsupported('cleanup-unconfirmed')
+        self.intents.remove(plan['unit'])
+        row.update(status='recorded', missing=state['missing'], layers=layers, actual_NNP_off=result['actual_NNP_off'])
+        return result
+
+    def matrix_edge(self, a, b, repeat=False):
+        delta = sorted(set(a['enabled']) ^ set(b['enabled']))
+        if len(delta) != (0 if repeat else 1):
+            raise Unsupported('matrix-request-delta')
+        inventory = self.matrix_inventory(a['profile'], b['profile'], variable=not repeat)
+        inventory.update(request_delta=delta, reference=a['phase'], observation=b['phase'],
+                         NNP_layers={'reference': a['layers']['NoNewPrivileges'], 'observation': b['layers']['NoNewPrivileges']},
+                         actual_NNP_off={'reference': a['actual_NNP_off'], 'observation': b['actual_NNP_off']})
+        self.record(b['phase'] + '/against-' + a['phase'] + '.json', inventory)
+        _raise_unsupported(inventory['matrix_issues'])
+        if repeat and a['state'] != b['state']:
+            raise Unsupported('matrix-repeat-unstable')
+
+    def run_matrix(self):
+        self.matrix_report = {'status': 'unavailable', 'attempt_limit': 28, 'attempts': [],
+                              'knobs': list(MATRIX_KNOBS), 'minimum_tested_requested_profile': None,
+                              'exploration_limit': 23, 'confirmation_limit': 2, 'supplement_limit': 1,
+                              'limits': ['requested-profile comparisons, not a global minimum or root cause',
+                                         'only singles and NNP-plus-one pairs; higher orders unresolved',
+                                         'entry is after Python initialization; no HAProxy, tracing or listeners',
+                                         'requested NNP=no does not establish effective/proc NNP=0',
+                                         'no production change or production fix is established']}
+        self.matrix_python_initial = executable_metadata('/usr/bin/python3')
+        self.record('matrix.python.initial.json', self.matrix_python_initial)
+        cap = self.matrix_python_initial.get('filecap', {})
+        if (not self.matrix_python_initial.get('available') or not cap.get('available') or cap.get('present') is not False):
+            raise Unsupported('matrix-python-filecap-unavailable-or-present')
+        minimal, production = self.matrix_attempt(()), self.matrix_attempt(MATRIX_KNOBS)
+        if minimal['state']['missing']:
+            repeated = self.matrix_attempt(())
+            self.matrix_edge(minimal, repeated, repeat=True)
+            self.matrix_report.update(status='confirmed-zero-optional-settings', minimum_tested_requested_profile=[])
+            return 0
+        if not production['state']['missing']:
+            self.matrix_report['status'] = 'not-reproduced-inconclusive'
+            return 2
+        nnp, singles, candidate, reference = MATRIX_KNOBS[0], {}, None, None
+        for knob in MATRIX_KNOBS:  # NNP first, then the ten other single requests.
+            observed = self.matrix_attempt((knob,))
+            self.matrix_edge(minimal, observed)
+            singles[knob] = observed
+            if observed['state']['missing']:
+                reference, candidate = minimal, observed
+                break
+        if candidate is None:
+            for knob in MATRIX_KNOBS[1:]:  # No powerset, recursion, or other pairs.
+                observed = self.matrix_attempt((nnp, knob))
+                self.matrix_edge(singles[knob], observed)
+                self.matrix_edge(singles[nnp], observed)
+                if observed['state']['missing']:
+                    reference, candidate = singles[knob], observed
+                    break
+        if candidate is None:
+            self.matrix_report['status'] = 'higher-order-unresolved'
+            return 2
+        for original in (reference, candidate):
+            repeated = self.matrix_attempt(original['enabled'])
+            self.matrix_edge(original, repeated, repeat=True)
+        self.matrix_report.update(minimum_tested_requested_profile=candidate['enabled'],
+                                  reference=reference['phase'], candidate=candidate['phase'],
+                                  status='interaction-incomplete')
+        if len(candidate['enabled']) == 1:
+            enabled = (set(MATRIX_KNOBS) - {nnp}) if candidate['enabled'] == [nnp] else set(candidate['enabled']) | {nnp}
+            supplement = self.matrix_attempt(enabled)
+            self.matrix_edge(production if candidate['enabled'] == [nnp] else candidate, supplement)
+            self.matrix_report['interaction'] = {'phase': supplement['phase'], 'missing': supplement['state']['missing'],
+                                                'actual_NNP_off': supplement['actual_NNP_off'], 'production_fix_claimed': False}
+        else:
+            self.matrix_report['interaction'] = {'healthy_components': [singles[k]['phase'] for k in candidate['enabled']]}
+        self.matrix_report['status'] = 'confirmed-tested-requested-profile'
+        return 0
+
     def boundary_report(self):
         rows = list(self.boundaries)
         for plan in self.boundary_plans:
@@ -1871,10 +2203,10 @@ class Controller:
 
 def main(argv=None):
     args = sys.argv[1:] if argv is None else argv
-    if args not in (['--run'], ['--cap-boundaries']):
-        print('Usage: bash tools/diagnose-haproxy.sh --help | --run | --cap-boundaries', file=sys.stderr)
+    if args not in (['--run'], ['--cap-boundaries'], ['--cap-matrix']):
+        print('Usage: bash tools/diagnose-haproxy.sh --help | --run | --cap-boundaries | --cap-matrix', file=sys.stderr)
         return 64
-    cap_boundaries = args == ['--cap-boundaries']
+    cap_boundaries, cap_matrix = args == ['--cap-boundaries'], args == ['--cap-matrix']
     outcomes = {}
     controller, status, exitcode = Controller(), 'unavailable', 2
     interrupted = False
@@ -1886,7 +2218,10 @@ def main(argv=None):
     try:
         for signum in (signal.SIGINT, signal.SIGTERM):
             old_handlers[signum] = signal.signal(signum, interrupt)
-        if cap_boundaries:
+        if cap_matrix:
+            controller.prepare(cap_boundaries=True)
+            exitcode = controller.run_matrix()
+        elif cap_boundaries:
             controller.prepare(cap_boundaries=True)
             outcomes = controller.run_controls()
             exitcode = 0 if all(v == 'recorded' for v in outcomes.values()) else 2
@@ -1911,13 +2246,18 @@ def main(argv=None):
                 print('trace evidence: unavailable (strace not installed)')
     except Unsupported as exc:
         # All Unsupported labels originate in constants or parse_show keys.
-        print('unsupported: ' + str(exc))
+        print('matrix: refused' if cap_matrix else 'unsupported: ' + str(exc))
+        if cap_matrix:
+            controller.matrix_report = getattr(controller, 'matrix_report', {'status': 'inconclusive', 'attempts': []})
+            controller.matrix_report['issues'] = list(exc.labels)
+            if controller.matrix_report['status'] == 'unavailable':
+                controller.matrix_report['status'] = 'inconclusive'
     except KeyboardInterrupt:
         interrupted = True
         print('interrupted: cleanup requested')
         exitcode = 130
     except (OSError, ValueError, KeyError, UnicodeError, subprocess.SubprocessError):
-        print('unavailable: inspection or runtime evidence incomplete')
+        print('matrix: evidence-unavailable' if cap_matrix else 'unavailable: inspection or runtime evidence incomplete')
     finally:
         # Ignore a second INT/TERM while bounded cleanup runs. SIGKILL/power loss
         # cannot be handled; RuntimeMaxSec is the independent service guard.
@@ -1932,13 +2272,27 @@ def main(argv=None):
             if not interrupted:
                 exitcode = 2
         if controller.directory is not None:
-            try:
-                first = controller.boundary_report()
-            except (OSError, ValueError):
-                first, exitcode = 'unavailable', 2
-            prefix = ('control gated/direct: ' + outcomes.get('cap-gated', 'unavailable') + '/' +
-                      outcomes.get('cap-direct', 'unavailable') + '; ') if cap_boundaries else ''
-            print(prefix + 'first root-unit observation missing SETUID (E/P): ' + first + ' (not a root cause)')
+            if cap_matrix:
+                try:
+                    report = getattr(controller, 'matrix_report', {'status': 'unavailable', 'attempts': []})
+                    report.update(cleanup_confirmed=clean, interrupted=interrupted, exitcode=exitcode,
+                                  attempt_count=len(report['attempts']))
+                    if interrupted or not clean:
+                        report['status'] = 'interrupted' if interrupted else 'cleanup-unconfirmed'
+                    controller.record('matrix.report.json', report)
+                    print('matrix: ' + report['status'])
+                except (OSError, ValueError):
+                    if not interrupted:
+                        exitcode = 2
+                    print('matrix: evidence-unavailable')
+            else:
+                try:
+                    first = controller.boundary_report()
+                except (OSError, ValueError):
+                    first, exitcode = 'unavailable', 2
+                prefix = ('control gated/direct: ' + outcomes.get('cap-gated', 'unavailable') + '/' +
+                          outcomes.get('cap-direct', 'unavailable') + '; ') if cap_boundaries else ''
+                print(prefix + 'first root-unit observation missing SETUID (E/P): ' + first + ' (not a root cause)')
             print('private evidence: ' + str(controller.directory))
         for signum, handler in old_handlers.items():
             signal.signal(signum, handler)
