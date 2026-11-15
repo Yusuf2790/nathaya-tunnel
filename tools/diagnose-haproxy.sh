@@ -4,7 +4,8 @@ nathaya_diagnose_haproxy_main() {
     case "$#:${1-}" in
         1:--help)
             builtin printf '%s\n' \
-                'Usage: bash tools/diagnose-haproxy.sh --help | --run' \
+                'Usage: bash tools/diagnose-haproxy.sh --help | --run | --cap-boundaries' \
+                '--cap-boundaries runs only fixed Python controls; no HAProxy, strace or listeners.' \
                 '--help is read-only. --run requires root Ubuntu 24.04 amd64, systemd PID 1.' \
                 'Creates bounded, private transient probes; never changes the production unit.' \
                 'Evidence is preserved under /run/nathaya-haproxy-probe.* (root only).' \
@@ -12,11 +13,11 @@ nathaya_diagnose_haproxy_main() {
                 'Tracing changes privilege/timing; traced results do not represent an untraced run.'
             return 0
             ;;
-        1:--run) ;;
-        *) builtin printf '%s\n' 'Usage: bash tools/diagnose-haproxy.sh --help | --run' >&2; return 64 ;;
+        1:--run|1:--cap-boundaries) ;;
+        *) builtin printf '%s\n' 'Usage: bash tools/diagnose-haproxy.sh --help | --run | --cap-boundaries' >&2; return 64 ;;
     esac
     exec /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C \
-        /usr/bin/python3 -I -B - --run <<'NATHAYA_HAPROXY_DIAG_PY'
+        /usr/bin/python3 -I -B - "$1" <<'NATHAYA_HAPROXY_DIAG_PY'
 """Self-contained, fail-closed HAProxy probe. Importing defines APIs only.
 
 Pure public interfaces:
@@ -548,7 +549,7 @@ def sanitise_trace(text):
     Includes <... syscall resumed> failures. Unknown names/errno are discarded.
     Combined HAProxy/strace output is not an authenticated syscall transcript.
     """
-    counts, identity, records = collections.Counter(), 0, 0
+    counts, calls, identity, records = collections.Counter(), collections.Counter(), 0, 0
     prefix = r'(?:(?:\[pid +[1-9][0-9]*\] +|[1-9][0-9]* +))?'
     call = re.compile('^' + prefix + r'([a-z][a-z0-9_]*)\(.*\)\s+=\s+(.*)$')
     resumed = re.compile('^' + prefix + r'<\.\.\. ([a-z][a-z0-9_]*) resumed>.*\)\s+=\s+(.*)$')
@@ -573,9 +574,10 @@ def sanitise_trace(text):
         elif not success:
             continue
         records += 1
+        calls[name] += 1
         identity += int(name in IDENTITY_CALLS)
     return {'available': bool(identity) and not denied,
-            'identity_calls': identity, 'records': records,
+            'identity_calls': identity, 'records': records, 'capset_records': calls['capset'],
             'counts': [{'syscall': name, 'errno': error, 'count': n}
                        for (name, error), n in sorted(counts.items())]}
 
@@ -585,7 +587,7 @@ def owned_unit(properties, unit, nonce):
     if (not isinstance(properties, dict) or not isinstance(unit, str) or
             not isinstance(nonce, str) or not re.fullmatch(r'[0-9a-f]{32}', nonce)):
         return False
-    match = re.fullmatch(r'nathaya-haproxy-probe-' + nonce + r'-(plain|trace)\.service', unit)
+    match = re.fullmatch(r'nathaya-haproxy-probe-' + nonce + r'-(plain|trace|cap-gated|cap-direct)\.service', unit)
     if not match:
         return False
     expected = {
@@ -597,22 +599,60 @@ def owned_unit(properties, unit, nonce):
             properties.get('ControlGroup') in ('', '/system.slice/' + unit))
 
 
-GATE_PROGRAM = '''import os, stat, sys, time
+ENV_NAMES = ('LD_PRELOAD', 'LD_LIBRARY_PATH', 'PYTHONHOME', 'PYTHONPATH',
+             'BASH_ENV', 'ENV', 'GLIBC_TUNABLES')
+BOUNDARY_TAG = 'nathaya-cap-boundary-v1'
+# First helper observation is AFTER Python initialization, not before Python exec.
+# Output uses the inherited append FD, never a reopened path or new writable path.
+BOUNDARY_PROGRAM = '''import json, os, stat, sys, time
 from pathlib import Path
-if len(sys.argv) != 2:
+def emit(stage, token):
+    with open('/proc/self/status') as f:
+        raw = f.read(65537)
+    if len(raw) > 65536:
+        raise SystemExit(1)
+    names = {'Pid','PPid','Uid','Gid','Groups','CapInh','CapPrm','CapEff',
+             'CapBnd','CapAmb','NoNewPrivs','TracerPid','Seccomp'}
+    status = '\\n'.join(s for s in raw.splitlines() if s.partition(':')[0] in names)
+    env = ('LD_PRELOAD','LD_LIBRARY_PATH','PYTHONHOME','PYTHONPATH',
+           'BASH_ENV','ENV','GLIBC_TUNABLES')
+    record = dict(tag='nathaya-cap-boundary-v1', stage=stage, token=token,
+                  status=status, exe=os.readlink('/proc/self/exe'),
+                  env_present={n: n in os.environ for n in env})
+    data = (json.dumps(record, sort_keys=True) + '\\n').encode()
+    if len(data) > 8192 or os.write(1, data) != len(data):
+        raise SystemExit(1)
+def wait(p):
+    deadline = time.monotonic() + 4.0
+    while time.monotonic() < deadline:
+        try:
+            s = p.lstat()
+            if (stat.S_ISREG(s.st_mode) and s.st_uid == 0 and s.st_gid == 0
+                    and stat.S_IMODE(s.st_mode) == 0o600 and s.st_nlink == 1):
+                return
+            raise SystemExit(1)
+        except FileNotFoundError:
+            time.sleep(0.025)
+    raise SystemExit(1)
+'''
+GATE_PROGRAM = BOUNDARY_PROGRAM + '''if len(sys.argv) != 2:
     raise SystemExit(1)
 p = Path(sys.argv[1])
-deadline = time.monotonic() + 4.0
-while time.monotonic() < deadline:
-    try:
-        s = p.lstat()
-        if (stat.S_ISREG(s.st_mode) and s.st_uid == 0 and s.st_gid == 0
-                and stat.S_IMODE(s.st_mode) == 0o600 and s.st_nlink == 1):
-            raise SystemExit(0)
-        raise SystemExit(1)
-    except FileNotFoundError:
-        time.sleep(0.025)
-raise SystemExit(1)
+emit('gate-entry', str(p.parent))
+wait(p)
+emit('gate-exit', str(p.parent))
+'''
+CONTROL_PROGRAM = BOUNDARY_PROGRAM + '''if (len(sys.argv) not in (2, 3) or
+        (len(sys.argv) == 3 and sys.argv[2] != 'after-exec')):
+    raise SystemExit(1)
+p = Path(sys.argv[1])
+if len(sys.argv) == 3:
+    emit('after-exec', str(p.parent))
+else:
+    emit('control-entry', str(p.parent))
+    wait(p)
+    os.execv('/usr/bin/python3', ['/usr/bin/python3', '-I', '-B',
+             __file__, sys.argv[1], 'after-exec'])
 '''
 
 
@@ -658,7 +698,7 @@ def _no_lock():
 
 def _status(raw):
     result = {}
-    wanted = {'Pid', 'PPid', 'Uid', 'Gid', 'Groups', 'CapEff', 'CapPrm', 'CapBnd', 'CapAmb', 'NoNewPrivs'}
+    wanted = {'Pid', 'PPid', 'Uid', 'Gid', 'Groups', 'CapInh', 'CapEff', 'CapPrm', 'CapBnd', 'CapAmb', 'NoNewPrivs'}
     for line in raw.splitlines():
         key, sep, val = line.partition(':')
         if key not in wanted:
@@ -682,7 +722,7 @@ def _capture_unit(unit, nonce):
     return (isinstance(unit, str) and isinstance(nonce, str) and
             re.fullmatch(r'[0-9a-f]{32}', nonce) is not None and
             re.fullmatch(r'nathaya-haproxy-probe-' + nonce +
-                         r'-(plain|trace)\.service', unit) is not None)
+                         r'-(plain|trace|cap-gated|cap-direct)\.service', unit) is not None)
 
 
 def _proc_identity(raw):
@@ -700,6 +740,172 @@ def _proc_identity(raw):
     return int(pid), int(fields[19])
 
 
+def restriction_properties(caps):
+    if frozenset(caps) not in (CAPS3, CAPS4):
+        raise ValueError('probe-caps')
+    return {
+        'Type': 'simple', 'User': 'root', 'Group': 'root', 'UMask': '0077',
+        'Slice': 'system.slice', 'NoNewPrivileges': 'yes', 'PrivateTmp': 'yes',
+        'ProtectSystem': 'strict', 'ProtectHome': 'yes',
+        'ProtectKernelTunables': 'yes', 'ProtectKernelModules': 'yes',
+        'ProtectControlGroups': 'yes', 'RestrictSUIDSGID': 'yes', 'LockPersonality': 'yes',
+        'RestrictAddressFamilies': 'AF_INET AF_INET6 AF_UNIX',
+        'CapabilityBoundingSet': ' '.join(sorted(caps)), 'AmbientCapabilities': '',
+        'ReadWritePaths': LOGS, 'Restart': 'no', 'RestartSec': '3s',
+        'RuntimeMaxSec': '8s', 'TimeoutStartSec': '5s', 'TimeoutStopSec': '2s',
+        'TimeoutAbortSec': '2s', 'WatchdogSec': '0',
+        'KillMode': 'control-group', 'SendSIGKILL': 'yes',
+    }
+
+
+def transient_command(unit, properties, argv):
+    command = ['/usr/bin/systemd-run', '--no-block', '--unit=' + unit,
+               '--description=' + properties['Description'], '--service-type=simple']
+    for key, value in properties.items():
+        if key not in ('Description', 'Type'):
+            command += ['--property=' + key + '=' + value]
+    command += ['--'] + argv
+    return command
+
+
+def control_plan(directory, nonce, caps, phase):
+    if (phase not in ('cap-gated', 'cap-direct') or not re.fullmatch(r'[0-9a-f]{32}', nonce)
+            or not re.fullmatch(r'/run/nathaya-haproxy-probe\.[A-Za-z0-9_-]+', str(directory))):
+        raise Unsupported('control-plan')
+    directory = Path(directory)
+    base = directory / phase
+    output, control_go = base / 'combined.log', base / 'control-go'
+    go = base / 'go' if phase == 'cap-gated' else control_go
+    argv = ['/usr/bin/python3', '-I', '-B', str(directory / 'control.py'), str(control_go)]
+    pre = ['/usr/bin/python3', '-I', '-B', str(directory / 'gate.py'), str(go)] if phase == 'cap-gated' else []
+    unit = 'nathaya-haproxy-probe-' + nonce + '-' + phase + '.service'
+    properties = {**restriction_properties(caps),
+                  'Description': 'Nathaya HAProxy probe ' + nonce + ' ' + phase,
+                  'StandardOutput': 'append:' + str(output), 'StandardError': 'append:' + str(output)}
+    if pre:
+        properties['ExecStartPre'] = ' '.join(pre)
+    return dict(phase=phase, unit=unit, argv=argv, pre=pre, go=go, control_go=control_go,
+                output=output, properties=properties, command=transient_command(unit, properties, argv))
+
+
+def fixed_snapshot(pid, environment=False):
+    """Only self or fixed PID 1; anchored identity, no global process inventory."""
+    if pid not in (1, os.getpid()):
+        raise ValueError('fixed-pid')
+    fd = None
+    try:
+        fd = os.open('/proc/' + str(pid), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        def read(name, limit):
+            f = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+            with os.fdopen(f, 'rb') as stream:
+                raw = stream.read(limit + 1)
+            if len(raw) > limit:
+                raise ValueError('proc-size')
+            return raw
+        before = _proc_identity(read('stat', 4096))
+        def executable():
+            try:
+                return {'exe': os.readlink('exe', dir_fd=fd)}
+            except OSError as exc:
+                return {'exe': None, 'exe_unavailable_errno': exc.errno}
+        exe = executable()
+        raw = read('status', 65536).decode('utf-8', 'strict')
+        status = _status(raw)
+        if (before[0] != pid or status['Pid'] != pid or
+                before != _proc_identity(read('stat', 4096)) or exe != executable()):
+            raise ValueError('proc-identity')
+        result = {'available': True, 'status': status, 'status_raw': raw, **exe}
+    except (OSError, ValueError) as exc:
+        result = {'available': False, 'unavailable': type(exc).__name__}
+    finally:
+        if fd is not None:
+            os.close(fd)
+    if environment:
+        result['env_present'] = {name: name in os.environ for name in ENV_NAMES}
+    return result
+
+
+def executable_metadata(path):
+    """Resolve only root-owned symlinks in trusted parents; read filecap, not payload."""
+    try:
+        pending, resolved, links = list(Path(path).parts[1:]), Path('/'), 0
+        if not Path(path).is_absolute():
+            raise Unsupported('executable-path')
+        while pending:
+            part = pending.pop(0)
+            if part in ('.', '..'):
+                resolved = resolved.parent if part == '..' else resolved
+                continue
+            _secure_path(resolved, directory=True)
+            candidate = resolved / part
+            info = candidate.lstat()
+            if stat.S_ISLNK(info.st_mode):
+                links += 1
+                if info.st_uid or info.st_gid or links > 32:
+                    raise Unsupported('executable-link')
+                target = Path(os.readlink(candidate))
+                if target.is_absolute():
+                    resolved = Path('/')
+                pending = list(target.parts[1:] if target.is_absolute() else target.parts) + pending
+            else:
+                resolved = candidate
+        expected = _secure_path(resolved)
+        fd = os.open(resolved, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            info = os.fstat(fd)
+            if (info.st_dev, info.st_ino, info.st_uid, info.st_gid, info.st_mode) != (expected.st_dev, expected.st_ino, expected.st_uid, expected.st_gid, expected.st_mode):
+                raise Unsupported('executable-changed')
+            try:
+                cap = os.getxattr(fd, 'security.capability')
+                filecap = {'available': len(cap) <= 64, 'present': True,
+                           'hex': cap.hex() if len(cap) <= 64 else None}
+            except OSError as exc:
+                filecap = {'available': exc.errno == errno.ENODATA,
+                           'present': False if exc.errno == errno.ENODATA else None, 'errno': exc.errno}
+            return {'available': True, 'resolved': str(resolved), 'uid': info.st_uid,
+                    'gid': info.st_gid, 'mode': oct(stat.S_IMODE(info.st_mode)),
+                    'device': info.st_dev, 'inode': info.st_ino, 'size': info.st_size,
+                    'mtime_ns': info.st_mtime_ns, 'filecap': filecap}
+        finally:
+            os.close(fd)
+    except (OSError, ValueError) as exc:
+        return {'available': False, 'unavailable': type(exc).__name__}
+
+
+def boundary_records(raw, token, control=False):
+    """Fixed schema/tokens only: unrelated combined output is not a snapshot."""
+    records = []
+    def unique(pairs):
+        result = dict(pairs)
+        if len(result) != len(pairs):
+            raise ValueError('duplicate-json-key')
+        return result
+    stages = ('gate-entry', 'gate-exit', 'control-entry', 'after-exec') if control else ('gate-entry', 'gate-exit')
+    for line in raw.splitlines():
+        if len(line) > 8192:
+            continue
+        try:
+            r = json.loads(line, object_pairs_hook=unique)
+            if (not isinstance(r, dict) or set(r) != {'tag', 'stage', 'token', 'status', 'exe', 'env_present'}
+                    or r['tag'] != BOUNDARY_TAG or r['token'] != token or r['stage'] not in stages
+                    or not isinstance(r['exe'], str) or not re.fullmatch(r'/usr/bin/python3(?:\.[0-9]+)?', r['exe'])
+                    or not isinstance(r['status'], str) or not isinstance(r['env_present'], dict)
+                    or set(r['env_present']) != set(ENV_NAMES)
+                    or any(type(v) is not bool for v in r['env_present'].values())):
+                continue
+            optional = {}
+            for entry in r['status'].splitlines():
+                name, _, value = entry.partition(':')
+                if name in ('TracerPid', 'Seccomp') and re.fullmatch(r'[0-9]{1,10}', value.strip()):
+                    optional[name] = int(value)
+            r['status'] = _status(r['status'])
+            r['optional_status'] = optional
+            records.append(r)
+        except (ValueError, TypeError, KeyError):
+            continue
+    return records
+
+
 class Controller:
     """Private evidence, intent-before-create, pre-exec comparison, bounded cleanup."""
     def __init__(self):
@@ -715,6 +921,11 @@ class Controller:
         self.caps = None
         self.uid = self.gid = None
         self.cleanup_confirmed = True
+        self.boundaries = []
+        self.control_profiles = {}
+        self.control_records = {}
+        self.boundary_plans = []
+        self.process_boundaries = []
 
     def save(self, name, content):
         if self.directory is None or not re.fullmatch(r'[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*', name):
@@ -761,7 +972,7 @@ class Controller:
         return code, out, err
 
     def show(self, unit, absent=False, timeout=3):
-        if unit != MAIN and not re.fullmatch(r'nathaya-haproxy-probe-' + self.nonce + r'-(?:plain|trace)\.service', unit):
+        if unit != MAIN and not re.fullmatch(r'nathaya-haproxy-probe-' + self.nonce + r'-(?:plain|trace|cap-gated|cap-direct)\.service', unit):
             raise Unsupported('unit-name')
         code, out, _ = self.command(['/usr/bin/systemctl', 'show', '--all', '--no-pager', unit], timeout=timeout)
         if len(out) > SHOW_LIMIT:
@@ -806,7 +1017,7 @@ class Controller:
         fragment = collect_unsupported(errors, validate_fragment, text)
         return raw, fragment, errors
 
-    def prepare(self):
+    def prepare(self, cap_boundaries=False):
         if (os.geteuid() != 0 or os.getuid() != 0 or os.getegid() != 0 or os.getgid() != 0 or
                 platform.machine() != 'x86_64'):
             raise Unsupported('root-Ubuntu-24.04-amd64-required')
@@ -817,6 +1028,8 @@ class Controller:
                         if '=' in line and not line.startswith('#'))
         if osfields.get('ID', '').strip('"') != 'ubuntu' or osfields.get('VERSION_ID', '').strip('"') != '24.04':
             raise Unsupported('Ubuntu-24.04-required')
+        # Capture before workdir, source inspection or any transient unit exists.
+        initial = {'controller': fixed_snapshot(os.getpid(), True), 'manager': fixed_snapshot(1)}
         _no_lock()
         _secure_path('/run', directory=True)
         os.umask(0o077)
@@ -824,7 +1037,17 @@ class Controller:
         _secure_path(self.directory, directory=True)
         if stat.S_IMODE(self.directory.stat().st_mode) != 0o700:
             raise Unsupported('evidence-mode')
+        self.record('boundaries.initial.json', initial)
+        for label, snapshot in initial.items():
+            self.boundaries.append({'stage': label, **snapshot})
         self.save('gate.py', GATE_PROGRAM)
+        if cap_boundaries:
+            self.save('control.py', CONTROL_PROGRAM)
+        executables = ['/usr/bin/python3', '/usr/bin/env', '/usr/bin/systemd-run',
+                       '/usr/bin/strace', HAPROXY, '/usr/lib/systemd/systemd-executor']
+        if initial['manager'].get('exe'):
+            executables.append(initial['manager']['exe'])
+        self.record('boundaries.executables.json', {p: executable_metadata(p) for p in dict.fromkeys(executables)})
         inspection_errors = []
         self.source = self._audit_show(MAIN, inspection_errors)
         if self.source is not None:
@@ -836,6 +1059,8 @@ class Controller:
         self.record('source-audit.json', audit)
         _raise_unsupported(audit['issues'])
         self.caps = frozenset(audit['source_caps'])
+        if cap_boundaries:
+            return  # No HAProxy/strace inventory execution or account changes.
         binary, metadata = _read_private_source(HAPROXY, 64 * 1024 * 1024)
         if not binary.startswith(b'\x7fELF\x02\x01') or binary[18:20] != b'\x3e\x00':
             raise Unsupported('haproxy-amd64-ELF-required')
@@ -894,31 +1119,14 @@ class Controller:
         pre = ['/usr/bin/python3', '-I', '-B', str(self.directory / 'gate.py'), str(go)]
         # Never interpolate show values. Every CLI property is a constant, a
         # validated capability token set, or a private generated path/nonce.
-        properties = {
-            'Description': 'Nathaya HAProxy probe ' + self.nonce + ' ' + phase,
-            'Type': 'simple', 'User': 'root', 'Group': 'root', 'UMask': '0077',
-            'Slice': 'system.slice', 'NoNewPrivileges': 'yes', 'PrivateTmp': 'yes',
-            'ProtectSystem': 'strict', 'ProtectHome': 'yes',
-            'ProtectKernelTunables': 'yes', 'ProtectKernelModules': 'yes',
-            'ProtectControlGroups': 'yes', 'RestrictSUIDSGID': 'yes', 'LockPersonality': 'yes',
-            'RestrictAddressFamilies': 'AF_INET AF_INET6 AF_UNIX',
-            'CapabilityBoundingSet': ' '.join(sorted(self.caps)), 'AmbientCapabilities': '',
-            'ReadWritePaths': LOGS, 'Restart': 'no', 'RestartSec': '3s',
-            'RuntimeMaxSec': '8s', 'TimeoutStartSec': '5s', 'TimeoutStopSec': '2s',
-            'TimeoutAbortSec': '2s', 'WatchdogSec': '0',
-            'KillMode': 'control-group', 'SendSIGKILL': 'yes',
-            'ExecStartPre': ' '.join(pre),
-            'StandardOutput': 'append:' + str(output), 'StandardError': 'append:' + str(output),
-        }
+        properties = {**restriction_properties(self.caps),
+                      'Description': 'Nathaya HAProxy probe ' + self.nonce + ' ' + phase,
+                      'ExecStartPre': ' '.join(pre),
+                      'StandardOutput': 'append:' + str(output), 'StandardError': 'append:' + str(output)}
         # SecureBits=0 and an empty SystemCallFilter are defaults. In particular
         # systemd-run's transient API does NOT accept all unit-file zero syntax.
         # Omit them, then require their effective values before releasing gate.
-        command = ['/usr/bin/systemd-run', '--no-block', '--unit=' + unit,
-                   '--description=' + properties['Description'], '--service-type=simple']
-        for key, value in properties.items():
-            if key not in ('Description', 'Type'):
-                command += ['--property=' + key + '=' + value]
-        command += ['--'] + argv
+        command = transient_command(unit, properties, argv)
         return {'phase': phase, 'unit': unit, 'command': command, 'argv': argv,
                 'pre': pre, 'go': go, 'output': output, 'properties': properties}
 
@@ -926,7 +1134,7 @@ class Controller:
         # Never borrow the production destination, even if File metadata exists.
         phase = plan.get('phase')
         directory = str(self.directory)
-        if (phase not in ('plain', 'trace') or not isinstance(self.directory, Path) or not re.fullmatch(
+        if (phase not in ('plain', 'trace', 'cap-gated', 'cap-direct') or not isinstance(self.directory, Path) or not re.fullmatch(
                 r'/run/nathaya-haproxy-probe\.[A-Za-z0-9_-]+', directory)):
             raise Unsupported('probe-output-plan')
         destination = str(self.directory / phase / 'combined.log')
@@ -977,13 +1185,21 @@ class Controller:
         return assignments
 
     def empty_probe_exec_fields(self, probe, plan):
+        return self._empty_exec_fields(probe, plan, PROBE_EMPTY_EXEC_HOOKS)
+
+    def control_empty_exec_fields(self, probe, plan):
+        if plan.get('phase') not in ('cap-gated', 'cap-direct'):
+            raise Unsupported('control-phase')
+        hooks = PROBE_EMPTY_EXEC_HOOKS + (('ExecStartPre',) if plan['phase'] == 'cap-direct' else ())
+        return self._empty_exec_fields(probe, plan, hooks)
+
+    def _empty_exec_fields(self, probe, plan, hooks):
         errors = []
         if not owned_unit(probe, plan.get('unit'), self.nonce):
             errors.append('probe-ownership')
         collect_unsupported(errors, _require, probe,
                             {'LoadState': 'loaded', 'DropInPaths': '', 'NeedDaemonReload': 'no'})
-        fields = frozenset(name + suffix for name in PROBE_EMPTY_EXEC_HOOKS
-                           for suffix in ('', 'Ex'))
+        fields = frozenset(name + suffix for name in hooks for suffix in ('', 'Ex'))
         declared = plan.get('properties')
         assignments = collect_unsupported(errors, self._plan_assignments, plan)
         if not isinstance(declared, dict):
@@ -1036,10 +1252,7 @@ class Controller:
             errors.append('probe-command-plan:ExecStartPre')
         _raise_unsupported(errors)
 
-    def validate_probe(self, probe, plan):
-        """Collect independent effective/plan/log/hook/argv failures; return None."""
-        if not isinstance(probe, dict) or not isinstance(plan, dict):
-            raise Unsupported('probe-snapshot-or-plan-format')
+    def _validate_probe_policy(self, probe, plan):
         errors = []
         unit = plan.get('unit')
         if not owned_unit(probe, unit, self.nonce):
@@ -1071,6 +1284,14 @@ class Controller:
             errors.append('RestrictAddressFamilies')
         if probe.get('SystemCallFilter') != '~':
             errors.append('SystemCallFilter')
+        _raise_unsupported(errors)
+
+    def validate_probe(self, probe, plan):
+        """Collect independent effective/plan/log/hook/argv failures; return None."""
+        if not isinstance(probe, dict) or not isinstance(plan, dict):
+            raise Unsupported('probe-snapshot-or-plan-format')
+        errors = []
+        collect_unsupported(errors, self._validate_probe_policy, probe, plan)
         collect_unsupported(errors, self.validate_probe_logging, probe, plan)
         collect_unsupported(errors, self._validate_probe_watchdog, probe, plan)
         collect_unsupported(errors, self._validate_probe_command_plan, plan)
@@ -1080,6 +1301,26 @@ class Controller:
             if key + 'Ex' in probe and not _exec_struct(probe[key + 'Ex'], argv):
                 errors.append(key + 'Ex')
         collect_unsupported(errors, self.empty_probe_exec_fields, probe, plan)
+        _raise_unsupported(errors)
+
+    def validate_control(self, probe, plan):
+        """Fixed Python-only command proof, independent of the HAProxy validator."""
+        if not isinstance(probe, dict) or not isinstance(plan, dict):
+            raise Unsupported('control-snapshot-or-plan-format')
+        expected = control_plan(self.directory, self.nonce, self.caps, plan.get('phase'))
+        errors = ['control-plan:' + key for key, value in expected.items() if plan.get(key) != value]
+        caps = collect_unsupported(errors, _capset, probe.get('CapabilityBoundingSet'))
+        if caps != self.caps:
+            errors.append('CapabilityBoundingSet')
+        collect_unsupported(errors, self._validate_probe_policy, probe, plan)
+        collect_unsupported(errors, self.validate_probe_logging, probe, plan)
+        collect_unsupported(errors, self._validate_probe_watchdog, probe, plan)
+        for key, argv in [('ExecStart', expected['argv'])] + ([('ExecStartPre', expected['pre'])] if expected['pre'] else []):
+            if not _exec_struct(probe.get(key), argv):
+                errors.append(key)
+            if key + 'Ex' in probe and not _exec_struct(probe[key + 'Ex'], argv):
+                errors.append(key + 'Ex')
+        collect_unsupported(errors, self.control_empty_exec_fields, probe, plan)
         _raise_unsupported(errors)
 
     def audit_compatibility(self, source=None, probe=None, *, fragment=None, plan=None,
@@ -1094,21 +1335,24 @@ class Controller:
         bytes, when both supplied, establish exact fragment-change evidence.
         No IO, execution, repairs, guessed hooks, or exception-based equivalence.
         """
+        control = isinstance(plan, dict) and plan.get('phase') in ('cap-gated', 'cap-direct')
+        validator = self.validate_control if control else self.validate_probe
+        empty_fields = self.control_empty_exec_fields if control else self.empty_probe_exec_fields
         validation = {'source': [], 'probe': [], 'original': []}
         source_caps = None
         source_empty, probe_empty, original_empty = (), (), ()
         if source is not None:
             if probe_source:
-                collect_unsupported(validation['source'], self.validate_probe, source, plan)
+                collect_unsupported(validation['source'], validator, source, plan)
             else:
                 source_caps = collect_unsupported(validation['source'], validate_effective, source, fragment)
             if not validation['source']:
-                source_empty = (self.empty_probe_exec_fields(source, plan) if probe_source else
+                source_empty = (empty_fields(source, plan) if probe_source else
                                 _source_empty_exec_fields(source, fragment))
         if probe is not None:
-            collect_unsupported(validation['probe'], self.validate_probe, probe, plan)
+            collect_unsupported(validation['probe'], validator, probe, plan)
             if not validation['probe']:
-                probe_empty = self.empty_probe_exec_fields(probe, plan)
+                probe_empty = empty_fields(probe, plan)
         if original is not None:
             collect_unsupported(validation['original'], validate_effective, original, original_fragment)
             if not validation['original']:
@@ -1162,7 +1406,14 @@ class Controller:
         return result
 
     def gate(self, plan):
+        # Only the fixed harmless direct control may start before comparison.
+        # ExecStartPre exits: PID 1 starts ExecStart independently, not its child.
+        direct = plan['phase'] == 'cap-direct'
+        if direct:
+            expected = control_plan(self.directory, self.nonce, self.caps, 'cap-direct')
+            _raise_unsupported(['control-plan'] if any(plan.get(k) != v for k, v in expected.items()) else [])
         unit = plan['unit']
+        state, substate, pidfield = ('active', 'running', 'MainPID') if direct else ('activating', 'start-pre', 'ControlPID')
         # Starts before systemd-run; do not release a missed/expired prestart.
         deadline = plan['created_at'] + 3.4
         probe, inspection_errors = None, []
@@ -1174,10 +1425,10 @@ class Controller:
             if not owned_unit(probe, unit, self.nonce):
                 inspection_errors.append('probe-ownership')
                 break
-            if (probe.get('ActiveState') == 'activating' and
-                    probe.get('SubState') == 'start-pre' and
-                    probe.get('ControlPID', '0') != '0'):
-                break
+            if (probe.get('ActiveState') == state and probe.get('SubState') == substate
+                    and probe.get(pidfield, '0') != '0'):
+                if not direct or any(r['stage'] == 'control-entry' for r in self.read_boundaries(plan)):
+                    break
             if probe.get('ActiveState') in ('failed', 'inactive'):
                 inspection_errors.append('prestart-unavailable')
                 break
@@ -1218,8 +1469,8 @@ class Controller:
         if live is not None:
             self.record(plan['phase'] + '/probe-live.show.json', live)
         if (live is None or not owned_unit(live, unit, self.nonce) or
-                live.get('ActiveState') != 'activating' or live.get('SubState') != 'start-pre' or
-                live.get('ControlPID') != probe.get('ControlPID')):
+                live.get('ActiveState') != state or live.get('SubState') != substate or
+                live.get(pidfield) != probe.get(pidfield)):
             live_errors.append('prestart-unavailable')
         if time.monotonic() >= deadline:
             live_errors.append('prestart-deadline')
@@ -1238,7 +1489,8 @@ class Controller:
         })
         _raise_unsupported(release_errors)
         self.release_reservations()
-        self.save(plan['phase'] + '/go', b'')
+        self.save(plan['phase'] + '/' + plan['go'].name, b'')
+        return live
 
     def capture(self, unit, sample):
         """Stage bounded metadata on an anchored task FD, then validate and save.
@@ -1328,6 +1580,15 @@ class Controller:
                     self.save(prefix + '.' + name, data)
                 if link is not None:
                     captures.append({'exe': link, 'status': parsed})
+                role = ('haproxy-root' if parsed['Uid'][1] == 0 else 'haproxy-worker') if link == HAPROXY else 'strace' if link == '/usr/bin/strace' else 'other'
+                stage = sample.split('/')[0] + ':' + role
+                # Retain the first observation of every credential/capability
+                # state, not just the first healthy state for this process role.
+                fields = ('Uid', 'Gid', 'Groups', 'CapInh', 'CapPrm', 'CapEff',
+                          'CapBnd', 'CapAmb', 'NoNewPrivs')
+                if not any(r['stage'] == stage and all(r['status'][k] == parsed[k] for k in fields)
+                           for r in self.process_boundaries):
+                    self.process_boundaries.append({'stage': stage, 'status': parsed, 'sample': sample})
             except (OSError, ValueError) as exc:
                 errors.append({'pid': pid, 'error': type(exc).__name__, 'errno': getattr(exc, 'errno', None)})
             finally:
@@ -1452,6 +1713,12 @@ class Controller:
     def run_phase(self, phase):
         _no_lock()
         plan = self.factory(phase)
+        self.boundary_plans.append(plan)
+        if phase == 'trace':
+            self.record('trace/selector.json', {'selector': 'trace=' + ','.join(SYSCALLS),
+                        'raw_selector': 'raw=clone,clone3,prctl', 'capset_selector_count': SYSCALLS.count('capset'),
+                        'notes': ['prctl 0x17 is PR_CAPBSET_READ (query, not mutation)',
+                                  'absence of capset in an excerpt is not proof of absence globally']})
         if self.show(plan['unit'], absent=True).get('LoadState') != 'not-found':
             raise Unsupported('unit-name-conflict')
         # Persist and register intent BEFORE systemd-run; interrupted creation
@@ -1477,12 +1744,120 @@ class Controller:
             with plan['output'].open('rb') as stream:
                 raw = stream.read(16 * 1024 * 1024 + 1)
             if len(raw) > 16 * 1024 * 1024:
-                trace = {'available': False, 'counts': [], 'identity_calls': 0, 'records': 0}
+                trace = {'available': False, 'counts': [], 'identity_calls': 0, 'records': 0, 'capset_records': None}
             else:
                 trace = sanitise_trace(raw.decode('utf-8', 'replace'))
             self.record('trace/sanitised.json', trace)
             return result, trace
         return result, None
+
+    def read_boundaries(self, plan):
+        _secure_path(plan['output'])
+        with plan['output'].open('rb') as stream:
+            raw = stream.read(65536)  # Snapshots precede unrelated HAProxy output.
+        return boundary_records(raw, str(self.directory / plan['phase']), plan['phase'] in ('cap-gated', 'cap-direct'))
+
+    def run_controls(self):
+        outcomes = {}
+        for phase in ('cap-gated', 'cap-direct'):
+            plan = control_plan(self.directory, self.nonce, self.caps, phase)
+            (self.directory / phase).mkdir(mode=0o700)
+            self.save(phase + '/combined.log', b'')
+            self.boundary_plans.append(plan)
+            outcomes[phase] = 'unavailable'
+            try:
+                _no_lock()
+                if self.show(plan['unit'], absent=True).get('LoadState') != 'not-found':
+                    raise Unsupported('unit-name-conflict')
+                self.intents.append(plan['unit'])
+                self.record(phase + '/intent.json', {'unit': plan['unit'], 'nonce': self.nonce, 'command': plan['command']})
+                plan['created_at'] = time.monotonic()
+                code, _, _ = self.command(plan['command'])
+                if code != 0:
+                    raise Unsupported('transient-create-unavailable')
+                self.creation_confirmed.add(plan['unit'])
+                profile = self.gate(plan)
+                deadline = time.monotonic() + 3.4
+                released = phase == 'cap-direct'  # Direct gate released control-go.
+                while time.monotonic() < deadline:
+                    records = self.read_boundaries(plan)
+                    if any(r['stage'] == 'control-entry' for r in records) and not released:
+                        live = self.show(plan['unit'], timeout=max(0.01, deadline - time.monotonic()))
+                        audit = self.audit_compatibility(profile, live, plan=plan, probe_source=True)
+                        self.record(phase + '/helper-comparison.json', audit)
+                        _raise_unsupported(audit['issues'])
+                        if live.get('ActiveState') != 'active' or live.get('SubState') != 'running':
+                            raise Unsupported('control-helper-unavailable')
+                        _no_lock()
+                        self.save(phase + '/control-go', b'')
+                        profile, released = live, True
+                    if any(r['stage'] == 'after-exec' for r in records):
+                        expected = ['gate-entry', 'gate-exit'] if phase == 'cap-gated' else []
+                        if [r['stage'] for r in records] != expected + ['control-entry', 'after-exec']:
+                            raise Unsupported('control-record-sequence')
+                        self.control_profiles[phase], self.control_records[phase] = profile, records
+                        outcomes[phase] = 'recorded'
+                        break
+                    time.sleep(0.025)
+                self.record(phase + '/control-result.json', {'status': outcomes[phase]})
+            except Unsupported as exc:
+                self.record(phase + '/control-result.json', {'status': 'unavailable', 'issues': list(exc.labels)})
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                self.record(phase + '/control-result.json', {'status': 'unavailable', 'unavailable': type(exc).__name__})
+            finally:
+                if plan['unit'] in self.intents:
+                    if self.cleanup_one(plan['unit']):
+                        self.intents.remove(plan['unit'])
+                    else:
+                        self.cleanup_confirmed = False
+        if len(self.control_profiles) == 2:
+            a, b = (self.control_profiles[p] for p in ('cap-gated', 'cap-direct'))
+            pa, pb = (control_plan(self.directory, self.nonce, self.caps, p) for p in ('cap-gated', 'cap-direct'))
+            ea, eb = self.control_empty_exec_fields(a, pa), self.control_empty_exec_fields(b, pb)
+            comparison = _comparison_inventory(a, b, empty_source=ea, empty_probe=eb)
+            self.record('boundaries.control-comparison.json', comparison)
+            _raise_unsupported(restriction_differences(a, b, checked_empty_source=ea, checked_empty_probe=eb))
+        return outcomes
+
+    def boundary_report(self):
+        rows = list(self.boundaries)
+        for plan in self.boundary_plans:
+            try:
+                records = self.read_boundaries(plan)
+            except (OSError, ValueError):
+                records = []
+            self.record(plan['phase'] + '/boundaries.json', records)
+            rows.extend({'stage': plan['phase'] + ':' + r['stage'], 'available': True, 'status': r['status']} for r in records)
+            rows.extend(r for r in self.process_boundaries if r['stage'].startswith(plan['phase'] + ':'))
+        summary = []
+        for row in rows:
+            status = row.get('status')
+            summary.append({'stage': row['stage'], 'available': bool(status),
+                            'SETUID': {k: bool(status[k] & 0x80) for k in ('CapInh', 'CapPrm', 'CapEff', 'CapBnd', 'CapAmb')} if status else None})
+        # Controller is a D-Bus client, not the service's credential parent.
+        # Non-root workers normally lose these capabilities after their UID drop.
+        for observation, row in zip(summary, rows):
+            observation['scope'] = ('independent-context' if row['stage'] in ('controller', 'manager') else
+                                    'unit-root' if row.get('status', {}).get('Uid', (None, None))[1] == 0 else
+                                    'unit-nonroot' if row.get('status') else 'unavailable')
+            if 'sample' in row:
+                observation['sample'] = row['sample']
+        root_units = [r for r in summary if r['scope'] == 'unit-root']
+        first = next((r['stage'] for r in root_units if r['SETUID'] and
+                      not (r['SETUID']['CapEff'] and r['SETUID']['CapPrm'])),
+                     'not-observed' if root_units else 'unavailable')
+        views = []
+        for phase in ('cap-gated', 'cap-direct'):
+            views.append([{k: r['status'][k] for k in ('CapInh', 'CapPrm', 'CapEff', 'CapBnd', 'CapAmb', 'NoNewPrivs', 'Uid', 'Gid', 'Groups')}
+                          for r in self.control_records.get(phase, []) if r['stage'] in ('control-entry', 'after-exec')])
+        different = views[0] != views[1] if all(len(v) == 2 for v in views) else None
+        self.record('boundaries.report.json', {'observations': summary, 'first_observed_missing_SETUID_EP': first,
+                    'headline_scope': 'root unit tasks only; independent contexts and non-root workers excluded',
+                    'gated_direct_differ': different, 'ordering': 'observation stages, not a causal inheritance chain',
+                    'limits': ['helper entry is after Python initialization', 'manager and controller are independent contexts',
+                               'client env -i/FIXED_ENV is not the unit environment', 'bounding does not imply permitted/effective',
+                               'missing masks alone do not establish root cause']})
+        return first
 
     def cleanup(self):
         self.release_reservations()
@@ -1495,9 +1870,12 @@ class Controller:
 
 
 def main(argv=None):
-    if (sys.argv[1:] if argv is None else argv) != ['--run']:
-        print('Usage: bash tools/diagnose-haproxy.sh --help | --run', file=sys.stderr)
+    args = sys.argv[1:] if argv is None else argv
+    if args not in (['--run'], ['--cap-boundaries']):
+        print('Usage: bash tools/diagnose-haproxy.sh --help | --run | --cap-boundaries', file=sys.stderr)
         return 64
+    cap_boundaries = args == ['--cap-boundaries']
+    outcomes = {}
     controller, status, exitcode = Controller(), 'unavailable', 2
     interrupted = False
     old_handlers = {}
@@ -1508,9 +1886,14 @@ def main(argv=None):
     try:
         for signum in (signal.SIGINT, signal.SIGTERM):
             old_handlers[signum] = signal.signal(signum, interrupt)
-        controller.prepare()
-        status, _ = controller.run_phase('plain')
-        print('plain startup: ' + status)
+        if cap_boundaries:
+            controller.prepare(cap_boundaries=True)
+            outcomes = controller.run_controls()
+            exitcode = 0 if all(v == 'recorded' for v in outcomes.values()) else 2
+        else:
+            controller.prepare()
+            status, _ = controller.run_phase('plain')
+            print('plain startup: ' + status)
         if status == 'observed-running':
             exitcode = 0
         elif status == 'failed':
@@ -1549,6 +1932,13 @@ def main(argv=None):
             if not interrupted:
                 exitcode = 2
         if controller.directory is not None:
+            try:
+                first = controller.boundary_report()
+            except (OSError, ValueError):
+                first, exitcode = 'unavailable', 2
+            prefix = ('control gated/direct: ' + outcomes.get('cap-gated', 'unavailable') + '/' +
+                      outcomes.get('cap-direct', 'unavailable') + '; ') if cap_boundaries else ''
+            print(prefix + 'first root-unit observation missing SETUID (E/P): ' + first + ' (not a root cause)')
             print('private evidence: ' + str(controller.directory))
         for signum, handler in old_handlers.items():
             signal.signal(signum, handler)

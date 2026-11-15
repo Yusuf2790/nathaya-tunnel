@@ -31,7 +31,7 @@ import stat
 import subprocess
 import tempfile
 import time
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 import unittest
 import urllib.request
 from unittest.mock import Mock, patch
@@ -126,7 +126,7 @@ class Offline(unittest.TestCase):
             (builtins, ('open',)), (io, ('open',)),
             (subprocess, ('run', 'Popen', 'call', 'check_call', 'check_output', 'getoutput', 'getstatusoutput')),
             (os, ('system', 'popen', 'open', 'read', 'close', 'fdopen', 'fstat',
-                  'stat', 'lstat', 'access', 'listdir', 'scandir',
+                  'stat', 'lstat', 'access', 'listdir', 'scandir', 'getxattr',
                   'readlink', 'mkdir', 'makedirs', 'remove', 'unlink', 'rmdir', 'rename',
                   'replace', 'chmod', 'chown', 'link', 'symlink', 'umask', 'kill', 'killpg',
                   'urandom', 'fork', 'execv', 'execve', 'posix_spawn', 'posix_spawnp',
@@ -178,7 +178,8 @@ class Offline(unittest.TestCase):
             'TimeoutStartUSec': '5s', 'TimeoutStopUSec': '2s', 'TimeoutAbortUSec': '2s',
             'CanReload': 'no', 'StandardOutputFile': str(plan['output']),
             'StandardErrorFile': str(plan['output']),
-            'ExecStart': exec_property(plan['argv']), 'ExecStartPre': exec_property(plan['pre']),
+            'ExecStart': exec_property(plan['argv']),
+            'ExecStartPre': exec_property(plan['pre']) if plan['pre'] else '',
             'ExecReload': '',
         })
         # Both disabled v255 spellings are valid: retain the source spelling
@@ -204,11 +205,11 @@ class Offline(unittest.TestCase):
                 {'side_effect': clock} if isinstance(clock, list) else {'return_value': clock})))
             c.gate(plan)
 
-    def main_with(self, c):
+    def main_with(self, c, args=None):
         out, err = io.StringIO(), io.StringIO()
         with patch.object(self.D, 'Controller', return_value=c), patch.object(signal, 'signal'), \
                 patch.object(sys, 'stdout', out), patch.object(sys, 'stderr', err):
-            rc = self.D.main(['--run'])
+            rc = self.D.main(['--run'] if args is None else args)
         return rc, out.getvalue(), err.getvalue()
 
 
@@ -235,9 +236,16 @@ class ImportAndShellContracts(Offline):
         self.assertEqual(len(statements), 2)
         self.assertTrue(statements[0].startswith('builtin printf '))
         self.assertEqual(statements[1], 'return 0')
-        self.assertIn('1:--run) ;;', prefix)
+        self.assertIn('1:--run|1:--cap-boundaries) ;;', prefix)
+        # Dispatch exactly one allowlisted argument, never arbitrary shell argv.
+        self.assertIn('case "$#:${1-}" in', prefix)
+        self.assertIn('*) builtin printf', prefix)
+        self.assertIn('>&2; return 64 ;;', prefix)
         self.assertIn('exec /usr/bin/env -i PATH=', prefix)  # TERM/INT reach controller PID.
-        self.assertIn('/usr/bin/python3 -I -B - --run', prefix)
+        self.assertIn('/usr/bin/python3 -I -B - "$1" ' + START.rstrip('\n'), prefix)
+        self.assertEqual(prefix.count('/usr/bin/python3 -I -B - "$1"'), 1)
+        self.assertNotIn('/usr/bin/python3 -I -B - "$@"', prefix)
+        self.assertLess(prefix.index('return 64 ;;'), prefix.index('exec /usr/bin/env -i'))
         tail = SHELL.split('\n' + MARKER + '\n', 1)[1]
         self.assertRegex(tail, r'if \[\[ "\$\{BASH_SOURCE\[0\]\}" == "\$0" \]\]; then\s+nathaya_diagnose_haproxy_main "\$@"\s+fi')
         self.assertNotRegex(prefix, r'\b(?:source|systemctl|systemd-run|sudo|apt|curl|wget)\b')
@@ -1543,7 +1551,7 @@ class PureContracts(Offline):
         ))
         result = self.D.sanitise_trace(raw)
         self.assertEqual(result, {'available': True, 'identity_calls': 1, 'records': 3,
-                                 'counts': [{'syscall': 'setgid', 'errno': 'EINVAL', 'count': 2},
+                                 'capset_records': 0, 'counts': [{'syscall': 'setgid', 'errno': 'EINVAL', 'count': 2},
                                             {'syscall': 'setuid', 'errno': 'EPERM', 'count': 1}]})
         encoded = json.dumps(result)
         for value in ('PRIVATE_FIXTURE_VALUE', '98765', '45678', '123', 'args', 'secret'):
@@ -1568,11 +1576,11 @@ class CaptureContracts(Offline):
     def status_bytes(self, pid=101, parent=1, uid=0, gid=0, caps=0x4e0):
         return (f'Pid:\t{pid}\nPPid:\t{parent}\nUid:\t' + f'{uid} ' * 4 +
                 '\nGid:\t' + f'{gid} ' * 4 + f'\nGroups:\t{gid}\n' +
-                f'CapEff:\t{caps:x}\nCapPrm:\t{caps:x}\nCapBnd:\t4e0\n'
+                f'CapInh:\t0\nCapEff:\t{caps:x}\nCapPrm:\t{caps:x}\nCapBnd:\t4e0\n'
                 'CapAmb:\t0\nNoNewPrivs:\t1\n').encode()
 
     def virtual_capture(self, c, unit=None, changes=None, procs=b'101\n', links=None,
-                        extra=None, save_error=False, read_error=None):
+                        extra=None, save_error=False, read_error=None, sample='plain/sample-000'):
         unit = unit or 'nathaya-haproxy-probe-' + NONCE + '-plain.service'
         member = ('0::/system.slice/' + unit + '\n').encode()
         files = {101: {'cgroup': [member, member],
@@ -1663,7 +1671,7 @@ class CaptureContracts(Offline):
                 patch.object(os, 'close', side_effect=closing), \
                 patch.object(os, 'readlink', side_effect=readlink):
             try:
-                result = c.capture(unit, 'plain/sample-000')
+                result = c.capture(unit, sample)
             finally:
                 self.assertEqual(live, {}, 'All FDs must close even on refusal/errors')
                 self.assertEqual(len(closed), len(opened))
@@ -1721,6 +1729,26 @@ class CaptureContracts(Offline):
         self.assertIn(b'CapEff:\t4e0', saved['status'])
         self.assertNotIn(b'PRIVATE_STAT_MEMORY', b''.join(saved.values()))
         self.assertEqual(c.record.call_args.args[1]['errors'], [])
+
+    def test_capture_retains_first_unique_root_state_and_sample_after_later_capability_loss(self):
+        c = self.controller()
+        c.boundary_plans = [self.plan(c)]
+        for index, caps in enumerate((0x4e0, 0x4e0, 0x460, 0x460)):
+            self.virtual_capture(c, changes={'status': [self.status_bytes(caps=caps)]},
+                                 sample=f'plain/sample-{index:03d}')
+        self.assertEqual([r['stage'] for r in c.process_boundaries], ['plain:haproxy-root'] * 2)
+        self.assertEqual([r['sample'] for r in c.process_boundaries],
+                         ['plain/sample-000', 'plain/sample-002'])
+        self.assertEqual([(r['status']['CapEff'], r['status']['CapPrm'])
+                          for r in c.process_boundaries], [(0x4e0, 0x4e0), (0x460, 0x460)])
+        c.read_boundaries = Mock(return_value=[])
+        self.assertEqual(c.boundary_report(), 'plain:haproxy-root')
+        report = c.record.call_args.args[1]
+        self.assertEqual([r['sample'] for r in report['observations']],
+                         ['plain/sample-000', 'plain/sample-002'])
+        self.assertEqual([r['scope'] for r in report['observations']], ['unit-root'] * 2)
+        self.assertTrue(report['observations'][0]['SETUID']['CapEff'])
+        self.assertFalse(report['observations'][1]['SETUID']['CapEff'])
 
     def test_capture_exe_denied_preserves_caps_but_cannot_establish_identity(self):
         c = self.controller()
@@ -2068,6 +2096,526 @@ class ControllerContracts(Offline):
         rc, out, _ = self.main_with(c)
         self.assertEqual(rc, 2)
         self.assertIn('cleanup: unconfirmed', out)
+
+
+class CapabilityBoundaryContracts(Offline):
+    """Fixed Python controls and metadata only; helpers are never executed."""
+
+    def control(self, c, phase='cap-gated'):
+        return self.D.control_plan(c.directory, c.nonce, c.caps, phase)
+
+    def control_probe(self, c, plan):
+        p = self.probe(c, plan)
+        if plan['phase'] == 'cap-direct':
+            p.update(ActiveState='active', SubState='running', MainPID='42', ControlPID='0')
+        return p
+
+    def boundary(self, c, phase='cap-gated', stage='control-entry', **changes):
+        r = dict(tag=self.D.BOUNDARY_TAG, stage=stage, token=str(c.directory / phase),
+                 status=CaptureContracts.status_bytes(self).decode() + 'TracerPid:\t0\nSeccomp:\t2\n',
+                 exe='/usr/bin/python3.12', env_present=dict.fromkeys(self.D.ENV_NAMES, False))
+        r.update(changes)
+        return r
+
+    def records(self, c, phase):
+        stages = (['gate-entry', 'gate-exit'] if phase == 'cap-gated' else [])
+        stages += ['control-entry', 'after-exec']
+        raw = '\n'.join(json.dumps(self.boundary(c, phase, stage)) for stage in stages)
+        return self.D.boundary_records(raw, str(c.directory / phase), control=True)
+
+    def test_control_plans_share_exact_restrictions_without_listener_or_application_payload(self):
+        for old in (True, False):
+            c = self.controller(old)
+            before = copy.deepcopy((c.source, c.fragment, c.caps))
+            plain = self.plan(c)
+            for phase in ('cap-gated', 'cap-direct'):
+                plan = self.control(c, phase)
+                self.assertEqual(plan['argv'], ['/usr/bin/python3', '-I', '-B',
+                                 str(c.directory / 'control.py'), str(c.directory / phase / 'control-go')])
+                expected = self.D.restriction_properties(c.caps)
+                self.assertEqual({k: plan['properties'][k] for k in expected}, expected)
+                self.assertEqual({k: plain['properties'][k] for k in expected}, expected)
+                self.assertEqual(plan['command'], self.D.transient_command(
+                    plan['unit'], plan['properties'], plan['argv']))
+                if phase == 'cap-gated':
+                    self.assertEqual(plan['pre'], ['/usr/bin/python3', '-I', '-B',
+                                     str(c.directory / 'gate.py'), str(c.directory / phase / 'go')])
+                    self.assertEqual(plan['properties']['ExecStartPre'], ' '.join(plan['pre']))
+                else:
+                    self.assertEqual(plan['pre'], [])
+                    self.assertNotIn('ExecStartPre', plan['properties'])
+                    self.assertEqual(plan['go'], plan['control_go'])
+                for forbidden in ('/usr/sbin/haproxy', '/usr/bin/strace', 'haproxy.cfg',
+                                  '127.0.0.1', 'abns@', '/bin/sh'):
+                    self.assertNotIn(forbidden, ' '.join(plan['command']))
+                self.assertNotIn('-c', plan['command'])
+            self.assertEqual((c.source, c.fragment, c.caps), before)
+        for phase, nonce, directory in (('plain', NONCE, c.directory),
+                                        ('cap-direct', 'A' * 32, c.directory),
+                                        ('cap-gated', NONCE, Path('/tmp/untrusted'))):
+            with self.assertRaises(self.D.Unsupported):
+                self.D.control_plan(directory, nonce, CAPS3, phase)
+
+    def test_validate_control_exact_plans_reject_arbitrary_argv_and_shadow_properties(self):
+        c = self.controller()
+        for phase in ('cap-gated', 'cap-direct'):
+            good = self.control(c, phase)
+            probe = self.control_probe(c, good)
+            c.validate_control(probe, good)
+            self.assertTrue(c.audit_compatibility(c.source, probe, fragment=c.fragment, plan=good)['ok'])
+            for key in ('argv', 'pre', 'go', 'control_go', 'unit', 'output', 'properties', 'command'):
+                bad = copy.deepcopy(good)
+                if key in ('argv', 'pre'):
+                    bad[key] = ['/bin/true']
+                elif key == 'properties':
+                    bad[key]['User'] = 'haproxy'
+                elif key == 'command':
+                    bad[key].insert(bad[key].index('--'), '--property=User=haproxy')
+                else:
+                    bad[key] = 'untrusted'
+                with self.subTest(phase=phase, key=key), self.assertRaisesRegex(
+                        self.D.Unsupported, 'control-plan:' + key):
+                    c.validate_control(probe, bad)
+            bad = copy.deepcopy(good)
+            bad['argv'] = ['/bin/true']
+            bad['command'] = self.D.transient_command(bad['unit'], bad['properties'], bad['argv'])
+            with self.assertRaises(self.D.Unsupported):
+                c.validate_control(dict(probe, ExecStart=exec_property(bad['argv'])), bad)
+
+    def test_control_effective_root_security_and_capability_widening_are_not_authorized(self):
+        for old in (True, False):
+            c = self.controller(old)
+            plan = self.control(c)
+            good = self.control_probe(c, plan)
+            for key, value in (('User', 'haproxy'), ('Group', 'haproxy'),
+                               ('NoNewPrivileges', 'no'), ('SystemCallFilter', '@mount'),
+                               ('AmbientCapabilities', 'CAP_SETUID'), ('RootDirectory', '/tmp'),
+                               ('CapabilityBoundingSet', ' '.join(sorted(c.caps | {'CAP_SYS_ADMIN'})))):
+                with self.subTest(old=old, key=key), self.assertRaisesRegex(self.D.Unsupported, key):
+                    c.validate_control(dict(good, **{key: value}), plan)
+            if old:
+                widened = dict(good, CapabilityBoundingSet=' '.join(sorted(CAPS4)))
+                # This validator must bind the effective set to this source's
+                # plan, not merely accept either globally supported profile.
+                with self.assertRaisesRegex(self.D.Unsupported, 'CapabilityBoundingSet'):
+                    c.validate_control(widened, plan)
+                audit = c.audit_compatibility(c.source, widened, fragment=c.fragment, plan=plan)
+                self.assertFalse(audit['ok'])
+                self.assertIn('CapabilityBoundingSet', audit['unsupported'])
+                bad = copy.deepcopy(plan)
+                bad['properties']['CapabilityBoundingSet'] = ' '.join(sorted(CAPS4))
+                bad['command'] = self.D.transient_command(bad['unit'], bad['properties'], bad['argv'])
+                with self.assertRaisesRegex(self.D.Unsupported, 'control-plan:'):
+                    c.validate_control(widened, bad)
+
+    def test_control_pre_aliases_and_hidden_hooks_cannot_escape_validation(self):
+        c = self.controller()
+        for phase in ('cap-gated', 'cap-direct'):
+            plan = self.control(c, phase)
+            good = self.control_probe(c, plan)
+            if plan['pre']:
+                c.validate_control(dict(good, ExecStartPreEx=good['ExecStartPre']), plan)
+            else:
+                for key in ('ExecStartPre', 'ExecStartPreEx'):
+                    absent = dict(good)
+                    absent.pop(key, None)
+                    c.validate_control(absent, plan)
+            for key in ('ExecStartEx', 'ExecStartPre', 'ExecStartPreEx', 'ExecStopEx', 'ExecCondition'):
+                with self.subTest(phase=phase, key=key), self.assertRaisesRegex(self.D.Unsupported, key):
+                    c.validate_control(dict(good, **{key: exec_property(['/bin/true'])}), plan)
+            hooks = ('ExecStopEx', 'ExecStartPost', 'ExecReloadEx')
+            if phase == 'cap-direct':
+                hooks += ('ExecStartPre', 'ExecStartPreEx')
+            for key in hooks:
+                for form in (None, ['--property=' + key + '='], ['--property', key + '='],
+                             ['-p', key + '='], ['-p' + key + '=']):
+                    bad = copy.deepcopy(plan)
+                    if form is None:
+                        bad['properties'][key] = ''
+                    else:
+                        index = bad['command'].index('--')
+                        bad['command'][index:index] = form
+                    with self.subTest(phase=phase, key=key, form=form), self.assertRaises(self.D.Unsupported):
+                        c.validate_control(good, bad)
+
+    def test_normal_probe_validator_never_accepts_control_or_omitted_gate(self):
+        c = self.controller()
+        for phase in ('cap-gated', 'cap-direct'):
+            plan = self.control(c, phase)
+            with self.assertRaisesRegex(self.D.Unsupported, 'probe-command-plan'):
+                c.validate_probe(self.control_probe(c, plan), plan)
+        for phase in ('plain', 'trace'):
+            plan = self.plan(c, phase)
+            probe = self.probe(c, plan)
+            plan['pre'] = []
+            plan['properties'].pop('ExecStartPre')
+            plan['command'] = [a for a in plan['command'] if not a.startswith('--property=ExecStartPre=')]
+            probe.pop('ExecStartPre')
+            with self.assertRaisesRegex(self.D.Unsupported, 'ExecStartPre'):
+                c.validate_probe(probe, plan)
+
+    def test_status_requires_inheritable_and_parses_all_five_masks(self):
+        raw = CaptureContracts.status_bytes(self).decode()
+        raw = raw.replace('CapInh:\t0', 'CapInh:\t80').replace('CapAmb:\t0', 'CapAmb:\tA')
+        status = self.D._status(raw)
+        self.assertEqual({k: status[k] for k in ('CapInh', 'CapPrm', 'CapEff', 'CapBnd', 'CapAmb')},
+                         dict(CapInh=0x80, CapPrm=0x4e0, CapEff=0x4e0, CapBnd=0x4e0, CapAmb=10))
+        for bad in (raw.replace('CapInh:\t80\n', ''), raw + 'CapInh:\t0\n',
+                    raw.replace('CapInh:\t80', 'CapInh:\tzz'),
+                    raw.replace('CapInh:\t80', 'CapInh:\t' + 'f' * 17)):
+            with self.assertRaisesRegex(ValueError, 'proc-status'):
+                self.D._status(bad)
+
+    def test_embedded_helpers_emit_presence_only_and_hardcoded_isolated_python_self_exec(self):
+        for program in (self.D.BOUNDARY_PROGRAM, self.D.GATE_PROGRAM, self.D.CONTROL_PROGRAM):
+            tree = ast.parse(program)
+            compile(tree, 'boundary-helper-static-contract', 'exec')
+            self.assertIn("'CapInh','CapPrm','CapEff'", program)
+            self.assertIn("'CapBnd','CapAmb'", program)
+            self.assertIn('len(data) > 8192', program)
+            self.assertIn('env_present={n: n in os.environ for n in env}', program)
+            self.assertNotIn('os.environ[', program)
+            self.assertNotIn('os.environ.get', program)
+            self.assertNotIn('subprocess', program)
+            self.assertNotIn('socket', program)
+        self.assertIn("emit('gate-entry', str(p.parent))", self.D.GATE_PROGRAM)
+        self.assertIn("emit('gate-exit', str(p.parent))", self.D.GATE_PROGRAM)
+        self.assertIn("emit('control-entry', str(p.parent))", self.D.CONTROL_PROGRAM)
+        self.assertIn("emit('after-exec', str(p.parent))", self.D.CONTROL_PROGRAM)
+        calls = [n for n in ast.walk(ast.parse(self.D.CONTROL_PROGRAM))
+                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == 'execv']
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(ast.literal_eval(calls[0].args[0]), '/usr/bin/python3')
+        argv = calls[0].args[1].elts
+        self.assertEqual([ast.literal_eval(n) for n in argv[:3]], ['/usr/bin/python3', '-I', '-B'])
+        self.assertEqual(ast.literal_eval(argv[-1]), 'after-exec')
+        self.assertIsInstance(argv[3], ast.Name)
+        self.assertEqual(argv[3].id, '__file__')
+        self.assertNotIn('execv', self.D.GATE_PROGRAM)
+
+    def test_boundary_records_accept_only_bounded_stage_schema_and_boolean_environment(self):
+        c = self.controller()
+        records = self.records(c, 'cap-gated')
+        self.assertEqual([r['stage'] for r in records],
+                         ['gate-entry', 'gate-exit', 'control-entry', 'after-exec'])
+        for r in records:
+            self.assertEqual(r['status']['CapInh'], 0)
+            self.assertEqual(r['optional_status'], {'TracerPid': 0, 'Seccomp': 2})
+            self.assertEqual(r['env_present'], dict.fromkeys(self.D.ENV_NAMES, False))
+        raw = '\n'.join(json.dumps(self.boundary(c, stage=stage)) for stage in
+                        ('gate-entry', 'gate-exit', 'control-entry', 'after-exec'))
+        self.assertEqual([r['stage'] for r in self.D.boundary_records(raw, str(c.directory / 'cap-gated'))],
+                         ['gate-entry', 'gate-exit'])
+
+    def test_boundary_records_discard_wrong_tokens_stages_duplicate_keys_and_bad_records(self):
+        c = self.controller()
+        good = self.boundary(c)
+        bad = [dict(good, token='wrong'), dict(good, tag='wrong'), dict(good, stage='pre-exec'),
+               dict(good, exe='/tmp/python3'), dict(good, status='not status'),
+               dict(good, status=good['status'].replace('CapInh:\t0\n', '')),
+               dict(good, env_present=dict.fromkeys(self.D.ENV_NAMES, 'PRIVATE_ENV_VALUE')),
+               dict(good, env_present=dict.fromkeys(self.D.ENV_NAMES, 0)),
+               dict(good, env_present={}), dict(good, extra='PRIVATE_EXTRA'), [], None]
+        lines = [json.dumps(r) for r in bad]
+        lines += ['{"tag":"shadow",' + json.dumps(good)[1:],
+                  json.dumps(good).replace('"LD_PRELOAD": false', '"LD_PRELOAD": false, "LD_PRELOAD": true'),
+                  'not-json', json.dumps(good) + ' ' * 8193]
+        for line in lines:
+            with self.subTest(kind=line[:30]):
+                self.assertEqual(self.D.boundary_records(line, good['token'], control=True), [])
+        accepted = self.D.boundary_records('\n'.join(lines + [json.dumps(good)]), good['token'], control=True)
+        self.assertEqual(len(accepted), 1)
+        self.assertNotIn('PRIVATE_', json.dumps(accepted))
+
+    def test_trace_selector_counts_capset_once_and_prctl_queries_do_not_imply_mutation(self):
+        c = self.controller()
+        plan = self.plan(c, 'trace')
+        selectors = [a for a in plan['argv'] if a.startswith('trace=')]
+        self.assertEqual(len(selectors), 1)
+        self.assertEqual(selectors[0][6:].split(',').count('capset'), 1)
+        self.assertEqual(self.D.SYSCALLS.count('capset'), 1)
+        query = self.D.sanitise_trace('prctl(0x17, 0x7, 0, 0, 0) = 1\ngetuid() = 0\n')
+        self.assertEqual(query, dict(available=True, identity_calls=1, records=2, capset_records=0, counts=[]))
+        caps = self.D.sanitise_trace('capset(0, 0) = 0\ncapset(0, 0) = -1 EPERM (private)\n'
+                                     '<... capset resumed>) = 0\ncapset(0 <unfinished ...>\n')
+        self.assertEqual(caps, dict(available=False, identity_calls=0, records=3, capset_records=3,
+                                   counts=[dict(syscall='capset', errno='EPERM', count=1)]))
+        c.factory = Mock(return_value=plan)
+        c.show = Mock(return_value={'LoadState': 'loaded'})
+        c.command = Mock()
+        with patch.object(self.D, '_no_lock'), self.assertRaisesRegex(self.D.Unsupported, 'unit-name-conflict'):
+            c.run_phase('trace')
+        evidence = next(call.args[1] for call in c.record.call_args_list if call.args[0] == 'trace/selector.json')
+        self.assertEqual(evidence['capset_selector_count'], 1)
+        self.assertIn('prctl 0x17 is PR_CAPBSET_READ (query, not mutation)', evidence['notes'])
+        c.command.assert_not_called()
+
+    def test_fixed_snapshot_limits_pid_and_anchors_bounded_reads_with_presence_only_environment(self):
+        with patch.object(os, 'getpid', return_value=99), patch.object(os, 'open') as opening:
+            with self.assertRaisesRegex(ValueError, 'fixed-pid'):
+                self.D.fixed_snapshot(100)
+        opening.assert_not_called()
+        for pid in (1, 99):
+            opened, streams, sizes = [], [], []
+            class BoundedStream(io.BytesIO):
+                def read(stream, size=-1):
+                    self.assertIn(size, (4097, 65537))
+                    sizes.append(size)
+                    return super().read(size)
+            def opening(path, flags, *, dir_fd=None):
+                opened.append((path, flags, dir_fd))
+                if path == '/proc/' + str(pid):
+                    self.assertEqual(flags, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                    self.assertIsNone(dir_fd)
+                    return 10
+                self.assertEqual(dir_fd, 10)
+                self.assertEqual(flags, os.O_RDONLY | os.O_NOFOLLOW)
+                self.assertIn(path, ('stat', 'status'))
+                return 11 if path == 'stat' else 12
+            def fdopen(fd, mode):
+                self.assertEqual(mode, 'rb')
+                data = (CaptureContracts.stat_bytes(self, pid) if fd == 11 else
+                        CaptureContracts.status_bytes(self, pid))
+                stream = BoundedStream(data)
+                streams.append(stream)
+                return stream
+            with patch.object(os, 'getpid', return_value=99), \
+                    patch.object(os, 'open', side_effect=opening), patch.object(os, 'fdopen', side_effect=fdopen), \
+                    patch.object(os, 'readlink', return_value='/usr/bin/python3.12') as link, \
+                    patch.object(os, 'close') as close, \
+                    patch.dict(os.environ, {'LD_PRELOAD': 'PRIVATE_ENV_VALUE'}, clear=True):
+                snapshot = self.D.fixed_snapshot(pid, environment=True)
+            self.assertTrue(snapshot['available'])
+            self.assertEqual(snapshot['status']['Pid'], pid)
+            self.assertEqual(snapshot['status']['CapInh'], 0)
+            self.assertTrue(snapshot['env_present']['LD_PRELOAD'])
+            self.assertFalse(snapshot['env_present']['PYTHONPATH'])
+            self.assertNotIn('PRIVATE_ENV_VALUE', json.dumps(snapshot))
+            self.assertEqual([p for p, _, _ in opened], ['/proc/' + str(pid), 'stat', 'status', 'stat'])
+            self.assertEqual(link.call_count, 2)
+            link.assert_called_with('exe', dir_fd=10)
+            close.assert_called_once_with(10)
+            self.assertTrue(all(s.closed for s in streams))
+            self.assertEqual(sizes, [4097, 65537, 4097])
+
+    def test_executable_metadata_trusts_only_root_symlinks_and_distinguishes_missing_filecap_from_denial(self):
+        file = SimpleNamespace(st_mode=stat.S_IFREG | 0o755, st_uid=0, st_gid=0,
+                               st_nlink=1, st_dev=2, st_ino=3, st_size=4, st_mtime_ns=5)
+        directory = SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=0, st_gid=0)
+        link = SimpleNamespace(st_mode=stat.S_IFLNK | 0o777, st_uid=0, st_gid=0)
+        for refusal in (None, 'link-owner', 'parent-owner', 'parent-writable'):
+            for error in (errno.ENODATA, errno.EPERM):
+                def info(path):
+                    if str(path) == '/usr/bin/python3':
+                        return SimpleNamespace(**{**vars(link), 'st_uid': 1000 if refusal == 'link-owner' else 0})
+                    if str(path) == '/usr/bin/python3.12':
+                        return file
+                    if str(path) == '/usr/bin' and refusal == 'parent-owner':
+                        return SimpleNamespace(**{**vars(directory), 'st_uid': 1000})
+                    if str(path) == '/usr/bin' and refusal == 'parent-writable':
+                        return SimpleNamespace(**{**vars(directory), 'st_mode': stat.S_IFDIR | 0o777})
+                    return directory
+                with patch.object(Path, 'lstat', autospec=True, side_effect=info), \
+                        patch.object(Path, 'stat', autospec=True, side_effect=info), \
+                        patch.object(os, 'readlink', return_value='python3.12'), \
+                        patch.object(os, 'open', return_value=20) as opening, \
+                        patch.object(os, 'fstat', return_value=file), patch.object(os, 'close') as close, \
+                        patch.object(os, 'getxattr', side_effect=OSError(error, 'PRIVATE_XATTR')) as xattr:
+                    result = self.D.executable_metadata('/usr/bin/python3')
+                with self.subTest(refusal=refusal, error=error):
+                    if refusal:
+                        self.assertFalse(result['available'])
+                        opening.assert_not_called()
+                        close.assert_not_called()
+                    else:
+                        self.assertTrue(result['available'])
+                        self.assertEqual(result['resolved'], '/usr/bin/python3.12')
+                        self.assertEqual(result['filecap'], {'available': error == errno.ENODATA,
+                                         'present': False if error == errno.ENODATA else None, 'errno': error})
+                        opening.assert_called_once_with(Path('/usr/bin/python3.12'),
+                                                        os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                        xattr.assert_called_once_with(20, 'security.capability')
+                        close.assert_called_once_with(20)
+                    self.assertNotIn('PRIVATE_XATTR', json.dumps(result))
+
+    def test_prepare_cap_boundaries_keeps_root_arch_pid1_and_os_checks(self):
+        for stage in ('root', 'arch', 'pid1', 'os'):
+            c = self.D.Controller()
+            c.command = Mock()
+            with ExitStack() as stack:
+                for name in ('getuid', 'geteuid', 'getgid', 'getegid'):
+                    stack.enter_context(patch.object(os, name, return_value=1000 if stage == 'root' else 0))
+                stack.enter_context(patch.object(platform, 'machine', return_value='aarch64' if stage == 'arch' else 'x86_64'))
+                stack.enter_context(patch.object(Path, 'read_text', return_value='other' if stage == 'pid1' else 'systemd'))
+                stack.enter_context(patch.object(self.D, '_read_private_source', return_value=(b'ID=ubuntu\nVERSION_ID=22.04\n', {})))
+                snapshot = stack.enter_context(patch.object(self.D, 'fixed_snapshot'))
+                with self.subTest(stage=stage), self.assertRaises(self.D.Unsupported):
+                    c.prepare(cap_boundaries=True)
+            snapshot.assert_not_called()
+            c.command.assert_not_called()
+            self.assertIsNone(c.directory)
+
+    def test_prepare_cap_boundaries_audits_source_without_haproxy_vv_strace_or_accounts(self):
+        c = self.controller(True)
+        c.command = Mock(side_effect=AssertionError('No inventory command in controls mode'))
+        c._audit_show = Mock(return_value=c.source)
+        c._audit_fragment = Mock(return_value=(c.source_bytes, c.fragment, []))
+        with ExitStack() as stack:
+            for name in ('getuid', 'geteuid', 'getgid', 'getegid'):
+                stack.enter_context(patch.object(os, name, return_value=0))
+            stack.enter_context(patch.object(platform, 'machine', return_value='x86_64'))
+            stack.enter_context(patch.object(Path, 'read_text', return_value='systemd'))
+            private = stack.enter_context(patch.object(self.D, '_read_private_source',
+                                                      return_value=(b'ID=ubuntu\nVERSION_ID=24.04\n', {})))
+            snapshots = stack.enter_context(patch.object(self.D, 'fixed_snapshot', return_value={'available': False}))
+            stack.enter_context(patch.object(self.D, '_no_lock'))
+            stack.enter_context(patch.object(self.D, '_secure_path'))
+            stack.enter_context(patch.object(os, 'umask'))
+            stack.enter_context(patch.object(tempfile, 'mkdtemp', return_value=str(c.directory)))
+            stack.enter_context(patch.object(Path, 'stat', return_value=SimpleNamespace(st_mode=stat.S_IFDIR | 0o700)))
+            metadata = stack.enter_context(patch.object(self.D, 'executable_metadata', return_value={'available': False}))
+            c.prepare(cap_boundaries=True)
+        private.assert_called_once_with('/usr/lib/os-release', 65536)
+        self.assertEqual(snapshots.call_count, 2)
+        self.assertEqual(c.caps, CAPS3)
+        c.command.assert_not_called()
+        c._audit_show.assert_called_once_with(MAIN, [])
+        self.assertIn('/usr/bin/python3', [call.args[0] for call in metadata.call_args_list])
+        saved = {call.args[0]: call.args[1] for call in c.save.call_args_list}
+        self.assertEqual(saved['gate.py'], self.D.GATE_PROGRAM)
+        self.assertEqual(saved['control.py'], self.D.CONTROL_PROGRAM)
+        self.assertIsNone(c.uid)
+        self.assertIsNone(c.gid)
+
+    def test_control_gate_requires_both_effective_snapshots_before_exact_release(self):
+        for phase in ('cap-gated', 'cap-direct'):
+            for changed in (False, True):
+                c = self.controller(True)
+                plan = self.control(c, phase)
+                probe = self.control_probe(c, plan)
+                live = dict(probe, NoNewPrivileges='no') if changed else dict(probe)
+                c.save.reset_mock()
+                c.read_boundaries = Mock(return_value=self.records(c, phase))
+                with self.subTest(phase=phase, changed=changed):
+                    if changed:
+                        with self.assertRaisesRegex(self.D.Unsupported, 'NoNewPrivileges'):
+                            self.gate(c, plan, probe=probe, live=live)
+                        c.save.assert_not_called()
+                    else:
+                        self.gate(c, plan, probe=probe, live=live)
+                        c.save.assert_called_once_with(phase + '/' + ('control-go' if phase == 'cap-direct' else 'go'), b'')
+                        audits = {call.args[0]: call.args[1] for call in c.record.call_args_list}
+                        self.assertTrue(audits[phase + '/comparison.json']['ok'])
+                        self.assertTrue(audits[phase + '/live-comparison.json']['ok'])
+
+    def test_run_controls_orders_intent_audits_helper_and_cleans_up_incomplete_sequences(self):
+        for incomplete in (False, True):
+            c = self.controller()
+            c.command = Mock()
+            c.cleanup_one = Mock(return_value=True)
+            profiles = {p: self.control_probe(c, self.control(c, p)) for p in ('cap-gated', 'cap-direct')}
+            for p in profiles.values():
+                p.update(ActiveState='active', SubState='running', ControlPID='0', MainPID='42')
+            c.gate = Mock(side_effect=lambda plan: profiles[plan['phase']])
+            c.show = Mock(side_effect=lambda unit, **kw: {'LoadState': 'not-found'} if kw.get('absent')
+                          else profiles['cap-gated' if '-cap-gated.' in unit else 'cap-direct'])
+            counts = collections.Counter()
+            def reading(plan):
+                phase = plan['phase']
+                counts[phase] += 1
+                records = self.records(c, phase)
+                if counts[phase] == 1 and phase == 'cap-gated':
+                    return records[:-1]
+                return records[1:] if incomplete and phase == 'cap-gated' else records
+            c.read_boundaries = Mock(side_effect=reading)
+            def command(argv):
+                unit = next(a.split('=', 1)[1] for a in argv if a.startswith('--unit='))
+                self.assertIn(unit, c.intents)
+                self.assertEqual(c.record.call_args.args[0],
+                                 ('cap-gated' if '-cap-gated.' in unit else 'cap-direct') + '/intent.json')
+                return 0, b'', b''
+            c.command.side_effect = command
+            with patch.object(Path, 'mkdir') as mkdir, patch.object(self.D, '_no_lock'), \
+                    patch.object(time, 'monotonic', return_value=1), patch.object(time, 'sleep'):
+                outcomes = c.run_controls()
+            self.assertEqual(outcomes, {'cap-gated': 'unavailable' if incomplete else 'recorded', 'cap-direct': 'recorded'})
+            self.assertEqual(c.intents, [])
+            self.assertEqual(c.cleanup_one.call_count, 2)
+            self.assertEqual(c.command.call_count, 2)
+            self.assertEqual(mkdir.call_count, 2)
+            self.assertIn('cap-gated/control-go', [call.args[0] for call in c.save.call_args_list])
+            self.assertNotIn('cap-direct/control-go', [call.args[0] for call in c.save.call_args_list])
+            names = [call.args[0] for call in c.record.call_args_list]
+            self.assertIn('cap-gated/helper-comparison.json', names)
+            self.assertEqual('boundaries.control-comparison.json' in names, not incomplete)
+            results = {call.args[0]: call.args[1] for call in c.record.call_args_list
+                       if call.args[0].endswith('/control-result.json')}
+            self.assertEqual(results['cap-gated/control-result.json'],
+                             {'status': 'unavailable', 'issues': ['control-record-sequence']}
+                             if incomplete else {'status': 'recorded'})
+            self.assertEqual(results['cap-direct/control-result.json'], {'status': 'recorded'})
+
+    def test_boundary_report_excludes_independent_contexts_and_nonroot_workers_from_headline(self):
+        for healthy_root, expected in ((True, 'not-observed'), (False, 'unavailable')):
+            c = self.controller()
+            missing = self.D._status(CaptureContracts.status_bytes(self, caps=0).decode())
+            worker = self.D._status(CaptureContracts.status_bytes(self, uid=200, gid=201, caps=0).decode())
+            c.boundaries = [{'stage': stage, 'status': missing} for stage in ('controller', 'manager')]
+            c.boundaries += [{'stage': 'plain:haproxy-worker', 'status': worker},
+                             {'stage': 'plain:other', 'available': False}]
+            scopes = ['independent-context', 'independent-context', 'unit-nonroot', 'unavailable']
+            if healthy_root:
+                c.boundaries.append({'stage': 'plain:haproxy-root',
+                                     'status': self.D._status(CaptureContracts.status_bytes(self).decode())})
+                scopes.append('unit-root')
+            with self.subTest(healthy_root=healthy_root):
+                self.assertEqual(c.boundary_report(), expected)
+                report = c.record.call_args.args[1]
+                self.assertEqual(report['first_observed_missing_SETUID_EP'], expected)
+                self.assertEqual([r['scope'] for r in report['observations']], scopes)
+                self.assertEqual(report['headline_scope'],
+                                 'root unit tasks only; independent contexts and non-root workers excluded')
+
+    def test_boundary_report_all_masks_are_observations_not_inheritance_or_cause(self):
+        c = self.controller()
+        status = self.D._status(CaptureContracts.status_bytes(self).decode())
+        c.boundaries = [{'stage': 'controller', 'status': status}]
+        c.control_records = {p: self.records(c, p) for p in ('cap-gated', 'cap-direct')}
+        c.boundary_plans = [self.control(c, p) for p in ('cap-gated', 'cap-direct')]
+        c.read_boundaries = Mock(side_effect=lambda plan: c.control_records[plan['phase']])
+        self.assertEqual(c.boundary_report(), 'not-observed')
+        report = c.record.call_args.args[1]
+        self.assertFalse(report['gated_direct_differ'])
+        self.assertEqual(report['ordering'], 'observation stages, not a causal inheritance chain')
+        self.assertEqual(report['observations'][0]['SETUID'],
+                         dict(CapInh=False, CapPrm=True, CapEff=True, CapBnd=True, CapAmb=False))
+        c.control_records['cap-direct'][-1]['status']['CapEff'] = 0
+        self.assertEqual(c.boundary_report(), 'cap-direct:after-exec')
+        report = c.record.call_args.args[1]
+        self.assertTrue(report['gated_direct_differ'])
+        self.assertIn('missing masks alone do not establish root cause', report['limits'])
+
+    def test_main_cap_boundary_mode_dispatches_only_controls_and_respects_cleanup(self):
+        for recorded, clean in ((True, True), (False, True), (True, False)):
+            c = self.controller()
+            c.prepare = Mock()
+            c.run_controls = Mock(return_value={'cap-gated': 'recorded' if recorded else 'unavailable',
+                                                'cap-direct': 'recorded'})
+            c.run_phase = Mock(side_effect=AssertionError('No application phase in controls mode'))
+            c.cleanup = Mock(return_value=clean)
+            c.boundary_report = Mock(return_value='not-observed')
+            rc, out, err = self.main_with(c, ['--cap-boundaries'])
+            self.assertEqual(rc, 0 if recorded and clean else 2)
+            self.assertEqual(err, '')
+            c.prepare.assert_called_once_with(cap_boundaries=True)
+            c.run_controls.assert_called_once_with()
+            c.run_phase.assert_not_called()
+            c.cleanup.assert_called_once_with()
+            c.boundary_report.assert_called_once_with()
+            self.assertIn('control gated/direct:', out)
+            self.assertIn('(not a root cause)', out)
+            self.assertNotIn('plain startup:', out)
+            self.assertNotIn('trace startup:', out)
 
 
 if __name__ == '__main__':
