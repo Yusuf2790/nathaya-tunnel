@@ -34,6 +34,8 @@ Pure public interfaces:
   owned_unit(properties, unit, nonce) -> bool
   matrix_plan(directory, nonce, caps, index, enabled_knob_names) -> fixed plan
   matrix_entry_state(records, caps, executable, entry_only=False) -> validated observation state
+  Controller.matrix_mount_audit(a, b, source_plan=None, probe_plan=None, source=False) -> pure private proof
+  Controller.matrix_mount_manager() -> one recorded system-manager Version sample (matrix only)
 Controller is the bounded runtime/evidence owner; main(argv=None) is opt-in.
 Unknown effective differences are unsupported, never a reason to weaken a probe.
 """
@@ -1012,6 +1014,8 @@ class Controller:
         self.control_records = {}
         self.boundary_plans = []
         self.process_boundaries = []
+        self.matrix_plans = {}
+        self.matrix_mount_manager_sample = None
 
     def save(self, name, content):
         if self.directory is None or not re.fullmatch(r'[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*', name):
@@ -1944,12 +1948,173 @@ class Controller:
         self.validate_probe_logging(probe, plan)
         self._validate_probe_watchdog(probe, plan)
 
-    def matrix_inventory(self, a, b, variable=False, source=False):
+    def matrix_mount_manager(self):
+        """One read-only system-manager sample, before any matrix helper exists."""
+        if self.matrix_mount_manager_sample is not None:
+            return self.matrix_mount_manager_sample
+        code, out, _ = self.command(['/usr/bin/systemctl', '--system', 'show', '--property=Version'])
+        sample = {'available': False, 'version': None, 'verified_255': False,
+                  'scope': 'system-manager sampled once for this matrix run'}
+        try:
+            props = parse_show(out.decode('utf-8', 'strict')) if len(out) <= 4096 else {}
+            if code == 0 and set(props) == {'Version'} and props['Version']:
+                sample.update(available=True, version=props['Version'])
+                sample['verified_255'] = bool(re.fullmatch(
+                    r'255(?:[.\-+~][0-9A-Za-z][0-9A-Za-z.+:~_\-]*)?', props['Version']))
+        except (UnicodeError, Unsupported):
+            pass
+        sample['reason'] = ('verified-system-manager-255' if sample['verified_255'] else
+                            'unsupported-manager-version' if sample['available'] else 'manager-version-unavailable')
+        self.matrix_mount_manager_sample = sample
+        self.record('matrix.mount-manager.json', sample)
+        self.matrix_report['mount_manager'] = sample
+        return sample
+
+    def matrix_mount_audit(self, a, b, source_plan=None, probe_plan=None, source=False):
+        """PURE, opt-in proof for exactly RequiresMountsFor, never a path exemption.
+
+        v255 unit_add_exec_dependencies registers ONLY /var/tmp for PrivateTmp;
+        tmp.mount is separately weak Wants/After (allow masked), plus tmpfiles
+        ordering. Root/working/image and the five managed directories also add
+        mount paths. ReadWritePaths and append log files do NOT do so here.
+        https://raw.githubusercontent.com/systemd/systemd/v255/src/core/unit.c
+        (unit_add_exec_dependencies, around lines 1177-1252)
+        The getter exposes exact registered hashmap path keys, not mount units
+        or prefix closure; do not expand /var/tmp into /tmp or ancestor paths.
+        https://raw.githubusercontent.com/systemd/systemd/v255/src/core/dbus-unit.c
+        (property_get_requires_mounts_for, around lines 169-195)
+        https://www.freedesktop.org/software/systemd/man/255/systemd.exec.html#
+        Version is proof scope, NOT evidence of any VPS/SETUID root cause.
+        """
+        producers = ('WorkingDirectory', 'RootDirectory', 'RootImage', 'RuntimeDirectory',
+                     'StateDirectory', 'CacheDirectory', 'LogsDirectory', 'ConfigurationDirectory')
+        logs = ('StandardOutput', 'StandardError', 'StandardOutputFile', 'StandardErrorFile', 'ReadWritePaths')
+        manager = self.matrix_mount_manager_sample or {'available': False, 'version': None,
+                                                       'verified_255': False, 'reason': 'manager-not-sampled'}
+        scoped = bool(source_plan is not None or probe_plan is not None)
+
+        def observed(properties, key):
+            return {'present': key in properties, 'raw': properties.get(key)}
+
+        def side(properties, plan, production):
+            errors = []
+            requested = self.fragment if production else (plan.get('properties') if isinstance(plan, dict) else None)
+            requested_available = isinstance(requested, dict)
+            requested = requested if requested_available else {}
+            result = {'role': 'production-source' if production else 'matrix-probe',
+                      'id': properties.get('Id'), 'phase': plan.get('phase') if isinstance(plan, dict) else None,
+                      'requested_context_available': requested_available,
+                      'provenance_basis': 'audited-full-source-fragment' if production else 'registered-exact-fixed-matrix-plan',
+                      'requested_requires': observed(requested, 'RequiresMountsFor'),
+                      'requested_cli_requires': {'available': False, 'present': None, 'raw': None},
+                      'effective_requires': observed(properties, 'RequiresMountsFor'),
+                      'requested_private_tmp': observed(requested, 'PrivateTmp'),
+                      'effective_private_tmp': observed(properties, 'PrivateTmp'),
+                      'producer_context': {k: observed(properties, k) for k in producers},
+                      'requested_producer_context': {k: observed(requested, k) for k in producers},
+                      'proof_context': {k: observed(properties, k) for k in
+                                        ('Id', 'LoadState', 'Transient', 'Description', 'FragmentPath',
+                                         'DropInPaths', 'NeedDaemonReload', 'ControlGroup')},
+                      'log_context': {'requested': {k: observed(requested, k) for k in logs},
+                                      'effective': {k: observed(properties, k) for k in logs}},
+                      'expected_paths': None, 'observed_paths': None,
+                      'explicit_request_absence_proved': False, 'provenance_valid': False}
+            if not scoped:
+                errors.append('strict-comparison-no-proof-scope')
+            elif production:
+                collect_unsupported(errors, validate_effective, properties, self.fragment)
+                # Also verifies the complete fragment key grammar, including
+                # forbidding a RequiresMountsFor directive even with empty RHS.
+                collect_unsupported(errors, _source_empty_exec_fields, properties, self.fragment)
+            elif not isinstance(plan, dict):
+                errors.append('matrix-plan-not-supplied')
+            else:
+                registered = self.matrix_plans.get(plan.get('phase'))
+                if registered is None or registered != plan:
+                    errors.append('matrix-plan-not-registered')
+                collect_unsupported(errors, self.validate_matrix, properties, plan)
+                assignments = collect_unsupported(errors, self._plan_assignments, plan)
+                if assignments is not None:
+                    values = [v for k, v in assignments if k == 'RequiresMountsFor']
+                    result['requested_cli_requires'] = {'available': True, 'present': bool(values),
+                                                        'raw': values if values else None}
+                if ('RequiresMountsFor' in requested or
+                        any(k == 'RequiresMountsFor' for k, _ in assignments or ())):
+                    errors.append('explicit-mount-request-forbidden')
+            result['provenance_valid'] = not errors
+            result['explicit_request_absence_proved'] = not errors and 'RequiresMountsFor' not in requested
+            if not manager.get('verified_255'):
+                errors.append('system-manager-255-unproved')
+            for key in producers:
+                if key not in properties or properties[key] != '':
+                    errors.append('dependency-producer-not-verified-empty:' + key)
+            private = properties.get('PrivateTmp')
+            if private not in ('yes', 'no'):
+                errors.append('private-tmp-not-proved-on-or-off')
+            # Only fully proved contexts predict paths. Missing is never empty.
+            rule = not errors
+            if rule:
+                result['expected_paths'] = ['/var/tmp'] if private == 'yes' else []
+            value = properties.get('RequiresMountsFor')
+            if 'RequiresMountsFor' not in properties:
+                errors.append('effective-mount-key-missing')
+            elif value == '':
+                result['observed_paths'] = []
+            elif value == '/var/tmp':
+                result['observed_paths'] = ['/var/tmp']
+            else:
+                # Reject escapes, specifiers, whitespace, duplicates, /tmp,
+                # unrelated paths and all noncanonical spellings, even if equal.
+                errors.append('mount-paths-outside-exact-model')
+            if rule and result['observed_paths'] != result['expected_paths']:
+                errors.append('mount-paths-not-exact-private-tmp-derivation')
+            outside = scoped and 'RequiresMountsFor' in properties and value not in ('', '/var/tmp')
+            result.update(status=('verified-generated-private-tmp' if not errors else
+                                  'unsupported' if outside or (rule and 'RequiresMountsFor' in properties) else 'unproved'),
+                          reasons=sorted(set(errors)), rule_context_proved=rule)
+            return result
+
+        sides = {'source': side(a, source_plan, source), 'probe': side(b, probe_plan, False)}
+        verified = all(s['status'] == 'verified-generated-private-tmp' for s in sides.values())
+        return {'property': 'RequiresMountsFor', 'scope_requested': scoped, 'manager': manager,
+                'coverage': ('unknown-both-effective-keys-absent' if 'RequiresMountsFor' not in a
+                             and 'RequiresMountsFor' not in b else 'observed-effective-keys'),
+                'sides': sides, 'verified': verified,
+                'classification': ('verified-generated-private-tmp' if verified else
+                                   'unsupported' if any(s['status'] == 'unsupported' for s in sides.values()) else 'unproved'),
+                'scope': 'exact registered roots; logging context is not a dependency producer'}
+
+    def record_matrix_inventory(self, inventory, artifact, phase, stage, roles=None):
+        """Private raw mount details in both the comparison and the top report."""
+        mount = inventory.get('mount_dependency_audit')
+        if roles and mount:
+            for key, role in zip(('source', 'probe'), roles):
+                mount['sides'][key]['role'] = role
+        self.record(artifact, inventory)
+        rows = [r for r in inventory.get('properties', []) if r['property'] == 'RequiresMountsFor']
+        detail = {'artifact': artifact, 'phase': phase, 'stage': stage,
+                  'roles': roles or ['reference', 'observation'], 'rows': rows,
+                  'mount_dependency_audit': inventory.get('mount_dependency_audit')}
+        self.matrix_report.setdefault('comparisons', []).append(detail)
+        if any(not r['raw_equal'] or r['unsupported'] for r in rows):
+            self.matrix_report.setdefault('mount_mismatches', []).append(detail)
+
+    def matrix_inventory(self, a, b, variable=False, source=False, *, source_plan=None, probe_plan=None):
         hooks = frozenset(n + suffix for n in PROBE_EMPTY_EXEC_HOOKS + ('ExecStartPre',) for suffix in ('', 'Ex'))
         inventory = _comparison_inventory(a, b, empty_source=(_source_empty_exec_fields(a, self.fragment) if source else hooks),
                                           empty_probe=hooks)
+        mount = self.matrix_mount_audit(a, b, source_plan, probe_plan, source)
+        inventory['mount_dependency_audit'] = mount
         for row in inventory['properties']:
             key = row['property']
+            if key == 'RequiresMountsFor' and mount['scope_requested']:
+                if mount['verified'] and row['source_present'] and row['probe_present']:
+                    row.update(unsupported=False, classification='verified-generated-private-tmp',
+                               reason='known-source-backed-PrivateTmp-distinction')
+                elif mount['classification'] == 'unsupported':
+                    row.update(unsupported=True, classification='unsupported',
+                               reason='mount-paths-outside-proved-PrivateTmp-model')
+                row['mount_proof_classification'] = mount['classification']
             if key in MATRIX_KNOBS and row['source_present'] and row['probe_present']:
                 known = _matrix_allowed(key, row['source']) and _matrix_allowed(key, row['probe'])
                 equal = _matrix_value(key, row['source']) == _matrix_value(key, row['probe'])
@@ -1974,6 +2139,29 @@ class Controller:
                                         original_fragment=self.fragment, original_bytes=self.source_bytes,
                                         current_bytes=raw, inspection_errors=errors, allow_source_only=True)
         self.record(plan['phase'] + '/' + stem + '.show.json', current)
+        profile = audit.get('source_profile_change')
+        if profile is not None:
+            # Original/current source drift is ALWAYS strict, never derived-path
+            # normalization. Attach raw mount evidence before a refusal is raised.
+            mount = self.matrix_mount_audit(self.source, current, source=True)
+            # Record each observed fragment's context, without authorizing any
+            # normalization of production drift (including changed log paths).
+            for key, requested in (('source', self.fragment), ('probe', fragment)):
+                side = mount['sides'][key]
+                side['fragment_context_available'] = isinstance(requested, dict)
+                side['requested_context_available'] = isinstance(requested, dict)
+                side['provenance_basis'] = 'strict-production-fragment-drift-comparison'
+                requested = requested if isinstance(requested, dict) else {}
+                for field, prop in (('requested_requires', 'RequiresMountsFor'),
+                                    ('requested_private_tmp', 'PrivateTmp')):
+                    side[field] = {'present': prop in requested, 'raw': requested.get(prop)}
+                for group in (side['requested_producer_context'], side['log_context']['requested']):
+                    for prop in group:
+                        group[prop] = {'present': prop in requested, 'raw': requested.get(prop)}
+            profile['mount_dependency_audit'] = mount
+            self.record_matrix_inventory(profile, plan['phase'] + '/' + stem + '.comparison.json',
+                                         plan['phase'], stem,
+                                         ['production-original', 'production-current'])
         self.record(plan['phase'] + '/' + stem + '.audit.json', audit)
         _raise_unsupported(audit['issues'])
         if raw != self.source_bytes or frozenset(audit['source_caps']) != self.caps:
@@ -1992,6 +2180,7 @@ class Controller:
         if index >= 28:
             raise Unsupported('matrix-attempt-limit')
         plan = matrix_plan(self.directory, self.nonce, self.caps, index, enabled)
+        self.matrix_plans[plan['phase']] = plan  # Retain the actual plan (including later created_at); max 28.
         row = {'phase': plan['phase'], 'enabled': plan['enabled'], 'status': 'unavailable'}
         self.matrix_report['attempts'].append(row)  # Failed creation consumes an index too.
         base = self.directory / plan['phase']
@@ -2023,20 +2212,26 @@ class Controller:
         entry = matrix_entry_state(records, self.caps, metadata['resolved'], entry_only=True)
         profile = self.show(plan['unit'], timeout=max(0.01, deadline - time.monotonic()))
         self.record(plan['phase'] + '/entry.show.json', profile)
-        self.validate_matrix(profile, plan)
-        if _matrix_value('NoNewPrivileges', profile['NoNewPrivileges']) == 'yes' and entry['entry']['NoNewPrivs'] != 1:
-            raise Unsupported('matrix-NNP-inconsistent')
-        comparison = self.matrix_inventory(source, profile, variable=True, source=True)
-        self.record(plan['phase'] + '/source-comparison.json', comparison)
-        _raise_unsupported(comparison['matrix_issues'])
+        validation_errors = []
+        collect_unsupported(validation_errors, self.validate_matrix, profile, plan)
+        if _matrix_value('NoNewPrivileges', profile.get('NoNewPrivileges')) == 'yes' and entry['entry']['NoNewPrivs'] != 1:
+            validation_errors.append('matrix-NNP-inconsistent')
+        comparison = self.matrix_inventory(source, profile, variable=True, source=True, probe_plan=plan)
+        comparison['validation_issues'] = validation_errors
+        self.record_matrix_inventory(comparison, plan['phase'] + '/source-comparison.json',
+                                     plan['phase'], 'source-comparison', ['production-source', 'matrix-probe'])
+        _raise_unsupported(validation_errors + comparison['matrix_issues'])
         self.matrix_source(plan, 'source-release')
         self.matrix_python(plan, 'release')
         live = self.show(plan['unit'], timeout=max(0.01, deadline - time.monotonic()))
         self.record(plan['phase'] + '/release.show.json', live)
-        self.validate_matrix(live, plan)
-        comparison = self.matrix_inventory(profile, live)
-        self.record(plan['phase'] + '/release-comparison.json', comparison)
-        _raise_unsupported(comparison['matrix_issues'])
+        validation_errors = []
+        collect_unsupported(validation_errors, self.validate_matrix, live, plan)
+        comparison = self.matrix_inventory(profile, live, source_plan=plan, probe_plan=plan)
+        comparison['validation_issues'] = validation_errors
+        self.record_matrix_inventory(comparison, plan['phase'] + '/release-comparison.json',
+                                     plan['phase'], 'release')
+        _raise_unsupported(validation_errors + comparison['matrix_issues'])
         if (live.get('ActiveState') != 'active' or live.get('SubState') != 'running'
                 or live.get('MainPID') != str(records[0]['status']['Pid'])
                 or live.get('ControlGroup') != '/system.slice/' + plan['unit']):
@@ -2057,10 +2252,13 @@ class Controller:
         after = self.show(plan['unit'], absent=True)
         self.record(plan['phase'] + '/after.show.json', after)
         if after.get('LoadState') != 'not-found':
-            self.validate_matrix(after, plan)
-            comparison = self.matrix_inventory(live, after)
-            self.record(plan['phase'] + '/after-comparison.json', comparison)
-            _raise_unsupported(comparison['matrix_issues'])
+            validation_errors = []
+            collect_unsupported(validation_errors, self.validate_matrix, after, plan)
+            comparison = self.matrix_inventory(live, after, source_plan=plan, probe_plan=plan)
+            comparison['validation_issues'] = validation_errors
+            self.record_matrix_inventory(comparison, plan['phase'] + '/after-comparison.json',
+                                         plan['phase'], 'after')
+            _raise_unsupported(validation_errors + comparison['matrix_issues'])
         layers = {k: {'requested': plan['properties'][k], 'show': live[k],
                        'request_matches_show': _matrix_value(k, plan['properties'][k]) == _matrix_value(k, live[k])}
                   for k in MATRIX_KNOBS}
@@ -2083,11 +2281,14 @@ class Controller:
         delta = sorted(set(a['enabled']) ^ set(b['enabled']))
         if len(delta) != (0 if repeat else 1):
             raise Unsupported('matrix-request-delta')
-        inventory = self.matrix_inventory(a['profile'], b['profile'], variable=not repeat)
+        inventory = self.matrix_inventory(a['profile'], b['profile'], variable=not repeat,
+                                          source_plan=self.matrix_plans.get(a['phase']),
+                                          probe_plan=self.matrix_plans.get(b['phase']))
         inventory.update(request_delta=delta, reference=a['phase'], observation=b['phase'],
                          NNP_layers={'reference': a['layers']['NoNewPrivileges'], 'observation': b['layers']['NoNewPrivileges']},
                          actual_NNP_off={'reference': a['actual_NNP_off'], 'observation': b['actual_NNP_off']})
-        self.record(b['phase'] + '/against-' + a['phase'] + '.json', inventory)
+        self.record_matrix_inventory(inventory, b['phase'] + '/against-' + a['phase'] + '.json',
+                                     b['phase'], 'repeat' if repeat else 'edge')
         _raise_unsupported(inventory['matrix_issues'])
         if repeat and a['state'] != b['state']:
             raise Unsupported('matrix-repeat-unstable')
@@ -2101,6 +2302,7 @@ class Controller:
                                          'entry is after Python initialization; no HAProxy, tracing or listeners',
                                          'requested NNP=no does not establish effective/proc NNP=0',
                                          'no production change or production fix is established']}
+        self.matrix_mount_manager()  # No manager query while a helper is held.
         self.matrix_python_initial = executable_metadata('/usr/bin/python3')
         self.record('matrix.python.initial.json', self.matrix_python_initial)
         cap = self.matrix_python_initial.get('filecap', {})

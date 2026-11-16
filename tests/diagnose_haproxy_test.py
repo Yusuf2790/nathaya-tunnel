@@ -2845,6 +2845,7 @@ class CapabilityMatrixContracts(Offline):
             requested = frozenset(enabled)
             counts[requested] += 1
             plan = self.mx_plan(c, enabled, len(requests))
+            c.matrix_plans[plan['phase']] = plan
             requests.append(requested)
             absent = missing(requested)
             if unstable and counts[requested] > 1:
@@ -2863,7 +2864,12 @@ class CapabilityMatrixContracts(Offline):
             return result
 
         c.matrix_attempt = Mock(side_effect=attempt)
-        return c, requests, (patch.object(self.D, 'executable_metadata', return_value=self.python_metadata()),)
+        return c, requests, (
+            patch.object(self.D, 'executable_metadata', return_value=self.python_metadata()),
+            # Scheduler-only fixtures have no host manager evidence. Do not
+            # turn an unqueried version into a fabricated v255 proof.
+            patch.object(c, 'matrix_mount_manager', return_value={'available': False}),
+        )
 
     def test_fixed_eleven_explicit_off_and_source_production_on_plans_are_immutable(self):
         self.assertEqual(self.D.MATRIX_KNOBS, self.KNOBS)
@@ -3362,6 +3368,7 @@ class CapabilityMatrixContracts(Offline):
             c.matrix_attempt = Mock()
             with self.assertRaisesRegex(self.D.Unsupported, 'matrix-python-filecap-unavailable-or-present'):
                 self.invoke(c.run_matrix, patchers=(
+                    patch.object(c, 'matrix_mount_manager', return_value={'available': False}),
                     patch.object(self.D, 'executable_metadata', return_value=metadata),))
             c.matrix_attempt.assert_not_called()
             self.assertEqual(c.matrix_report['attempts'], [])
@@ -3387,6 +3394,7 @@ class CapabilityMatrixContracts(Offline):
         _, _, _, patchers = self.attempt_fixture(c, clean=False)
         with self.assertRaisesRegex(self.D.Unsupported, 'cleanup-unconfirmed'):
             self.invoke(c.run_matrix, patchers=patchers + (
+                patch.object(c, 'matrix_mount_manager', return_value={'available': False}),
                 patch.object(self.D, 'executable_metadata', return_value=self.python_metadata()),))
         self.assertFalse(c.cleanup_confirmed)
         self.assertEqual(len(c.matrix_report['attempts']), 1)
@@ -3468,6 +3476,379 @@ class CapabilityMatrixContracts(Offline):
         b['enabled'] = list(self.KNOBS[1:3])
         with self.assertRaisesRegex(self.D.Unsupported, 'matrix-request-delta'):
             c.matrix_edge(a, b)
+
+    # These are deliberately complete SYNTHETIC mount contexts, not recovered
+    # VPS values. The workspace has only partial watchdog evidence and synthetic
+    # snapshots; the archive is uninspected and its provenance remains unknown.
+    MOUNT_PRODUCERS = ('WorkingDirectory', 'RootDirectory', 'RootImage',
+                       'RuntimeDirectory', 'StateDirectory', 'CacheDirectory',
+                       'LogsDirectory', 'ConfigurationDirectory')
+
+    def mount_source(self, c):
+        c.source.update(dict.fromkeys(self.MOUNT_PRODUCERS, ''))
+        c.source['RequiresMountsFor'] = '/var/tmp'
+        c.matrix_report = {'attempts': []}
+        runner = Mock(return_value=(0, b'Version=255.4-1ubuntu8\n', b''))
+        self.invoke(c.matrix_mount_manager, patchers=(patch.object(c, 'command', runner),))
+        runner.assert_called_once_with(
+            ['/usr/bin/systemctl', '--system', 'show', '--property=Version'])
+
+    def mount_pair(self, old=False):
+        c = self.controller(old)
+        self.mount_source(c)
+        on = self.mx_plan(c, self.KNOBS, 1)
+        off = self.mx_plan(c)
+        for plan in (on, off):
+            c.matrix_plans[plan['phase']] = plan
+        return c, on, off
+
+    def mount_row(self, inventory):
+        return next(r for r in inventory['properties'] if r['property'] == 'RequiresMountsFor')
+
+    def test_mount_manager_is_one_readonly_exact_version_sample_not_host_inference(self):
+        cases = [(0, ('Version=' + version + '\n').encode(), True, verified)
+                 for version, verified in (('255', True), ('255.4-1ubuntu8', True),
+                                           ('254', False), ('256', False),
+                                           ('2550', False), ('unknown', False))]
+        cases += [(1, b'Version=255\n', False, False), (None, b'', False, False),
+                  (0, b'', False, False), (0, b'Version=\n', False, False),
+                  (0, b'Version=255\nVersion=255\n', False, False),
+                  (0, b'Version=255\nOther=value\n', False, False),
+                  (0, b'Version=\xff\n', False, False),
+                  (0, b'Version=255' + b'x' * 4096, False, False)]
+        for code, out, available, verified in cases:
+            c, on, off = self.mount_pair()
+            c.matrix_mount_manager_sample = None
+            runner = Mock(return_value=(code, out, b'PRIVATE_FIXTURE_VALUE'))
+            with self.subTest(code=code, out=out[:40]):
+                sample = self.invoke(c.matrix_mount_manager, patchers=(
+                    patch.object(c, 'command', runner),))
+                self.assertEqual((sample['available'], sample['verified_255']), (available, verified))
+                self.assertEqual(sample['version'], out.decode().strip().split('=', 1)[1] if available else None)
+                self.assertIs(c.matrix_mount_manager(), sample)
+                self.assertIs(c.matrix_report['mount_manager'], sample)
+                runner.assert_called_once_with(
+                    ['/usr/bin/systemctl', '--system', 'show', '--property=Version'])
+                inventory = c.matrix_inventory(c.source, dict(self.mx_profile(c, off), RequiresMountsFor=''),
+                                               variable=True, source=True, probe_plan=off)
+                self.assertEqual(inventory['mount_dependency_audit']['verified'], verified)
+                self.assertEqual('RequiresMountsFor' in inventory['matrix_issues'], not verified)
+                if not verified:
+                    self.assertIn('system-manager-255-unproved',
+                                  inventory['mount_dependency_audit']['sides']['source']['reasons'])
+                self.assertNotIn('PRIVATE_FIXTURE_VALUE', repr(sample))
+
+    def test_mount_private_tmp_derivation_is_scoped_to_both_fixed_plans_not_global(self):
+        for old in (True, False):
+            c, on, off = self.mount_pair(old)
+            a = self.mx_profile(c, on)
+            b = dict(self.mx_profile(c, off), RequiresMountsFor='')
+            # A pure mount proof needs no /proc PID identity lookup; the full
+            # attempt separately binds entry PID, ownership and release state.
+            pidless = {k: v for k, v in b.items() if k not in ('MainPID', 'ControlPID')}
+            self.assertTrue(c.matrix_mount_audit(c.source, pidless, source=True, probe_plan=off)['verified'])
+            before = copy.deepcopy((c.source, a, b, on, off))
+            for left, kwargs in ((c.source, {'source': True, 'probe_plan': off}),
+                                 (a, {'source_plan': on, 'probe_plan': off})):
+                inventory = c.matrix_inventory(left, b, variable=True, **kwargs)
+                row, proof = self.mount_row(inventory), inventory['mount_dependency_audit']
+                self.assertEqual(inventory['matrix_issues'], [])
+                self.assertFalse(row['raw_equal'])
+                self.assertEqual(row['classification'], 'verified-generated-private-tmp')
+                self.assertTrue(proof['verified'])
+                self.assertEqual(proof['sides']['source']['expected_paths'], ['/var/tmp'])
+                self.assertEqual(proof['sides']['probe']['expected_paths'], [])
+                self.assertEqual(proof['sides']['probe']['requested_cli_requires'],
+                                 {'available': True, 'present': False, 'raw': None})
+            for kwargs in ({}, {'source_plan': on}, {'probe_plan': off}):
+                self.assertIn('RequiresMountsFor', c.matrix_inventory(a, b, variable=True, **kwargs)['matrix_issues'])
+            self.assertIn('RequiresMountsFor', self.D.restriction_differences(a, b))
+            self.assertEqual((c.source, a, b, on, off), before)
+
+    def test_mount_exact_paths_reject_injection_duplicates_and_same_wrong_value(self):
+        c, on, off = self.mount_pair()
+        a, b = self.mx_profile(c, on), self.mx_profile(c, off)
+        bad_paths = ('/tmp', '/tmp /var/tmp', '/var/tmp /var/tmp', '/var/tmp /etc',
+                     '/var/tmp\n/etc', '/var/tmp\\x20/etc', '%t', '/var/../tmp',
+                     '/var/tmp/', ' /var/tmp', '/var/tmp ', '/etc',
+                     '/opt/nathaya/logs', str(off['output']), None, False)
+        for value in bad_paths:
+            for left in (a, dict(a, RequiresMountsFor=value)):
+                with self.subTest(value=value, same=left['RequiresMountsFor'] == value):
+                    inventory = c.matrix_inventory(left, dict(b, RequiresMountsFor=value), variable=True,
+                                                   source_plan=on, probe_plan=off)
+                    self.assertIn('RequiresMountsFor', inventory['matrix_issues'])
+                    self.assertFalse(inventory['mount_dependency_audit']['verified'])
+                    self.assertEqual(self.mount_row(inventory)['classification'], 'unsupported')
+        for plan, value in ((on, ''), (off, '/var/tmp')):
+            wrong = dict(self.mx_profile(c, plan), RequiresMountsFor=value)
+            inventory = c.matrix_inventory(wrong, dict(wrong), source_plan=plan, probe_plan=plan)
+            self.assertIn('RequiresMountsFor', inventory['matrix_issues'])
+
+    def test_mount_requires_raw_presence_and_all_producers_verified_empty(self):
+        c, on, off = self.mount_pair()
+        good = dict(self.mx_profile(c, off), RequiresMountsFor='')
+        for side in ('source', 'probe'):
+            for key in self.MOUNT_PRODUCERS + ('RequiresMountsFor',):
+                for absent, value in ((True, None), (False, None), (False, '/foreign')):
+                    left, right = dict(c.source), dict(good)
+                    target = left if side == 'source' else right
+                    if absent:
+                        target.pop(key)
+                    else:
+                        target[key] = value
+                    with self.subTest(side=side, key=key, absent=absent, value=value):
+                        inventory = c.matrix_inventory(left, right, variable=True, source=True, probe_plan=off)
+                        proof = inventory['mount_dependency_audit']
+                        self.assertFalse(proof['verified'])
+                        self.assertIn('RequiresMountsFor', inventory['matrix_issues'])
+                        raw = (proof['sides'][side]['effective_requires'] if key == 'RequiresMountsFor'
+                               else proof['sides'][side]['producer_context'][key])
+                        self.assertEqual(raw, {'present': not absent, 'raw': value})
+        # Availability False/None is not an observed effective empty string.
+        missing = dict(good)
+        del missing['RequiresMountsFor']
+        proof = c.matrix_mount_audit(c.source, missing, probe_plan=off, source=True)
+        self.assertEqual(proof['sides']['probe']['effective_requires'], {'present': False, 'raw': None})
+        self.assertEqual(proof['sides']['probe']['requested_requires'], {'present': False, 'raw': None})
+        self.assertEqual(c.matrix_mount_audit(c.source, good, probe_plan=off, source=True)
+                         ['sides']['probe']['effective_requires'], {'present': True, 'raw': ''})
+
+    def test_mount_source_requires_full_trusted_fragment_no_declarations_dropins_or_reload(self):
+        c, on, off = self.mount_pair()
+        good = dict(self.mx_profile(c, off), RequiresMountsFor='')
+        fragment = copy.deepcopy(c.fragment)
+        for value in ('', '/var/tmp'):
+            raw = rendered().replace('[Unit]\n', '[Unit]\nRequiresMountsFor=' + value + '\n')
+            with self.subTest(explicit=value), self.assertRaises(self.D.Unsupported):
+                self.D.validate_fragment(raw)
+        fragments = (None, {}, dict(fragment, RequiresMountsFor=''),
+                     dict(fragment, RequiresMountsFor='/var/tmp'), dict(fragment, FutureDirective='no'),
+                     {k: v for k, v in fragment.items() if k != 'ExecReload'},
+                     dict(fragment, User='haproxy'))
+        for bad in fragments:
+            c.fragment = bad
+            with self.subTest(fragment=bad):
+                proof = c.matrix_mount_audit(c.source, good, probe_plan=off, source=True)
+                self.assertFalse(proof['verified'])
+                self.assertFalse(proof['sides']['source']['explicit_request_absence_proved'])
+        c.fragment = fragment
+        for key, value in (('DropInPaths', '/etc/systemd/system/foreign.conf'),
+                           ('NeedDaemonReload', 'yes'), ('DropInPaths', None),
+                           ('StandardOutput', 'journal')):
+            proof = c.matrix_mount_audit(dict(c.source, **{key: value}), good,
+                                        source=True, probe_plan=off)
+            self.assertFalse(proof['verified'])
+            self.assertFalse(proof['sides']['source']['explicit_request_absence_proved'])
+        for key in ('DropInPaths', 'NeedDaemonReload'):
+            missing = dict(c.source)
+            del missing[key]
+            self.assertFalse(c.matrix_mount_audit(missing, good, source=True, probe_plan=off)['verified'])
+
+    def test_mount_plan_registration_cli_aliases_shadow_argv_and_log_paths_are_not_proof(self):
+        c, on, off = self.mount_pair()
+        good = dict(self.mx_profile(c, off), RequiresMountsFor='')
+        variants = []
+        for value in ('', '/var/tmp'):
+            for form in (None, ['--property=RequiresMountsFor=' + value],
+                         ['--property', 'RequiresMountsFor=' + value],
+                         ['-p', 'RequiresMountsFor=' + value], ['-pRequiresMountsFor=' + value]):
+                bad = copy.deepcopy(off)
+                if form is None:
+                    bad['properties']['RequiresMountsFor'] = value
+                else:
+                    boundary = bad['command'].index('--')
+                    bad['command'][boundary:boundary] = form
+                variants.append(bad)
+        for key in ('argv', 'output', 'properties', 'command'):
+            bad = copy.deepcopy(off)
+            if key == 'argv':
+                bad['argv'].append('--unexpected')
+                bad['command'] = self.D.transient_command(bad['unit'], bad['properties'], bad['argv'])
+            elif key == 'output':
+                bad['output'] = c.directory / 'foreign.log'
+            elif key == 'properties':
+                bad['properties']['StandardOutput'] = 'append:/foreign.log'
+                bad['command'] = self.D.transient_command(bad['unit'], bad['properties'], bad['argv'])
+            else:
+                bad['command'].insert(bad['command'].index('--'), '--property=PrivateTmp=yes')
+            variants.append(bad)
+        for registered in (False, True):
+            for bad in variants:
+                c.matrix_plans[off['phase']] = bad if registered else off
+                with self.subTest(registered=registered, command=bad['command']):
+                    proof = c.matrix_mount_audit(c.source, good, source=True, probe_plan=bad)
+                    self.assertFalse(proof['verified'])
+                    self.assertFalse(proof['sides']['probe']['provenance_valid'])
+        c.matrix_plans.clear()
+        self.assertFalse(c.matrix_mount_audit(c.source, good, source=True, probe_plan=off)['verified'])
+        c.matrix_plans[off['phase']] = off
+        for key, value in (('ExecStartEx', exec_property(['/bin/true'])), ('Id', MAIN),
+                           ('StandardOutputFile', '/foreign.log'), ('StandardOutput', 'journal')):
+            proof = c.matrix_mount_audit(c.source, dict(good, **{key: value}), source=True, probe_plan=off)
+            self.assertFalse(proof['verified'])
+        proof = c.matrix_mount_audit(c.source, good, source=True, probe_plan=off)
+        self.assertTrue(proof['verified'])
+        self.assertEqual(proof['sides']['probe']['expected_paths'], [])
+        self.assertEqual(proof['sides']['probe']['log_context']['requested']['StandardOutput']['raw'],
+                         'append:' + str(off['output']))
+        self.assertNotIn(str(off['output']), proof['sides']['probe']['observed_paths'])
+
+    def test_mount_private_diagnostics_copy_raw_values_presence_and_context_each_stage(self):
+        c, on, off = self.mount_pair()
+        good = dict(self.mx_profile(c, off), RequiresMountsFor='')
+        for stage in ('source-before', 'source-comparison', 'release', 'after', 'edge', 'repeat'):
+            for absent in (False, True):
+                right = dict(good, RequiresMountsFor='/etc/fixture-private')
+                if absent:
+                    del right['RequiresMountsFor']
+                inventory = c.matrix_inventory(c.source, right, variable=True, source=True, probe_plan=off)
+                artifact = 'mx00/' + stage + '.comparison.json'
+                c.record_matrix_inventory(inventory, artifact, 'mx00', stage,
+                                          ['production-source', 'matrix-probe'])
+                detail = c.matrix_report['comparisons'][-1]
+                with self.subTest(stage=stage, absent=absent):
+                    c.record.assert_called_with(artifact, inventory)
+                    self.assertEqual((detail['artifact'], detail['phase'], detail['stage']),
+                                     (artifact, 'mx00', stage))
+                    self.assertEqual(c.matrix_report['mount_mismatches'][-1], detail)
+                    row = detail['rows'][0]
+                    self.assertEqual((row['source_present'], row['source']), (True, '/var/tmp'))
+                    self.assertEqual((row['probe_present'], row['probe']),
+                                     (not absent, None if absent else '/etc/fixture-private'))
+                    proof = detail['mount_dependency_audit']
+                    self.assertEqual(proof, inventory['mount_dependency_audit'])
+                    self.assertEqual(proof['sides']['source']['requested_requires'],
+                                     {'present': False, 'raw': None})
+                    self.assertEqual(proof['sides']['probe']['requested_private_tmp'],
+                                     {'present': True, 'raw': 'no'})
+                    self.assertTrue(proof['sides']['source']['requested_context_available'])
+                    self.assertEqual(set(proof['sides']['probe']['producer_context']), set(self.MOUNT_PRODUCERS))
+                    self.assertEqual(proof['manager']['version'], '255.4-1ubuntu8')
+
+    def test_mount_attempt_pipeline_proves_only_complete_synthetic_context_and_keeps_unknown_strict(self):
+        for full in (False, True):
+            c = self.controller()
+            if full:
+                self.mount_source(c)
+            plan, profile, _, patchers = self.attempt_fixture(c)
+            if full:
+                profile['RequiresMountsFor'] = ''
+            c.show.side_effect = [{'LoadState': 'not-found'}, profile, dict(profile), dict(profile)]
+            no_query = Mock(side_effect=AssertionError('No manager query during held helper'))
+            result = self.invoke(c.matrix_attempt, (), patchers=patchers + (
+                patch.object(c, 'matrix_mount_manager', no_query),))
+            no_query.assert_not_called()
+            self.assertEqual(result['phase'], 'mx00')
+            self.assertEqual(c.matrix_plans['mx00']['command'], plan['command'])
+            saved = {call.args[0]: call.args[1] for call in c.record.call_args_list}
+            for name in ('source-comparison', 'release-comparison', 'after-comparison'):
+                proof = saved['mx00/' + name + '.json']['mount_dependency_audit']
+                self.assertEqual(proof['verified'], full)
+                if not full:
+                    self.assertEqual(proof['coverage'], 'unknown-both-effective-keys-absent')
+                    self.assertEqual(proof['classification'], 'unproved')
+                    self.assertIsNone(proof['manager']['version'])
+                    self.assertNotIn('RequiresMountsFor', c.source)
+                    self.assertNotIn('RequiresMountsFor', profile)
+            self.assertIn('mx00/control-go', [call.args[0] for call in c.save.call_args_list])
+            self.assertEqual(c.intents, [])
+            c.cleanup_one.assert_called_once_with(plan['unit'])
+
+    def test_mount_attempt_refusal_persists_top_context_before_raise_at_source_release_and_after(self):
+        for stage in ('source-comparison', 'release', 'after'):
+            c = self.controller()
+            self.mount_source(c)
+            plan, profile, _, patchers = self.attempt_fixture(c)
+            profile['RequiresMountsFor'] = ''
+            live, after = dict(profile), dict(profile)
+            target = {'source-comparison': profile, 'release': live, 'after': after}[stage]
+            target['RequiresMountsFor'] = '/etc/fixture-private'
+            c.show.side_effect = [{'LoadState': 'not-found'}, profile, live, after]
+            with self.subTest(stage=stage), self.assertRaises(self.D.Unsupported):
+                self.invoke(c.matrix_attempt, (), patchers=patchers)
+            detail = c.matrix_report['comparisons'][-1]
+            self.assertEqual(detail['stage'], stage)
+            self.assertEqual(detail['rows'][0]['probe'], '/etc/fixture-private')
+            self.assertTrue(detail['rows'][0]['probe_present'])
+            self.assertIn(detail, c.matrix_report['mount_mismatches'])
+            self.assertEqual(detail['mount_dependency_audit']['sides']['probe']['effective_requires'],
+                             {'present': True, 'raw': '/etc/fixture-private'})
+            self.assertEqual(c.matrix_report['attempts'][0]['status'], 'unavailable')
+            self.assertEqual('mx00/control-go' in [call.args[0] for call in c.save.call_args_list], stage == 'after')
+            c.cleanup_one.assert_not_called()
+            # Main's sanitized stdout must not leak raw paths/values. The private
+            # failed comparison above already exists before main catches it.
+            c.prepare = Mock()
+            c.matrix_report['status'] = 'unavailable'
+            c.run_matrix = Mock(side_effect=self.D.Unsupported('RequiresMountsFor'))
+            c.cleanup = Mock(return_value=True)
+            rc, out, err = self.main_with(c, ['--cap-matrix'])
+            self.assertEqual((rc, err), (2, ''))
+            self.assertNotIn('/etc/fixture-private', out)
+            self.assertNotIn('/var/tmp', out)
+            report = next(call.args[1] for call in c.record.call_args_list if call.args[0] == 'matrix.report.json')
+            self.assertTrue(report['cleanup_confirmed'])
+            self.assertEqual(report['attempts'][0]['enabled'], [])
+            self.assertEqual(report['attempts'][0]['status'], 'unavailable')
+
+    def test_mount_attempt_real_source_revalidation_is_strict_even_for_derivable_drift(self):
+        for stage in ('source-before', 'source-release'):
+            for kind in ('same', 'mount', 'private-tmp', 'log'):
+                c = self.controller()
+                self.mount_source(c)
+                plan, profile, _, patchers = self.attempt_fixture(c)
+                profile['RequiresMountsFor'] = ''
+                c.show.side_effect = [{'LoadState': 'not-found'}, profile, dict(profile), {'LoadState': 'not-found'}]
+                # Restore the real source validator, not a mock that waives drift.
+                del c.matrix_source
+                current = dict(c.source)
+                if kind in ('mount', 'private-tmp'):
+                    current['RequiresMountsFor'] = ''
+                if kind == 'private-tmp':
+                    current['PrivateTmp'] = 'no'
+                if kind == 'log':
+                    for key in ('StandardOutputFile', 'StandardErrorFile'):
+                        current[key] = '/opt/nathaya/logs/other.log'
+                original_fragment = (c.source_bytes, c.fragment, [])
+                changed_bytes = c.source_bytes
+                if kind == 'log':
+                    original_log = b'append:/opt/nathaya/logs/%N.log'
+                    self.assertIn(original_log, c.source_bytes)
+                    changed_bytes = c.source_bytes.replace(original_log, b'append:/opt/nathaya/logs/other.log')
+                    self.assertNotEqual(changed_bytes, c.source_bytes, 'Log drift must change actual fragment bytes')
+                changed_fragment = (changed_bytes, self.D.validate_fragment(changed_bytes.decode()), [])
+                c._audit_fragment = Mock(side_effect=([changed_fragment, changed_fragment]
+                                                     if stage == 'source-before' else
+                                                     [original_fragment, changed_fragment]))
+                c._audit_show = Mock(side_effect=([current, current] if stage == 'source-before'
+                                                 else [c.source, current]))
+                no_query = Mock(side_effect=AssertionError('Version must already be sampled'))
+                with self.subTest(stage=stage, kind=kind):
+                    if kind == 'same':
+                        self.invoke(c.matrix_attempt, (), patchers=patchers + (
+                            patch.object(c, 'matrix_mount_manager', no_query),))
+                    else:
+                        with self.assertRaises(self.D.Unsupported):
+                            self.invoke(c.matrix_attempt, (), patchers=patchers + (
+                                patch.object(c, 'matrix_mount_manager', no_query),))
+                        self.assertNotIn('mx00/control-go', [call.args[0] for call in c.save.call_args_list])
+                        detail = c.matrix_report['comparisons'][-1]
+                        self.assertEqual((detail['stage'], detail['roles']),
+                                         (stage, ['production-original', 'production-current']))
+                        self.assertEqual(detail['rows'][0]['source'], '/var/tmp')
+                        self.assertEqual(detail['rows'][0]['probe'], current['RequiresMountsFor'])
+                        self.assertFalse(detail['mount_dependency_audit']['scope_requested'])
+                        self.assertFalse(detail['mount_dependency_audit']['verified'])
+                        for side in detail['mount_dependency_audit']['sides'].values():
+                            self.assertTrue(side['fragment_context_available'])
+                            self.assertEqual(side['provenance_basis'], 'strict-production-fragment-drift-comparison')
+                        saved = {call.args[0]: call.args[1] for call in c.record.call_args_list}
+                        self.assertFalse(saved['mx00/' + stage + '.audit.json']['ok'])
+                    no_query.assert_not_called()
+                # Only the fixed transient command is possible after source-before;
+                # no manager query is slipped into the held release deadline.
+                self.assertEqual(c.command.call_count, int(kind == 'same' or stage == 'source-release'))
 
     def test_main_matrix_dispatch_has_no_application_trace_controls_or_reservations(self):
         for clean in (True, False):
