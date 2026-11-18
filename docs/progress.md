@@ -220,3 +220,19 @@ Referensi semantik yang diverifikasi pada konteks induk (bukan bukti run VPS):
 - https://raw.githubusercontent.com/systemd/systemd/v255/src/core/unit.c#L1177-L1252
 - https://raw.githubusercontent.com/systemd/systemd/v255/src/core/dbus-unit.c#L169-L195
 - https://www.freedesktop.org/software/systemd/man/255/systemd.exec.html
+
+## 19 — Kontrak matrix_report pada fixture revalidasi source/Python
+
+- Bukti baru **dari pengguna**: 150 tes dijalankan pada VPS, satu ERROR pada CapabilityMatrixContracts.test_source_and_python_revalidation_do_not_invent_unchanged_evidence; matrix_source memanggil record_matrix_inventory ketika Controller fixture belum mempunyai matrix_report. Ini laporan revisi sebelum perbaikan, bukan PASS revisi ini.
+- Kontrak ditelusuri dari constructor, prepare, main, run_matrix dan seluruh caller matrix_source/record_matrix_inventory. Constructor sengaja belum membuat laporan mode matriks. Jalur produksi main → prepare(cap_boundaries=True) → run_matrix menginisialisasi matrix_report sebelum manager query, matrix_attempt, matrix_source maupun matrix_edge. Prepare/callback/cleanup tidak masuk helper tersebut lebih awal. Karena semua caller produksi terjangkau sesudah inisialisasi, perbaikan hanya pada fixture; tidak mengubah lifecycle produksi, capability, validator atau membuat fallback laporan dengan getattr/default.
+- Tes terisolasi kini membuat object report secara eksplisit dengan status unavailable/attempts kosong sebelum memanggil helper langsung. Raw RequiresMountsFor sintetis ditambahkan agar assertion row tidak vacuous; bukan data VPS atau pembuktian provenance mount. Tes memeriksa object laporan yang sama, inventory pada artifact privat identik dengan source_profile_change audit, serta artifact/phase/stage/roles, presence/raw values, identitas row dan mount audit pada report.comparisons. Lolosnya source yang memang teramati sama tidak dianggap keberhasilan run matriks; status laporan tetap unavailable.
+- Refusal byte drift dan security drift tetap wajib beserta raw_fragment_changed, validation error dan unsupported NoNewPrivileges. Source yang unavailable tetap show=None/source_profile_change=None, tanpa artifact perbandingan atau entry report baru yang mengarang unchanged. Python metadata unavailable, inode berubah dan filecap unavailable tetap ditolak. Assertion akhir memastikan laporan tidak diganti, tidak ada attempt diciptakan dan tepat tiga comparison yang betul-betul mempunyai pasangan source.
+- Pemeriksaan aktual: baca ulang AGENTS/buffer aktual, audit caller independen read-only dan review assertion baru, lalu **25 kontrak tekstual JavaScript** sesuai. Tetap **150 metode** tanpa duplikasi nama dalam class, footer unittest lengkap dan tanpa trailing whitespace/control characters. Ini review teks, bukan syntax check atau hasil tes. Perubahan hanya tests/diagnose_haproxy_test.py dan checkpoint ini; tidak reset/Undo atau memulihkan nathaya.txt.
+- **Belum dijalankan:** tes terfokus, suite, Bash/Python syntax check, Git/status/diff, probe, installer, layanan, commit atau push. Tools sesi ini tidak menyediakan eksekusi Bash/Python/Git; tidak mengklaim working tree clean atau tes PASS. Gunakan perintah berikut dari akar checkout nathaya-tunnel yang tepercaya, bukan menjalankan diagnostic/probe:
+
+```sh
+python3 -I -B tests/diagnose_haproxy_test.py CapabilityMatrixContracts.test_source_and_python_revalidation_do_not_invent_unchanged_evidence
+python3 -I -B tests/diagnose_haproxy_test.py
+```
+
+- Penyebab hilangnya SETUID, nilai aktual snapshot mx00 yang belum diterima, kompatibilitas VPS dan fix produksi tetap belum terbukti. Seluruh blocker full serta batas evidence checkpoint sebelumnya tetap berlaku.

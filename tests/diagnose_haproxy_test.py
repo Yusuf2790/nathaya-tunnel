@@ -3340,17 +3340,71 @@ class CapabilityMatrixContracts(Offline):
 
     def test_source_and_python_revalidation_do_not_invent_unchanged_evidence(self):
         c = self.controller()
+        # Production run_matrix owns this initialization before any matrix
+        # helper. This isolated helper fixture deliberately bypasses that entry.
+        report = {'status': 'unavailable', 'attempts': []}
+        c.matrix_report = report
+        # Synthetic raw data makes report-row checks non-vacuous. This is not
+        # host evidence or a proof of the origin of this mount dependency.
+        c.source['RequiresMountsFor'] = '/var/tmp'
         plan = self.mx_plan(c)
         c._audit_fragment = Mock(return_value=(c.source_bytes, c.fragment, []))
         c._audit_show = Mock(return_value=c.source)
+
+        def recorded_comparison(stem):
+            saved = {call.args[0]: call.args[1] for call in c.record.call_args_list}
+            artifact = 'mx00/' + stem + '.comparison.json'
+            audit = saved['mx00/' + stem + '.audit.json']
+            inventory = saved[artifact]
+            self.assertIs(c.matrix_report, report)
+            self.assertIs(inventory, audit['source_profile_change'])
+            detail = report['comparisons'][-1]
+            self.assertEqual((detail['artifact'], detail['phase'], detail['stage']),
+                             (artifact, 'mx00', stem))
+            self.assertEqual(detail['roles'], ['production-original', 'production-current'])
+            rows = [r for r in inventory['properties'] if r['property'] == 'RequiresMountsFor']
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(detail['rows'], rows)
+            self.assertIs(detail['rows'][0], rows[0])
+            self.assertTrue(rows[0]['source_present'])
+            self.assertTrue(rows[0]['probe_present'])
+            self.assertEqual((rows[0]['source'], rows[0]['probe']), ('/var/tmp', '/var/tmp'))
+            self.assertIs(detail['mount_dependency_audit'], inventory['mount_dependency_audit'])
+            self.assertFalse(detail['mount_dependency_audit']['verified'])
+            return inventory, audit
+
         self.assertEqual(self.invoke(c.matrix_source, plan, 'before', patchers=(
             patch.object(self.D, '_no_lock'),)), c.source)
+        inventory, audit = recorded_comparison('before')
+        self.assertTrue(audit['ok'])
+        self.assertFalse(inventory['changed'])
+        self.assertFalse(inventory['raw_fragment_changed'])
+        self.assertEqual(inventory['unsupported'], [])
+        self.assertEqual(len(report['comparisons']), 1)
         for kind in ('bytes', 'security', 'missing'):
+            count = len(report['comparisons'])
             c._audit_fragment.return_value = (c.source_bytes + (b'\n' if kind == 'bytes' else b''), c.fragment, [])
             c._audit_show.return_value = (None if kind == 'missing' else
                                          dict(c.source, NoNewPrivileges='no') if kind == 'security' else c.source)
-            with self.subTest(kind=kind), self.assertRaises(self.D.Unsupported):
-                self.invoke(c.matrix_source, plan, kind, patchers=(patch.object(self.D, '_no_lock'),))
+            with self.subTest(kind=kind):
+                with self.assertRaises(self.D.Unsupported):
+                    self.invoke(c.matrix_source, plan, kind, patchers=(patch.object(self.D, '_no_lock'),))
+                saved = {call.args[0]: call.args[1] for call in c.record.call_args_list}
+                audit = saved['mx00/' + kind + '.audit.json']
+                self.assertFalse(audit['ok'])
+                if kind == 'missing':
+                    self.assertIsNone(saved['mx00/missing.show.json'])
+                    self.assertIsNone(audit['source_profile_change'])
+                    self.assertEqual(len(report['comparisons']), count)
+                    self.assertNotIn('mx00/missing.comparison.json', saved)
+                else:
+                    inventory, audit = recorded_comparison(kind)
+                    self.assertEqual(len(report['comparisons']), count + 1)
+                    self.assertTrue(inventory['changed'])
+                    self.assertEqual(inventory['raw_fragment_changed'], kind == 'bytes')
+                    if kind == 'security':
+                        self.assertTrue(audit['validation']['source'])
+                        self.assertIn('NoNewPrivileges', inventory['unsupported'])
         c.matrix_python_initial = self.python_metadata()
         self.assertEqual(self.invoke(c.matrix_python, plan, 'before', patchers=(
             patch.object(self.D, 'executable_metadata', return_value=self.python_metadata()),)), self.python_metadata())
@@ -3359,6 +3413,10 @@ class CapabilityMatrixContracts(Offline):
             with self.assertRaisesRegex(self.D.Unsupported, 'matrix-python-changed'):
                 self.invoke(c.matrix_python, plan, 'changed', patchers=(
                     patch.object(self.D, 'executable_metadata', return_value=changed),))
+        self.assertIs(c.matrix_report, report)
+        self.assertEqual(report['status'], 'unavailable')
+        self.assertEqual(report['attempts'], [])
+        self.assertEqual(len(report['comparisons']), 3)
 
     def test_initial_python_filecap_must_be_known_absent_before_any_attempt(self):
         for metadata in ({'available': False}, dict(self.python_metadata(), filecap={}),
