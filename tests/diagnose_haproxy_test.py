@@ -40,6 +40,12 @@ import unittest
 import urllib.request
 from unittest.mock import Mock, patch
 
+# Capture method objects before ANY host guard or local patch is active.
+# Aliasing Path itself would still point at the same mutable patched class.
+ORIGINAL_PATH_LSTAT = Path.lstat
+ORIGINAL_PATH_STAT = Path.stat
+ORIGINAL_PATH_UNLINK = Path.unlink
+
 ROOT = Path(__file__).resolve().parent.parent
 # Checkout source reads happen during discovery or unguarded failure reporting.
 # No renderer CLI, load_ports(), account lookup, runtime path or probe is invoked.
@@ -2570,8 +2576,8 @@ class CapabilityBoundaryContracts(Offline):
                 close = Mock()
                 xattr = Mock(side_effect=OSError(error, 'PRIVATE_XATTR'))
                 result = self.invoke(self.D.executable_metadata, '/usr/bin/python3', patchers=(
-                    patch.object(Path, 'lstat', autospec=True, side_effect=info),
-                    patch.object(Path, 'stat', autospec=True, side_effect=info),
+                    patch.object(Path, 'lstat', autospec=ORIGINAL_PATH_LSTAT, side_effect=info),
+                    patch.object(Path, 'stat', autospec=ORIGINAL_PATH_STAT, side_effect=info),
                     patch.object(os, 'readlink', return_value='python3.12'),
                     patch.object(os, 'open', opening),
                     patch.object(os, 'fstat', return_value=file),
@@ -4105,8 +4111,8 @@ class Pure2ArmReport(Offline):
             patch.object(c, 'save', side_effect=save), patch.object(Path, 'mkdir'),
             patch.object(os, 'open', side_effect=opening), patch.object(os, 'fstat', side_effect=fstat),
             patch.object(os, 'fdopen', side_effect=fdopen), patch.object(os, 'close', side_effect=close),
-            patch.object(Path, 'lstat', autospec=True, side_effect=info),
-            patch.object(Path, 'unlink', autospec=True, side_effect=lambda p: files.pop(relative(p))),
+            patch.object(Path, 'lstat', autospec=ORIGINAL_PATH_LSTAT, side_effect=info),
+            patch.object(Path, 'unlink', autospec=ORIGINAL_PATH_UNLINK, side_effect=lambda p: files.pop(relative(p))),
             patch.object(os.path, 'lexists', side_effect=lambda p: relative(p) in files),
             patch.object(signal, 'pthread_sigmask', side_effect=mask), patch.object(subprocess, 'run', runner),
             patch.object(self.D, '_secure_path', side_effect=info),
@@ -4533,8 +4539,8 @@ class Pure2ArmReport(Offline):
                         verify = Mock(side_effect=AssertionError('Cleanup must not require full assets'))
                         cleanup_patchers = patchers + extra + (
                             patch.object(self.D, '_secure_path', secure),
-                            patch.object(Path, 'lstat', autospec=True, side_effect=info),
-                            patch.object(Path, 'stat', autospec=True, side_effect=info),
+                            patch.object(Path, 'lstat', autospec=ORIGINAL_PATH_LSTAT, side_effect=info),
+                            patch.object(Path, 'stat', autospec=ORIGINAL_PATH_STAT, side_effect=info),
                             patch.object(c, 'verify_ab_assets', verify))
                         before = dict(files)
                         self.assertFalse(self.invoke(c.cleanup_ab_keys, False, patchers=cleanup_patchers))
@@ -4675,7 +4681,7 @@ class HostBoundaryRegressions(unittest.TestCase):
             (builtins, 'open'), (io, 'open'), (os, 'stat'), (os, 'open'),
             (os, 'fdopen'), (Path, 'stat'), (Path, 'read_text'),
             (Path, 'open'), (Path, 'lstat'), (Path, 'mkdir'),
-            (Path, 'readlink'), (Path, 'resolve'),
+            (Path, 'readlink'), (Path, 'resolve'), (Path, 'unlink'),
         ))
 
     def assert_restored(self, references):
@@ -4788,6 +4794,102 @@ class HostBoundaryRegressions(unittest.TestCase):
         self.assertEqual(fixture.D.Controller().nonce, NONCE)
         self.assertEqual(fixture.D.Controller().nonce, NONCE)
         self.assert_restored(references)
+
+    def test_original_path_autospec_supports_nested_bound_calls(self):
+        references = self.references()
+        for name, original in (('lstat', ORIGINAL_PATH_LSTAT), ('stat', ORIGINAL_PATH_STAT),
+                               ('unlink', ORIGINAL_PATH_UNLINK)):
+            self.assertIsInstance(original, FunctionType)
+            self.assertIs(getattr(Path, name), original)
+        fixture = Offline()
+        fixture.setUp()
+        path = Path('/fixture-forbidden')
+        outer_info, inner_info, stat_info = object(), object(), object()
+        active = {}
+
+        def inner():
+            active.update(inner=Path.lstat, stat=Path.stat, unlink=Path.unlink)
+            return path.lstat(), path.stat(), path.unlink()
+
+        def outer():
+            active['outer'] = Path.lstat
+            before = path.lstat()
+            result = fixture.invoke(inner, patchers=(
+                patch.object(Path, 'lstat', autospec=ORIGINAL_PATH_LSTAT, return_value=inner_info),
+                patch.object(Path, 'stat', autospec=ORIGINAL_PATH_STAT, return_value=stat_info),
+                patch.object(Path, 'unlink', autospec=ORIGINAL_PATH_UNLINK, return_value=None),
+            ))
+            self.assertIs(Path.lstat, active['outer'])
+            return before, result, path.lstat()
+
+        result = fixture.invoke(outer, patchers=(
+            patch.object(Path, 'lstat', autospec=ORIGINAL_PATH_LSTAT, return_value=outer_info),
+        ))
+        self.assertEqual(result, (outer_info, (inner_info, stat_info, None), outer_info))
+        self.assert_restored(references)
+        self.assertEqual(fixture.host.depth, 0)
+        self.assertEqual(active['outer'].call_count, 2)
+        active['outer'].assert_called_with(path)
+        for key in ('inner', 'stat', 'unlink'):
+            active[key].assert_called_once_with(path)  # Original unbound signatures bind self.
+        with self.assertRaises(TypeError):
+            fixture.invoke(lambda: path.lstat('unexpected-positional-argument'), patchers=(
+                patch.object(Path, 'lstat', autospec=ORIGINAL_PATH_LSTAT),
+            ))
+        with self.assertRaisesRegex(AssertionError, 'Real host operation forbidden'):
+            fixture.invoke(lambda: path.mkdir(), patchers=(
+                patch.object(Path, 'lstat', autospec=ORIGINAL_PATH_LSTAT),
+            ))
+        self.assert_restored(references)
+
+    def test_original_path_autospec_restores_on_call_and_patch_entry_failure(self):
+        references = self.references()
+        path = Path('/fixture-forbidden')
+        for stage in ('call', 'entry'):
+            fixture = Offline()
+            fixture.setUp()
+            active, called = [], []
+
+            @contextmanager
+            def final_patcher():
+                active.append((Path.lstat, Path.stat, Path.unlink))
+                if stage == 'entry':
+                    raise AssertionError('controlled-autospec-entry')
+                yield
+
+            def operation():
+                called.append(True)
+                self.assertEqual(path.lstat(), 'inner')
+                raise AssertionError('controlled-autospec-call')
+
+            retained = None
+            with self.subTest(stage=stage):
+                try:
+                    # Same-invocation stacking reproduces tls_memory + cleanup
+                    # overrides; specs must not inspect the active outer mock.
+                    fixture.invoke(operation, patchers=(
+                        patch.object(Path, 'lstat', autospec=ORIGINAL_PATH_LSTAT, return_value='outer'),
+                        patch.object(Path, 'lstat', autospec=ORIGINAL_PATH_LSTAT, return_value='inner'),
+                        patch.object(Path, 'stat', autospec=ORIGINAL_PATH_STAT),
+                        patch.object(Path, 'unlink', autospec=ORIGINAL_PATH_UNLINK),
+                        final_patcher(),
+                    ))
+                except AssertionError:
+                    retained = sys.exc_info()
+                self.assertIsNotNone(retained)
+                self.assertEqual(str(retained[1]), 'controlled-autospec-' + stage)
+                self.assertIsNotNone(retained[2])
+                self.assert_restored(references)  # Before any traceback/source lookup.
+                self.assertEqual(fixture.host.depth, 0)
+                self.assertEqual(called, [True] if stage == 'call' else [])
+                self.assertEqual(len(active), 1)
+                if stage == 'call':
+                    active[0][0].assert_called_once_with(path)
+                else:
+                    active[0][0].assert_not_called()
+                formatted = ''.join(traceback.format_exception(*retained))
+                self.assertIn('controlled-autospec-' + stage, formatted)
+                self.assert_restored(references)
 
     def test_import_failure_unwinds_before_handler_and_allows_fresh_setup(self):
         references = self.references()
