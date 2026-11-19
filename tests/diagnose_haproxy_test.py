@@ -170,7 +170,7 @@ class HostBoundary:
             (grp, ('getgrnam', 'getgrgid', 'getgrall')),
             (tempfile, ('mkdtemp', 'mkstemp', 'TemporaryDirectory', 'TemporaryFile', 'NamedTemporaryFile')),
             (urllib.request, ('urlopen', 'urlretrieve')),
-            (signal, ('signal',)), (time, ('sleep',)), (platform, ('machine',)),
+            (signal, ('signal', 'pthread_sigmask')), (time, ('sleep',)), (platform, ('machine',)),
         )
         for obj, names in targets:
             for name in names:
@@ -300,7 +300,7 @@ def assert_launcher_contract(case, shell):
         r'nathaya_diagnose_haproxy_main\s*\(\s*\)\s*\{\s*'
         r'case\s+"\$#:\$\{1-\}"\s+in\s*'
         r'1:--help\s*\)(?P<help>.*?)\s*;;\s*'
-        r'1:--run\s*\|\s*1:--cap-boundaries\s*\|\s*1:--cap-matrix\s*\)\s*;;\s*'
+        r'1:--run\s*\|\s*1:--cap-boundaries\s*\|\s*1:--cap-matrix\s*\|\s*1:--nnp-ab\s*\)\s*;;\s*'
         r'\*\s*\)(?P<default>.*?)\s*;;\s*'
         r'esac\s+(?P<dispatch>.*?)\s*\Z', flat, re.S)
     case.assertIsNotNone(structure, 'One-argument allowlist before dispatch')
@@ -340,12 +340,13 @@ class ImportAndShellContracts(Offline):
 
     def test_launcher_contract_accepts_layout_not_dispatch_changes(self):
         # Text-only variants: never source the shell or launch its Python.
+        self.assertIn('1:--run|1:--cap-boundaries|1:--cap-matrix|1:--nnp-ab)', SHELL)
         variants = (
             SHELL.replace(') ;;', ')\n            ;;')
                  .replace('return 64 ;;', 'return\t64\n            ;;')
                  .replace('    exec /usr/bin/env', '\texec\t/usr/bin/env'),
-            SHELL.replace('1:--run|1:--cap-boundaries|1:--cap-matrix)',
-                          '1:--run | 1:--cap-boundaries | 1:--cap-matrix )')
+            SHELL.replace('1:--run|1:--cap-boundaries|1:--cap-matrix|1:--nnp-ab)',
+                          '1:--run | 1:--cap-boundaries | 1:--cap-matrix | 1:--nnp-ab )')
                  .replace('case "$#:${1-}" in', 'case\t"$#:${1-}"\tin')
                  .replace(' -i PATH=', '  -i\tPATH=')
                  .replace(' -I -B - "$1"', '\t-I  -B\t-  "$1"')
@@ -357,7 +358,8 @@ class ImportAndShellContracts(Offline):
         for before, after in (('-i PATH=', 'PATH='), (' -I -B ', ' -B '),
                               ('- "$1"', '- $1'), ('- "$1"', '- "$@"'),
                               ('return 64 ;;', 'return 0 ;;'),
-                              ('1:--run|1:--cap-boundaries|1:--cap-matrix)', '*)'),
+                              ('1:--run|1:--cap-boundaries|1:--cap-matrix|1:--nnp-ab)', '*)'),
+                              ('|1:--nnp-ab)', ')'),
                               ('\n' + MARKER + '\n', '\n' + MARKER + ' \n'),
                               ('\n' + MARKER + '\n', '\n' + MARKER + '\t\n')):
             mutated = SHELL.replace(before, after)
@@ -377,7 +379,8 @@ class ImportAndShellContracts(Offline):
     def test_main_invalid_arguments_never_construct_controller(self):
         factory = Mock()
         for args in ([], ['--help'], ['--run', 'extra'], ['--trace'],
-                     ['--cap-matrix', 'extra'], ['--cap-matrix=PrivateTmp']):
+                     ['--cap-matrix', 'extra'], ['--cap-matrix=PrivateTmp'],
+                     ['--nnp-ab', 'extra'], ['--nnp-ab=yes'], ['--run', '--nnp-ab']):
             result = self.invoke(self.D.main, args, patchers=(
                 patch.object(self.D, 'Controller', factory),
                 patch.object(sys, 'stderr', io.StringIO()),
@@ -3931,6 +3934,736 @@ class CapabilityMatrixContracts(Offline):
             self.assertNotIn('plain startup:', out)
             self.assertNotIn('trace startup:', out)
             self.assertNotIn('control gated/direct:', out)
+
+
+class Pure2ArmReport(Offline):
+    """Closed TLS startup A/B only; every byte, process and runner is synthetic."""
+
+    def ab_controller(self, old=False):
+        c = self.controller(old)
+        c.uid, c.gid = 200, 201
+        # run_nnp_ab, NOT __init__ or a getattr fallback, owns the full report.
+        with self.assertRaisesRegex(self.D.Unsupported, 'fixture-report-init'):
+            self.invoke(c.run_nnp_ab, patchers=(patch.object(
+                c, 'prepare', side_effect=self.D.Unsupported('fixture-report-init')),))
+        return c
+
+    def ab_pair(self, c):
+        plans = [self.D.nnp_ab_plan(c.directory, c.nonce, c.caps, p)
+                 for p in ('nnp-yes', 'nnp-no')]
+        profiles = [dict(self.probe(c, p), NoNewPrivileges=p['properties']['NoNewPrivileges'])
+                    for p in plans]
+        return plans, profiles
+
+    def tasks(self, c, phase):
+        mask = sum(1 << self.D.CAP_BITS[k] for k in c.caps)
+        master = self.D._status(CaptureContracts.status_bytes(self).decode())
+        master.update(CapBnd=mask, CapPrm=mask, CapEff=mask, NoNewPrivs=int(phase == 'nnp-yes'))
+        worker = dict(master, Pid=102, PPid=101, Uid=(c.uid,) * 4, Gid=(c.gid,) * 4,
+                      Groups=(c.gid,), CapInh=0, CapPrm=0, CapEff=0, CapAmb=0)
+        return [dict(exe=self.D.HAPROXY, status=s) for s in (master, worker)]
+
+    def sequence(self, c, *, a='failed', sampled=True, refusal=None, clean=True, samples=None):
+        c.uid, c.gid = 200, 201
+        plans, profiles = self.ab_pair(c)
+        events = []
+        def observe(plan):
+            phase = plan['phase']
+            events.append(phase)
+            captures = self.tasks(c, phase) if sampled or phase == 'nnp-no' else []
+            for observation in (samples or {}).get(phase, [captures]):
+                c.ab_identity(observation, {'MainPID': '101'}, phase)
+            return a if phase == 'nnp-yes' else 'observed-running'
+        def cleanup(unit):
+            events.append('cleanup:' + unit)
+            return clean
+        def gate(plan):
+            if refusal:
+                raise self.D.Unsupported('fixture-audit-refusal')
+            return profiles[plan['phase'] == 'nnp-no']
+        patchers = (patch.object(c, 'prepare'), patch.object(c, 'prepare_ab_assets'),
+                    patch.object(c, 'verify_ab_assets'), patch.object(c, 'show', return_value={'LoadState': 'not-found'}),
+                    patch.object(c, 'command', return_value=(0, b'', b'')), patch.object(c, 'gate', side_effect=gate),
+                    patch.object(c, 'observe', side_effect=observe), patch.object(c, 'cleanup_one', side_effect=cleanup),
+                    patch.object(c, 'read_boundaries', return_value=[]), patch.object(Path, 'mkdir'),
+                    patch.object(self.D, '_no_lock'))
+        c.ab_assets = {'endpoints': (49173, ABSTRACT)}
+        return plans, events, patchers
+
+    def tls_memory(self, c, outcome=0, *, private_failure=None, events=None):
+        files, inodes = {'gate.py': b'public fixture gate'}, {'gate.py': 1}
+        descriptors = {}
+        events = [] if events is None else events
+        secret_names = {'nnp-ab/private.' + suffix for suffix in ('key', 'crt', 'pem')}
+        def relative(path):
+            return str(path).removeprefix(str(c.directory) + '/')
+        def save(name, raw):
+            # Only ordinary config/evidence goes through save, never key bytes.
+            self.assertNotIn(name, secret_names)
+            self.assertNotIn(name, files)
+            files[name] = raw if isinstance(raw, bytes) else raw.encode()
+            inodes[name] = max(inodes.values()) + 1
+            return c.directory / name
+        def info(path, directory=False):
+            self.assertTrue(path == '/usr/bin/openssl' or Path(path) == c.directory or c.directory in Path(path).parents)
+            name = relative(path)
+            return SimpleNamespace(st_mode=(stat.S_IFDIR | 0o700) if directory else stat.S_IFREG | 0o600,
+                                   st_dev=1, st_ino=inodes.get(name), st_uid=0, st_gid=0, st_nlink=1)
+        def opening(path, flags, mode):
+            name = relative(path)
+            self.assertIn(name, secret_names)
+            self.assertEqual(flags, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC)
+            self.assertEqual(mode, 0o600)
+            self.assertIsNone(c.ab_assets['owned'][name])  # Intent precedes creation.
+            self.assertEqual(events[-1], 'block')
+            if name in files:
+                raise FileExistsError(errno.EEXIST, 'fixture-exclusive')
+            files[name] = b''
+            inodes[name] = max(inodes.values()) + 1
+            descriptors[71] = name  # Synthetic integer; NEVER a host FD.
+            events.append('open')
+            return 71
+        def fstat(fd):
+            self.assertEqual(fd, 71)
+            name = descriptors[fd]
+            self.assertEqual(files[name], b'')
+            self.assertIsNone(c.ab_assets['owned'][name])
+            events.append('fstat')
+            if private_failure == 'fstat':
+                raise OSError(errno.EIO, 'fixture-fstat')
+            result = info(c.directory / name)
+            invalid = {'mode': ('st_mode', stat.S_IFREG | 0o640),
+                       'type': ('st_mode', stat.S_IFDIR | 0o600),
+                       'uid': ('st_uid', 1), 'gid': ('st_gid', 1), 'links': ('st_nlink', 2)}
+            if private_failure in invalid:
+                key, value = invalid[private_failure]
+                setattr(result, key, value)
+            return result
+        def registered(name):
+            self.assertEqual(c.ab_assets['owned'][name], (1, inodes[name]))
+        def close(fd):
+            self.assertEqual(fd, 71)
+            descriptors.pop(fd)
+            events.append('raw-close')
+        outer = self
+        class PrivateStream:
+            def __init__(self, name):
+                self.name = name
+            def __enter__(self):
+                return self
+            def write(self, raw):
+                registered(self.name)  # Even partial writes require FD identity first.
+                events.append('write')
+                if private_failure in ('write', 'interrupt', 'short'):
+                    files[self.name] += raw[:1]
+                    if private_failure == 'short':
+                        return 1
+                    if private_failure == 'interrupt':
+                        raise KeyboardInterrupt()
+                    raise OSError(errno.EIO, 'fixture-write')
+                files[self.name] += raw
+                return len(raw)
+            def __exit__(self, *exc):
+                self.close()
+            def close(self):
+                registered(self.name)
+                outer.assertEqual(descriptors.pop(71), self.name)
+                events.extend(('flush', 'stream-close'))
+                if private_failure in ('flush', 'close'):
+                    raise OSError(errno.EIO, 'fixture-' + private_failure)
+        def fdopen(fd, mode):
+            self.assertEqual((fd, mode), (71, 'wb'))
+            name = descriptors[fd]
+            registered(name)
+            self.assertEqual(files[name], b'')
+            events.append('fdopen')
+            if private_failure == 'fdopen':
+                raise OSError(errno.EIO, 'fixture-fdopen')
+            return PrivateStream(name)
+        def mask(how, signals):
+            if how == signal.SIG_BLOCK:
+                self.assertEqual(signals, {signal.SIGINT, signal.SIGTERM})
+                events.append('block')
+                return {signal.SIGUSR1}
+            self.assertEqual((how, signals), (signal.SIG_SETMASK, {signal.SIGUSR1}))
+            self.assertEqual(descriptors, {})
+            events.append('restore')
+        def read(path, limit):
+            self.assertEqual(Path(path).parent, c.directory if Path(path).name == 'gate.py' else c.directory / 'nnp-ab')
+            self.assertEqual(limit, 65536)
+            name = relative(path)
+            raw = files[name]
+            return raw, dict(mode='0o600', uid=0, gid=0, inode=inodes[name], sha256=hashlib.sha256(raw).hexdigest())
+        def generate(argv, **kwargs):
+            files['nnp-ab/private.key'], files['nnp-ab/private.crt'] = b'PUBLIC-FIXTURE-KEY', b'PUBLIC-FIXTURE-CERT'
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return SimpleNamespace(returncode=outcome)
+        runner = Mock(side_effect=generate)
+        metadata = CapabilityMatrixContracts.python_metadata()
+        return files, runner, (
+            patch.object(c, 'save', side_effect=save), patch.object(Path, 'mkdir'),
+            patch.object(os, 'open', side_effect=opening), patch.object(os, 'fstat', side_effect=fstat),
+            patch.object(os, 'fdopen', side_effect=fdopen), patch.object(os, 'close', side_effect=close),
+            patch.object(Path, 'lstat', autospec=True, side_effect=info),
+            patch.object(Path, 'unlink', autospec=True, side_effect=lambda p: files.pop(relative(p))),
+            patch.object(os.path, 'lexists', side_effect=lambda p: relative(p) in files),
+            patch.object(signal, 'pthread_sigmask', side_effect=mask), patch.object(subprocess, 'run', runner),
+            patch.object(self.D, '_secure_path', side_effect=info),
+            patch.object(self.D, '_read_private_source', side_effect=read),
+            patch.object(self.D, 'executable_metadata', return_value=metadata),
+            patch.object(c, 'reserve', return_value=(49173, ABSTRACT)))
+
+    def test_fixed_plans_tls_and_constructor_unavailable_fields(self):
+        fresh = self.D.Controller()
+        for name in ('directory', 'source', 'fragment', 'source_bytes', 'caps', 'uid', 'gid', 'ab_assets'):
+            self.assertIsNone(getattr(fresh, name))
+        self.assertEqual(fresh.ab_plans, {})
+        for old in (True, False):
+            c = self.ab_controller(old)
+            before = copy.deepcopy((c.source, c.fragment, c.source_bytes, c.caps))
+            plans, profiles = self.ab_pair(c)
+            a, b = plans
+            self.assertEqual(a['argv'], b['argv'])
+            self.assertEqual(a['argv'], [self.D.HAPROXY, '-W', '-db', '-f', str(c.directory / 'nnp-ab/haproxy.cfg')])
+            nuisance = {'NoNewPrivileges', 'Description', 'ExecStartPre', 'StandardOutput', 'StandardError'}
+            self.assertEqual({k for k in a['properties'] if a['properties'][k] != b['properties'][k]}, nuisance)
+            for plan, profile in zip(plans, profiles):
+                expected = self.D.restriction_properties(c.caps)
+                expected['NoNewPrivileges'] = plan['properties']['NoNewPrivileges']
+                self.assertEqual({k: plan['properties'][k] for k in expected}, expected)
+                self.assertEqual(plan['command'], self.D.transient_command(plan['unit'], plan['properties'], plan['argv']))
+                c.validate_nnp_ab(profile, plan)
+            pem = c.directory / 'nnp-ab/private.pem'
+            config = self.D.make_ab_config(49173, ABSTRACT, pem)
+            self.assertEqual(config, self.D.make_config(49173, ABSTRACT).replace(
+                'bind 127.0.0.1:49173\n', 'bind 127.0.0.1:49173 ssl crt ' + str(pem) + '\n'))
+            self.assertIn('user haproxy\n    group haproxy', config)
+            self.assertEqual(config.count(ABSTRACT), 2)
+            self.assertEqual((c.source, c.fragment, c.source_bytes, c.caps), before)
+        for pem in ('/etc/private.pem', '/tmp/private.pem', str(pem) + '\nbind *:443'):
+            with self.assertRaises(self.D.Unsupported):
+                self.D.make_ab_config(49173, ABSTRACT, pem)
+        for port in (0, 443, True, '49173'):
+            with self.assertRaises(ValueError):
+                self.D.make_ab_config(port, ABSTRACT, c.directory / 'nnp-ab/private.pem')
+
+    def test_exact_plan_aliases_duplicates_and_legacy_policy_stay_strict(self):
+        c = self.ab_controller()
+        plans, profiles = self.ab_pair(c)
+        for plan, profile in zip(plans, profiles):
+            for validator in (c.validate_probe, c.validate_control):
+                with self.assertRaises(self.D.Unsupported):
+                    validator(profile, plan)
+            for stamp in (0, -1, True, None, float('inf'), float('nan')):
+                with self.assertRaisesRegex(self.D.Unsupported, 'ab-plan'):
+                    c.validate_nnp_ab(profile, dict(plan, created_at=stamp))
+            c.validate_nnp_ab(profile, dict(plan, created_at=1))
+            for key in ('ExecStart', 'ExecStartEx', 'ExecStartPre', 'ExecStartPreEx'):
+                with self.assertRaises(self.D.Unsupported):
+                    c.validate_nnp_ab(dict(profile, **{key: exec_property(['/bin/true'])}), plan)
+            for args in (['--property=NoNewPrivileges=no'], ['--property', 'NoNewPrivileges=no'],
+                         ['-p', 'NoNewPrivileges=no'], ['-pNoNewPrivileges=no']):
+                bad = copy.deepcopy(plan)
+                i = bad['command'].index('--')
+                bad['command'][i:i] = args
+                with self.assertRaises(self.D.Unsupported):
+                    c.validate_nnp_ab(profile, bad)
+            for key in plan:
+                bad = copy.deepcopy(plan)
+                bad[key] = None
+                with self.assertRaises((self.D.Unsupported, ValueError)):
+                    c.validate_nnp_ab(profile, bad)
+            with self.assertRaises(self.D.Unsupported):
+                c.validate_nnp_ab(profile, dict(plan, unexpected='field'))
+        for phase in ('plain', 'trace', 'cap-gated', 'cap-direct', 'mx00', 'nnp-yes'):
+            for value in ('no', 'false', None, ''):
+                with self.subTest(phase=phase, expected_nnp=value), self.assertRaisesRegex(
+                        self.D.Unsupported, '^ab-policy-scope$'):
+                    c._validate_probe_policy({}, {'phase': phase}, expected_nnp=value)
+        for value in ('false', None, ''):
+            with self.assertRaisesRegex(self.D.Unsupported, '^ab-policy-scope$'):
+                c._validate_probe_policy(profiles[1], plans[1], expected_nnp=value)
+        # Unbound class validation also requires the exact fixed B proof.
+        self.D.Controller.validate_nnp_ab(c, profiles[1], plans[1])
+        with self.assertRaisesRegex(self.D.Unsupported, '^ab-plan$'):
+            self.D.Controller.validate_nnp_ab(c, profiles[1], dict(plans[1], argv=['/bin/true']))
+        with self.assertRaises(self.D.Unsupported):
+            self.D.validate_effective(dict(c.source, NoNewPrivileges='no'), c.fragment)
+
+    def test_scoped_complete_inventory_not_global_nnp_or_source_drift_waiver(self):
+        c = self.ab_controller(True)
+        plans, (a, b) = self.ab_pair(c)
+        before = copy.deepcopy((a, b, c.source))
+        inventory = c.compare_nnp_ab(a, b, *plans)
+        self.assertTrue(inventory['ok'])
+        self.assertEqual({r['property'] for r in inventory['properties']}, set(a) | set(b))
+        self.assertEqual([r['property'] for r in inventory['properties'] if r['classification'] == 'validated-nnp-ab-delta'], ['NoNewPrivileges'])
+        self.assertIn('NoNewPrivileges', self.D.restriction_differences(a, b))
+        with self.assertRaisesRegex(self.D.Unsupported, 'ab-comparison-roles'):
+            c.compare_nnp_ab(b, a, plans[1], plans[0])
+        kwargs = dict(fragment=c.fragment, plan=plans[1], original=c.source,
+                      original_fragment=c.fragment, original_bytes=c.source_bytes, current_bytes=c.source_bytes)
+        self.assertTrue(c.audit_compatibility(c.source, b, **kwargs)['ok'])
+        self.assertTrue(c.audit_compatibility(b, dict(b), plan=plans[1], probe_source=True)['ok'])
+        for key in ('NoNewPrivileges', 'AmbientCapabilities', 'FutureSecurityKnob', 'RequiresMountsFor'):
+            left, right = dict(a), dict(b)
+            if key not in right:
+                left[key] = right[key] = 'required'
+            for candidate in (dict(right, **{key: 'unexpected'}), {k: v for k, v in right.items() if k != key}):
+                self.assertNotEqual(candidate, right)
+                self.assertFalse(c.audit_compatibility(right, candidate, plan=plans[1], probe_source=True)['ok'])
+                if key in ('FutureSecurityKnob', 'RequiresMountsFor'):
+                    self.assertFalse(c.compare_nnp_ab(left, candidate, *plans)['ok'])
+                else:
+                    with self.assertRaises(self.D.Unsupported):
+                        c.compare_nnp_ab(left, candidate, *plans)
+        for current in (dict(c.source, NoNewPrivileges='no'), dict(c.source, FutureSecurityKnob='drift')):
+            self.assertFalse(c.audit_compatibility(current, b, **kwargs)['ok'])
+        self.assertEqual((a, b, c.source), before)
+
+    def test_b_gate_requires_current_source_live_cross_arm_and_asset_proofs(self):
+        for failure in (None, 'source', 'live', 'cross', 'assets'):
+            c = self.ab_controller()
+            plans, (a, b) = self.ab_pair(c)
+            c.ab_plans['nnp-yes'], c.ab_profiles['nnp-yes'] = plans[0], a
+            plan = dict(plans[1], created_at=0.5)
+            current = dict(c.source, NoNewPrivileges='no') if failure == 'source' else c.source
+            live = dict(b, NoNewPrivileges='yes') if failure == 'live' else dict(b)
+            if failure == 'cross':
+                c.ab_profiles['nnp-yes'] = dict(a, FutureSecurityKnob='changed')
+            verify = Mock(side_effect=self.D.Unsupported('fixture-assets') if failure == 'assets' else None)
+            patchers = (patch.object(c, 'show', side_effect=[b, current, live]),
+                        patch.object(c, 'verify_ab_assets', verify), patch.object(self.D, '_no_lock'),
+                        patch.object(self.D, '_read_private_source', return_value=(c.source_bytes, {})),
+                        patch.object(time, 'monotonic', return_value=1))
+            c.save.reset_mock()
+            if failure:
+                with self.assertRaises(self.D.Unsupported):
+                    self.invoke(c.gate, plan, patchers=patchers)
+                c.save.assert_not_called()
+            else:
+                self.invoke(c.gate, plan, patchers=patchers)
+                c.save.assert_called_once_with('nnp-no/go', b'')
+                self.assertEqual(verify.call_count, 2)
+
+    def test_all_five_masks_and_b_worker_self_nnp_are_actual_credentials(self):
+        for old in (True, False):
+            c = self.ab_controller(old)
+            for phase in ('nnp-yes', 'nnp-no'):
+                tasks = self.tasks(c, phase)
+                self.assertIsNotNone(c.ab_identity(tasks, {'MainPID': '101'}, phase))
+                tasks[1]['status']['NoNewPrivs'] = 1
+                self.assertIsNotNone(c.ab_identity(tasks, {'MainPID': '101'}, phase))
+                for index in (0, 1):
+                    for key in ('CapInh', 'CapPrm', 'CapEff', 'CapBnd', 'CapAmb'):
+                        bad = copy.deepcopy(tasks)
+                        bad[index]['status'][key] ^= 1
+                        self.assertIsNone(c.ab_identity(bad, {'MainPID': '101'}, phase))
+                for key, value in (('Uid', (0,) * 4), ('Gid', (0,) * 4), ('Groups', (999,)), ('PPid', 999)):
+                    bad = copy.deepcopy(tasks)
+                    bad[1]['status'][key] = value
+                    self.assertIsNone(c.ab_identity(bad, {'MainPID': '101'}, phase))
+                extra = tasks + [dict(exe=self.D.HAPROXY, status=dict(tasks[1]['status'], Pid=103, PPid=999))]
+                self.assertIsNone(c.ab_identity(extra, {'MainPID': '101'}, phase))
+
+    def test_report_master_is_current_mainpid_never_any_root_or_inferred_nnp(self):
+        c = self.ab_controller()
+        for phase, arm in (('nnp-yes', 'A'), ('nnp-no', 'B')):
+            self.assertIsNone(c.ab_identity(self.tasks(c, phase), {'MainPID': '999'}, phase))
+            row = c.ab_report['arms'][phase]['proc_samples'][-1]
+            self.assertIsNone(row['master'])
+            self.assertEqual(row['availability'], 'unavailable')
+            self.assertEqual(c.ab_report['actual_master_NNP'][arm], 'unavailable')
+            tasks = self.tasks(c, phase)
+            tasks[0]['status']['NoNewPrivs'] ^= 1
+            self.assertIsNone(c.ab_identity(tasks, {'MainPID': '101'}, phase))
+            self.assertEqual(c.ab_report['actual_master_NNP'][arm], [int(phase != 'nnp-yes')])
+
+    def test_observe_uses_ab_identity_for_stability_and_final_cgroup_bound_sample(self):
+        for phase, failure in ((p, f) for p in ('nnp-yes', 'nnp-no')
+                               for f in (None, 'final-cgroup', 'final-worker', 'unstable')):
+            c = self.ab_controller()
+            plans, profiles = self.ab_pair(c)
+            index = int(phase == 'nnp-no')
+            plan, profile = plans[index], dict(profiles[index], ActiveState='active', SubState='running',
+                                               MainPID='101', Result='success', ExecMainStatus='0')
+            final = dict(profile, ControlGroup='') if failure == 'final-cgroup' else profile
+            tasks = self.tasks(c, phase)
+            changed = copy.deepcopy(tasks)
+            changed[1]['status']['Groups'] = (999,) if failure == 'final-worker' else ()
+            capture = Mock(side_effect=[tasks, changed if failure == 'unstable' else tasks, tasks,
+                                       changed if failure == 'final-worker' else tasks])
+            result = self.invoke(c.observe, plan, patchers=(
+                patch.object(c, 'show', side_effect=[profile, profile, profile, profile, final]),
+                patch.object(c, 'capture', capture), patch.object(c, 'identity', side_effect=AssertionError('legacy identity')),
+                patch.object(time, 'monotonic', side_effect=([0, 0, 0, 1, 1.1, 2.1, 2.2, 3.1, 3.2, 3.3]
+                    if failure == 'unstable' else [0, 0, 0, 1, 2.1, 3.1, 3.2, 3.3])),
+                patch.object(time, 'sleep')))
+            self.assertEqual(result, 'observed-running' if failure is None else 'unavailable')
+            self.assertEqual(capture.call_count, 3 if failure == 'final-cgroup' else 4)
+            if failure != 'final-cgroup':
+                self.assertEqual(capture.call_args.args, (plan['unit'], phase + '/sample-final'))
+
+    def test_two_fixed_arms_allow_a_runtime_failure_only_after_confirmed_cleanup(self):
+        c = self.controller(True)
+        plans, events, patchers = self.sequence(c)
+        reserve = Mock(side_effect=lambda endpoints: events.append(('reserve', endpoints)))
+        before = copy.deepcopy((c.source, c.fragment, c.source_bytes, c.caps))
+        self.assertEqual(self.invoke(c.run_nnp_ab, patchers=patchers + (patch.object(c, 'reserve', reserve),)), 0)
+        self.assertEqual(events, ['nnp-yes', 'cleanup:' + plans[0]['unit'], ('reserve', (49173, ABSTRACT)),
+                                  'nnp-no', 'cleanup:' + plans[1]['unit']])
+        self.assertEqual(c.intents, [])
+        self.assertEqual((c.source, c.fragment, c.source_bytes, c.caps), before)
+        self.assertTrue(c.ab_report['confirmed_startup_difference'])
+
+    def test_audit_cleanup_or_endpoint_refusal_never_starts_b_or_retries(self):
+        for failure in ('audit', 'cleanup', 'endpoint'):
+            c = self.controller()
+            plans, events, patchers = self.sequence(c, refusal=failure == 'audit', clean=failure != 'cleanup')
+            reserve = Mock(side_effect=self.D.Unsupported('fixture-conflict'))
+            with self.assertRaises(self.D.Unsupported):
+                self.invoke(c.run_nnp_ab, patchers=patchers + (patch.object(c, 'reserve', reserve),))
+            self.assertNotIn('nnp-no', events)
+            self.assertEqual(reserve.call_count, int(failure == 'endpoint'))
+            if failure == 'endpoint':
+                reserve.assert_called_once_with((49173, ABSTRACT))
+            else:
+                self.assertEqual(c.intents, [plans[0]['unit']])
+
+    def test_fast_failed_a_without_proc_is_candidate_only_not_comparatively_complete(self):
+        for a, sampled, expected in (('failed', False, 'incomplete'), ('unavailable', False, 'incomplete'),
+                                      ('failed', True, 'confirmed-startup-only'),
+                                      ('observed-running', True, 'both-started')):
+            c = self.controller()
+            _, _, patchers = self.sequence(c, a=a, sampled=sampled)
+            gates = [{'stage': 'gate-entry', 'status': {'NoNewPrivs': 1, 'CapEff': 0x4e0}}]
+            rc = self.invoke(c.run_nnp_ab, patchers=patchers + (patch.object(c, 'reserve'),
+                             patch.object(c, 'read_boundaries', return_value=gates)))
+            report = c.ab_report
+            self.assertEqual(rc, 2 if not sampled else 0)
+            self.assertEqual(report['comparative_verification'], expected)
+            self.assertFalse(report['complete'])
+            self.assertFalse(report['production_applied'])
+            self.assertFalse(report['reload_usr2_tested'])
+            self.assertTrue(report['reload_required'])
+            if not sampled:
+                self.assertEqual(report['status'], 'CANDIDATE-startup-only')
+                self.assertTrue(report['startup_candidate'])
+                self.assertEqual(report['actual_master_NNP']['A'], 'unavailable')
+                self.assertEqual(report['arms']['nnp-yes']['gate_boundaries'], gates)
+                self.assertTrue(all(s['master'] is None for s in report['arms']['nnp-yes']['proc_samples']))
+                self.assertFalse(report['diagnostic_finding_completed'])
+
+    def test_reserve_optional_endpoints_are_exact_validated_and_never_fallback(self):
+        c = self.controller()
+        for endpoints in ((443, ABSTRACT), (True, ABSTRACT), (49173, '/tmp/socket')):
+            with self.assertRaises(ValueError):
+                c.reserve(endpoints)
+        tcp, unix = Mock(), Mock()
+        tcp.getsockname.return_value = ('127.0.0.1', 49173)
+        sockets = Mock(side_effect=[tcp, unix])
+        self.assertEqual(self.invoke(c.reserve, (49173, ABSTRACT), patchers=(patch.object(socket, 'socket', sockets),)),
+                         (49173, ABSTRACT))
+        tcp.bind.assert_called_once_with(('127.0.0.1', 49173))
+        unix.bind.assert_called_once_with((b'\x00' + ABSTRACT.encode()).ljust(108, b'\x00'))
+        c.release_reservations()
+        tcp.bind.side_effect = OSError(errno.EADDRINUSE, 'fixture-conflict')
+        sockets = Mock(return_value=tcp)
+        with self.assertRaises(OSError):
+            self.invoke(c.reserve, (49173, ABSTRACT), patchers=(patch.object(socket, 'socket', sockets),))
+        sockets.assert_called_once_with(socket.AF_INET, socket.SOCK_STREAM)
+        c.release_reservations()
+        tcp.bind.side_effect = None
+        tcp.getsockname.return_value = ('127.0.0.1', 49174)
+        sockets.reset_mock()
+        with self.assertRaisesRegex(self.D.Unsupported, '^ab-endpoint-reservation-mismatch$'):
+            self.invoke(c.reserve, (49173, ABSTRACT), patchers=(patch.object(socket, 'socket', sockets),))
+        sockets.assert_called_once_with(socket.AF_INET, socket.SOCK_STREAM)
+        c.release_reservations()
+
+    def test_tls_private_assets_hashes_devnull_timeout_and_exact_secret_cleanup(self):
+        for cap in ({}, {'available': False, 'present': None}, {'available': True, 'present': True}):
+            c = self.controller()
+            files, runner, patchers = self.tls_memory(c)
+            untrusted = dict(CapabilityMatrixContracts.python_metadata(), filecap=cap)
+            with self.assertRaisesRegex(self.D.Unsupported, 'ab-executable-untrusted-or-filecaps'):
+                self.invoke(c.prepare_ab_assets, patchers=patchers + (
+                    patch.object(self.D, 'executable_metadata', return_value=untrusted),))
+            runner.assert_not_called()
+        c = self.controller()
+        files, runner, patchers = self.tls_memory(c)
+        self.invoke(c.prepare_ab_assets, patchers=patchers)
+        argv = runner.call_args.args[0]
+        runner.assert_called_once_with(argv, env=self.D.FIXED_ENV, stdout=subprocess.DEVNULL,
+                                      stderr=subprocess.DEVNULL, timeout=3, check=False)
+        self.assertEqual(argv[:7], ['/usr/bin/openssl', 'req', '-new', '-x509', '-newkey', 'ec', '-pkeyopt'])
+        self.assertEqual(files['nnp-ab/private.pem'], b'PUBLIC-FIXTURE-KEY\nPUBLIC-FIXTURE-CERT')
+        self.assertEqual(set(c.ab_assets['metadata']), {'gate.py', 'nnp-ab/haproxy.cfg',
+                         'nnp-ab/private.key', 'nnp-ab/private.crt', 'nnp-ab/private.pem'})
+        self.assertNotIn('PUBLIC-FIXTURE', str(c.record.call_args_list))
+        self.invoke(c.verify_ab_assets, patchers=patchers)
+        self.assertFalse(self.invoke(c.cleanup_ab_keys, False, patchers=patchers))
+        self.assertIn('nnp-ab/private.pem', files)
+        self.assertTrue(self.invoke(c.cleanup_ab_keys, True, patchers=patchers))
+        self.assertEqual(set(files), {'gate.py', 'nnp-ab/haproxy.cfg'})
+
+    def test_partial_tls_generation_failure_or_interrupt_retains_owned_cleanup(self):
+        for outcome in (1, OSError(errno.EIO, 'fixture'), subprocess.TimeoutExpired(['fixture'], 3), KeyboardInterrupt()):
+            c = self.controller()
+            files, runner, patchers = self.tls_memory(c, outcome)
+            with self.assertRaises((self.D.Unsupported, KeyboardInterrupt)):
+                self.invoke(c.prepare_ab_assets, patchers=patchers)
+            self.assertEqual(len(c.ab_assets['owned']), 3)
+            generation = next(call.args[1] for call in c.record.call_args_list if call.args[0] == 'nnp-ab/tls-generation.json')
+            self.assertEqual(generation['state'], 'interrupted' if isinstance(outcome, KeyboardInterrupt) else
+                             'returned' if outcome == 1 else 'unavailable')
+            self.assertFalse(self.invoke(c.cleanup_ab_keys, False, patchers=patchers))
+            self.assertTrue(self.invoke(c.cleanup_ab_keys, True, patchers=patchers))
+            self.assertEqual(set(files), {'gate.py'})
+
+    def test_asset_drift_refuses_reuse_but_only_secret_identity_blocks_unlink(self):
+        for failure in ('hash', 'directory', 'file-mode', 'identity', 'unowned', 'filecap'):
+            c = self.controller()
+            files, _, patchers = self.tls_memory(c)
+            self.invoke(c.prepare_ab_assets, patchers=patchers)
+            extra = ()
+            if failure == 'hash':
+                files['nnp-ab/private.pem'] += b'changed'
+            elif failure in ('identity', 'unowned'):
+                c.ab_assets['owned']['nnp-ab/private.pem'] = (1, 999) if failure == 'identity' else None
+            elif failure == 'directory':
+                extra = (patch.object(self.D, '_secure_path', return_value=SimpleNamespace(
+                    st_mode=stat.S_IFDIR | 0o755, st_dev=1, st_ino=0, st_uid=0, st_gid=0, st_nlink=1)),)
+            elif failure == 'file-mode':
+                for metadata in c.ab_assets['metadata'].values():
+                    metadata['mode'] = '0o640'
+                extra = (patch.object(self.D, '_read_private_source', side_effect=lambda p, limit:
+                    (b'', c.ab_assets['metadata'][str(p).removeprefix(str(c.directory) + '/')])),)
+            else:
+                extra = (patch.object(self.D, 'executable_metadata', return_value={'available': False}),)
+            with self.assertRaises(self.D.Unsupported):
+                self.invoke(c.verify_ab_assets, patchers=patchers + extra)
+            clean = failure in ('hash', 'file-mode', 'filecap')
+            self.assertEqual(self.invoke(c.cleanup_ab_keys, True, patchers=patchers + extra), clean)
+            self.assertEqual('nnp-ab/private.pem' in files, not clean)
+            if failure in ('identity', 'unowned'):
+                self.assertEqual(set(c.ab_assets['owned']), {'nnp-ab/private.pem'})
+
+    def test_anomalous_observed_masters_never_confirm_an_nnp_only_candidate(self):
+        for old in (True, False):
+            mask = 0x4c0 if old else 0x4e0
+            changes = [dict(CapInh=0x80), dict(CapAmb=0x80), dict(CapBnd=mask ^ 1),
+                       dict(CapEff=mask ^ 1), dict(CapPrm=mask ^ 1),
+                       dict(CapEff=mask & ~0x40, CapPrm=mask & ~0x40),
+                       dict(CapEff=mask & ~0x80, CapPrm=mask & ~0x80),
+                       dict(Uid=(0, 1, 0, 0)), dict(Gid=(0, 1, 0, 0)), dict(NoNewPrivs=2)]
+            for phase in ('nnp-yes', 'nnp-no'):
+                for startup in ('failed', 'unavailable', 'observed-running'):
+                    for change in changes + [dict(NoNewPrivs=int(phase != 'nnp-yes'))]:
+                        with self.subTest(old=old, phase=phase, startup=startup, change=change):
+                            c = self.ab_controller(old)
+                            samples = {}
+                            _, _, patchers = self.sequence(c, a=startup, samples=samples)
+                            good = self.tasks(c, phase)
+                            bad = copy.deepcopy(good)
+                            bad[0]['status'].update(change)
+                            master = bad[0]['status']
+                            self.assertFalse(c.ab_master_valid(master, phase))
+                            self.assertIsNone(c.ab_identity(bad, {'MainPID': '101'}, phase))
+                            # A later healthy sample must not erase an earlier anomaly.
+                            samples[phase] = [bad, good]
+                            allowed = (phase == 'nnp-yes' and startup == 'failed'
+                                       and change == dict(CapEff=mask & ~0x80, CapPrm=mask & ~0x80))
+                            self.assertEqual(c.ab_master_valid(master, phase, failed_arm=True),
+                                             phase == 'nnp-yes' and change == dict(
+                                                 CapEff=mask & ~0x80, CapPrm=mask & ~0x80))
+                            rc = self.invoke(c.run_nnp_ab, patchers=patchers + (patch.object(c, 'reserve'),))
+                            self.assertEqual(rc, 0 if allowed else 2)
+                            report = c.ab_report
+                            self.assertEqual(report['startup_candidate'], allowed)
+                            self.assertEqual(report['confirmed_startup_difference'], allowed)
+                            self.assertEqual(report['diagnostic_finding_completed'], allowed)
+                            self.assertEqual(report['status'], 'CANDIDATE-startup-only' if allowed else
+                                             'inconclusive-A-credentials' if phase == 'nnp-yes' else 'inconclusive')
+                            self.assertEqual(len(report['arms'][phase]['proc_samples']), 2)
+            c = self.ab_controller(old)
+            self.assertFalse(c.ab_master_valid(None, 'nnp-yes', failed_arm=True))
+            with self.assertRaisesRegex(self.D.Unsupported, '^ab-phase$'):
+                c.ab_master_valid(None, 'plain')
+
+    def test_cleanup_ignores_unrelated_asset_drift_and_checks_each_secret_independently(self):
+        for asset in ('config', 'gate', 'executable'):
+            for foreign in ('private.key', 'private.crt', 'private.pem'):
+                for reason in ('inode', 'unregistered', 'uid', 'gid', 'mode', 'links', 'symlink'):
+                    with self.subTest(asset=asset, foreign=foreign, reason=reason):
+                        c = self.controller()
+                        files, _, patchers = self.tls_memory(c)
+                        self.invoke(c.prepare_ab_assets, patchers=patchers)
+                        extra = ()
+                        if asset == 'executable':
+                            extra = (patch.object(self.D, 'executable_metadata', return_value={'available': False}),)
+                        else:
+                            files['gate.py' if asset == 'gate' else 'nnp-ab/haproxy.cfg'] += b'changed'
+                        with self.assertRaises(self.D.Unsupported):
+                            self.invoke(c.verify_ab_assets, patchers=patchers + extra)
+                        secret = 'nnp-ab/' + foreign
+                        identities = dict(c.ab_assets['owned'])
+                        if reason == 'unregistered':
+                            c.ab_assets['owned'][secret] = None
+                        def info(path):
+                            name = str(path).removeprefix(str(c.directory) + '/')
+                            if name not in identities:
+                                return SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_uid=0, st_gid=0,
+                                                       st_dev=1, st_ino=1, st_nlink=1)
+                            device, inode = identities[name]
+                            values = dict(st_mode=stat.S_IFREG | 0o600, st_uid=0, st_gid=0,
+                                          st_dev=device, st_ino=inode, st_nlink=1)
+                            if name == secret:
+                                field, value = {'inode': ('st_ino', inode + 100),
+                                                'unregistered': ('st_ino', inode),
+                                                'uid': ('st_uid', 1), 'gid': ('st_gid', 1),
+                                                'mode': ('st_mode', stat.S_IFREG | 0o640),
+                                                'links': ('st_nlink', 2),
+                                                'symlink': ('st_mode', stat.S_IFLNK | 0o600)}[reason]
+                                values[field] = value
+                            return SimpleNamespace(**values)
+                        # Exercise the REAL root/ancestor/type checks, with stat-only data.
+                        secure = self.D._secure_path
+                        verify = Mock(side_effect=AssertionError('Cleanup must not require full assets'))
+                        cleanup_patchers = patchers + extra + (
+                            patch.object(self.D, '_secure_path', secure),
+                            patch.object(Path, 'lstat', autospec=True, side_effect=info),
+                            patch.object(Path, 'stat', autospec=True, side_effect=info),
+                            patch.object(c, 'verify_ab_assets', verify))
+                        before = dict(files)
+                        self.assertFalse(self.invoke(c.cleanup_ab_keys, False, patchers=cleanup_patchers))
+                        self.assertEqual(files, before)
+                        self.assertFalse(self.invoke(c.cleanup_ab_keys, True, patchers=cleanup_patchers))
+                        self.assertEqual(set(c.ab_assets['owned']), {secret})
+                        self.assertEqual(set(files), {'gate.py', 'nnp-ab/haproxy.cfg', secret})
+                        self.assertEqual(files[secret], before[secret])
+                        verify.assert_not_called()
+                        for name in ('gate.py', 'nnp-ab/haproxy.cfg', 'nnp-ab/private.other', '../private.key'):
+                            with self.assertRaisesRegex(self.D.Unsupported, '^ab-private-file-name$'):
+                                self.invoke(c.ab_unlink_secret, name, patchers=cleanup_patchers)
+                        self.assertEqual(files[secret], before[secret])
+
+    def test_private_fd_identity_precedes_bytes_and_survives_partial_write_or_close_failure(self):
+        unregistered = {'fstat', 'mode', 'type', 'uid', 'gid', 'links'}
+        for failure in (None, 'write', 'short', 'flush', 'close', 'interrupt', 'fdopen',
+                        'fstat', 'mode', 'type', 'uid', 'gid', 'links'):
+            with self.subTest(failure=failure):
+                c = self.controller()
+                c.ab_assets = {'owned': {}, 'metadata': {}, 'executables': {}}
+                events = []
+                files, runner, patchers = self.tls_memory(c, private_failure=failure, events=events)
+                name, raw = 'nnp-ab/private.pem', b'PUBLIC-PARTIAL-FIXTURE'
+                out, err = io.StringIO(), io.StringIO()
+                save = Mock(side_effect=AssertionError('Private bytes must not use save'))
+                patchers += (patch.object(c, 'save', save), patch.object(sys, 'stdout', out),
+                             patch.object(sys, 'stderr', err))
+                if failure is None:
+                    self.invoke(c.ab_private_file, name, raw, patchers=patchers)
+                else:
+                    with self.assertRaises((self.D.Unsupported, OSError, KeyboardInterrupt)) as raised:
+                        self.invoke(c.ab_private_file, name, raw, patchers=patchers)
+                    if failure == 'short':
+                        self.assertEqual(str(raised.exception), 'ab-private-short-write')
+                self.assertEqual(events[:3], ['block', 'open', 'fstat'])
+                self.assertEqual(events[-1], 'restore')
+                self.assertEqual('raw-close' in events, failure in unregistered or failure == 'fdopen')
+                self.assertEqual('write' in events, failure not in unregistered and failure != 'fdopen')
+                self.assertEqual(c.ab_assets['owned'][name] is None, failure in unregistered)
+                self.assertEqual(files[name], b'' if failure in unregistered or failure == 'fdopen' else
+                                 raw[:1] if failure in ('write', 'short', 'interrupt') else raw)
+                save.assert_not_called()
+                runner.assert_not_called()
+                self.assertEqual((out.getvalue(), err.getvalue()), ('', ''))
+                self.assertNotIn('PUBLIC-PARTIAL', str(c.record.call_args_list))
+                self.assertFalse(self.invoke(c.cleanup_ab_keys, False, patchers=patchers))
+                # Full metadata is unavailable: FD ownership alone authorizes cleanup.
+                self.assertEqual(c.ab_assets['metadata'], {})
+                self.assertEqual(self.invoke(c.cleanup_ab_keys, True, patchers=patchers), failure not in unregistered)
+                self.assertEqual(name in files, failure in unregistered)
+                if failure in unregistered:
+                    self.assertEqual(files[name], b'')  # Never authorize a guessed identity.
+                for bad in ('nnp-ab/haproxy.cfg', 'gate.py', 'nnp-ab/private.other'):
+                    with self.assertRaisesRegex(self.D.Unsupported, '^ab-private-file-name$'):
+                        self.invoke(c.ab_private_file, bad, raw, patchers=patchers)
+
+        c = self.controller()
+        c.ab_assets = {'owned': {}, 'metadata': {}, 'executables': {}}
+        events = []
+        files, _, patchers = self.tls_memory(c, events=events)
+        name = 'nnp-ab/private.key'
+        files[name] = b'PUBLIC-FOREIGN-FIXTURE'
+        with self.assertRaises(FileExistsError):
+            self.invoke(c.ab_private_file, name, b'PUBLIC-NEW-FIXTURE', patchers=patchers)
+        self.assertEqual(events, ['block', 'restore'])
+        self.assertIsNone(c.ab_assets['owned'][name])
+        self.assertFalse(self.invoke(c.cleanup_ab_keys, True, patchers=patchers))
+        self.assertEqual(files[name], b'PUBLIC-FOREIGN-FIXTURE')
+
+    def test_ab_mode_isolation_and_final_report_cleanup_contract(self):
+        c = self.controller(True)
+        elf = b'\x7fELF\x02\x01' + b'\x00' * 12 + b'\x3e\x00'
+        private = Mock(side_effect=[(b'ID=ubuntu\nVERSION_ID=24.04\n', {}), (elf, {})])
+        metadata = Mock(return_value={'available': False})
+        command = Mock(return_value=(0, b'', b''))
+        self.invoke(c.prepare, ab=True, patchers=tuple(
+            patch.object(os, name, return_value=0) for name in ('getuid', 'geteuid', 'getgid', 'getegid')
+        ) + (patch.object(platform, 'machine', return_value='x86_64'),
+             patch.object(Path, 'read_text', return_value='systemd'),
+             patch.object(self.D, '_read_private_source', private),
+             patch.object(self.D, 'fixed_snapshot', return_value={'available': False}),
+             patch.object(self.D, '_no_lock'), patch.object(self.D, '_secure_path'),
+             patch.object(os, 'umask'), patch.object(os.path, 'isfile', return_value=False),
+             patch.object(tempfile, 'mkdtemp', return_value=str(c.directory)),
+             patch.object(Path, 'stat', return_value=SimpleNamespace(st_mode=stat.S_IFDIR | 0o700)),
+             patch.object(self.D, 'executable_metadata', metadata), patch.object(c, 'command', command),
+             patch.object(c, '_audit_show', return_value=c.source),
+             patch.object(c, '_audit_fragment', return_value=(c.source_bytes, c.fragment, [])),
+             patch.object(pwd, 'getpwnam', return_value=SimpleNamespace(pw_uid=200, pw_gid=201)),
+             patch.object(grp, 'getgrnam', return_value=SimpleNamespace(gr_gid=201))))
+        command.assert_called_once_with([self.D.HAPROXY, '-vv'])
+        self.assertNotIn('/usr/bin/strace', [call.args[0] for call in metadata.call_args_list])
+        self.assertEqual((c.uid, c.gid, c.source['NoNewPrivileges']), (200, 201, 'yes'))
+        for interrupted in (False, True):
+            for clean, keys_clean in ((True, True), (False, True), (True, False), (False, False)):
+                with self.subTest(interrupted=interrupted, clean=clean, keys_clean=keys_clean):
+                    c = self.ab_controller()
+                    c.ab_report.update(status='confirmed-startup-only', startup_candidate=True,
+                                       diagnostic_finding_completed=True, confirmed_startup_difference=True)
+                    c.prepare, c.run_phase, c.run_matrix, c.run_controls, c.boundary_report = (Mock() for _ in range(5))
+                    c.run_nnp_ab = Mock(return_value=0, side_effect=KeyboardInterrupt if interrupted else None)
+                    c.cleanup = Mock(return_value=clean)
+                    c.cleanup_ab_keys = Mock(return_value=keys_clean)
+                    rc, out, err = self.main_with(c, ['--nnp-ab'])
+                    expected = 130 if interrupted else 0 if clean and keys_clean else 2
+                    self.assertEqual((rc, err), (expected, ''))
+                    c.run_nnp_ab.assert_called_once_with()
+                    c.cleanup.assert_called_once_with()
+                    c.cleanup_ab_keys.assert_called_once_with(clean)
+                    for operation in (c.prepare, c.run_phase, c.run_matrix, c.run_controls, c.boundary_report):
+                        operation.assert_not_called()
+                    report = next(call.args[1] for call in c.record.call_args_list if call.args[0] == 'nnp-ab.report.json')
+                    self.assertIs(report, c.ab_report)
+                    self.assertEqual(report['exitcode'], expected)
+                    self.assertEqual(report['interrupted'], interrupted)
+                    self.assertEqual(report['cleanup_confirmed'], clean)
+                    self.assertEqual(report['tls_cleanup_confirmed'], keys_clean)
+                    if not clean or not keys_clean:
+                        self.assertEqual(report['status'], 'cleanup-unconfirmed')
+                        for flag in ('startup_candidate', 'diagnostic_finding_completed', 'confirmed_startup_difference'):
+                            self.assertFalse(report[flag])
+                        self.assertIn('nnp-ab: private key cleanup unconfirmed', out)
+                        self.assertIn('nnp-ab: cleanup-unconfirmed;', out)
+                    self.assertFalse(report['production_applied'])
+                    self.assertFalse(report['reload_usr2_tested'])
+                    self.assertTrue(report['reload_required'])
+                    self.assertNotIn('trace startup:', out)
+                    self.assertNotIn('matrix:', out)
 
 
 class HostBoundaryRegressions(unittest.TestCase):

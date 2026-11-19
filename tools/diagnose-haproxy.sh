@@ -4,7 +4,10 @@ nathaya_diagnose_haproxy_main() {
     case "$#:${1-}" in
         1:--help)
             builtin printf '%s\n' \
-                'Usage: bash tools/diagnose-haproxy.sh --help | --run | --cap-boundaries | --cap-matrix' \
+                'Usage: bash tools/diagnose-haproxy.sh --help | --run | --cap-boundaries | --cap-matrix | --nnp-ab' \
+                '--nnp-ab runs ONLY two isolated TLS-config startup arms: NNP=yes then no.' \
+                'No production change, handshake/health, tracing or USR2/reload proof.' \
+                'NNP=no loses the kernel exec-gain barrier; other hardening is not a replacement.' \
                 '--cap-matrix tests a finite requested-restriction matrix using fixed Python only.' \
                 '--cap-boundaries runs only fixed Python controls; no HAProxy, strace or listeners.' \
                 '--help is read-only. --run requires root Ubuntu 24.04 amd64, systemd PID 1.' \
@@ -14,8 +17,8 @@ nathaya_diagnose_haproxy_main() {
                 'Tracing changes privilege/timing; traced results do not represent an untraced run.'
             return 0
             ;;
-        1:--run|1:--cap-boundaries|1:--cap-matrix) ;;
-        *) builtin printf '%s\n' 'Usage: bash tools/diagnose-haproxy.sh --help | --run | --cap-boundaries | --cap-matrix' >&2; return 64 ;;
+        1:--run|1:--cap-boundaries|1:--cap-matrix|1:--nnp-ab) ;;
+        *) builtin printf '%s\n' 'Usage: bash tools/diagnose-haproxy.sh --help | --run | --cap-boundaries | --cap-matrix | --nnp-ab' >&2; return 64 ;;
     esac
     exec /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C \
         /usr/bin/python3 -I -B - "$1" <<'NATHAYA_HAPROXY_DIAG_PY'
@@ -28,7 +31,12 @@ Pure public interfaces:
   watchdog_behavior(value) -> 'disabled' (only raw '0' or 'infinity')
   restriction_differences(source, probe) -> sorted list[str]
   Controller.audit_compatibility(...) -> private aggregate dict (pure, no IO)
-  make_config(port, abstract_name) -> str
+  make_config(port, abstract_name) -> str (legacy NO_TLS)
+  make_ab_config(port, abstract_name, private_pem) -> str (TLS startup only)
+  nnp_ab_plan(directory, nonce, caps, phase) -> closed A/B plan
+  Controller.validate_nnp_ab(probe, plan) -> None (pure exact-plan proof)
+  Controller.compare_nnp_ab(a, b, a_plan, b_plan) -> private raw inventory
+  Controller.run_nnp_ab() -> diagnostic exit code; nnp-ab.report.json
   trace_command(haproxy_argv) -> list[str]
   sanitise_trace(text) -> dict (no arguments, IDs or raw log text)
   owned_unit(properties, unit, nonce) -> bool
@@ -539,6 +547,47 @@ frontend probe_abstract
 '''
 
 
+def make_ab_config(port, abstract_name, private_pem):
+    """Startup TLS configuration only; the legacy make_config remains NO_TLS."""
+    if (not isinstance(private_pem, (str, Path)) or not re.fullmatch(
+            r'/run/nathaya-haproxy-probe\.[A-Za-z0-9_-]+/nnp-ab/private.pem', str(private_pem))):
+        raise Unsupported('ab-pem-path')
+    config = make_config(port, abstract_name)  # Validates high port and abstract name.
+    return config.replace(f'bind 127.0.0.1:{port}\n',
+                          f'bind 127.0.0.1:{port} ssl crt {private_pem}\n')
+
+
+def nnp_ab_plan(directory, nonce, caps, phase):
+    """Closed two-arm plan; all non-NNP security properties are identical."""
+    if (phase not in ('nnp-yes', 'nnp-no') or not isinstance(nonce, str)
+            or not re.fullmatch(r'[0-9a-f]{32}', nonce) or not re.fullmatch(
+                r'/run/nathaya-haproxy-probe\.[A-Za-z0-9_-]+', str(directory))):
+        raise Unsupported('ab-plan')
+    directory = Path(directory)
+    output, go = directory / phase / 'combined.log', directory / phase / 'go'
+    argv = [HAPROXY, '-W', '-db', '-f', str(directory / 'nnp-ab/haproxy.cfg')]
+    pre = ['/usr/bin/python3', '-I', '-B', str(directory / 'gate.py'), str(go)]
+    unit = 'nathaya-haproxy-probe-' + nonce + '-' + phase + '.service'
+    properties = {**restriction_properties(caps),
+                  'NoNewPrivileges': 'yes' if phase == 'nnp-yes' else 'no',
+                  'Description': 'Nathaya HAProxy probe ' + nonce + ' ' + phase,
+                  'ExecStartPre': ' '.join(pre),
+                  'StandardOutput': 'append:' + str(output), 'StandardError': 'append:' + str(output)}
+    return dict(phase=phase, unit=unit, argv=argv, pre=pre, go=go, output=output,
+                properties=properties, command=transient_command(unit, properties, argv))
+
+
+def _allow_nnp_ab_delta(inventory):
+    # Caller must independently prove both contexts. Never normalize a snapshot.
+    for row in inventory['properties']:
+        if (row['property'] == 'NoNewPrivileges' and row['source_present'] and row['probe_present']
+                and row['source'] == 'yes' and row['probe'] == 'no'):
+            row.update(unsupported=False, classification='validated-nnp-ab-delta',
+                       reason='closed-startup-AB-only-NNP-yes-to-no')
+    inventory['unsupported'] = [r['property'] for r in inventory['properties'] if r['unsupported']]
+    inventory['mismatches'] = [r for r in inventory['properties'] if r['unsupported']]
+
+
 def trace_command(haproxy_argv):
     if (not isinstance(haproxy_argv, (list, tuple)) or len(haproxy_argv) != 5 or
             list(haproxy_argv[:4]) != [HAPROXY, '-W', '-db', '-f'] or
@@ -592,7 +641,7 @@ def owned_unit(properties, unit, nonce):
     if (not isinstance(properties, dict) or not isinstance(unit, str) or
             not isinstance(nonce, str) or not re.fullmatch(r'[0-9a-f]{32}', nonce)):
         return False
-    match = re.fullmatch(r'nathaya-haproxy-probe-' + nonce + r'-(plain|trace|cap-gated|cap-direct|mx(?:0[0-9]|1[0-9]|2[0-7]))\.service', unit)
+    match = re.fullmatch(r'nathaya-haproxy-probe-' + nonce + r'-(plain|trace|cap-gated|cap-direct|nnp-yes|nnp-no|mx(?:0[0-9]|1[0-9]|2[0-7]))\.service', unit)
     if not match:
         return False
     expected = {
@@ -727,7 +776,7 @@ def _capture_unit(unit, nonce):
     return (isinstance(unit, str) and isinstance(nonce, str) and
             re.fullmatch(r'[0-9a-f]{32}', nonce) is not None and
             re.fullmatch(r'nathaya-haproxy-probe-' + nonce +
-                         r'-(plain|trace|cap-gated|cap-direct|mx(?:0[0-9]|1[0-9]|2[0-7]))\.service', unit) is not None)
+                         r'-(plain|trace|cap-gated|cap-direct|nnp-yes|nnp-no|mx(?:0[0-9]|1[0-9]|2[0-7]))\.service', unit) is not None)
 
 
 def _proc_identity(raw):
@@ -1016,6 +1065,11 @@ class Controller:
         self.process_boundaries = []
         self.matrix_plans = {}
         self.matrix_mount_manager_sample = None
+        self.ab_report = {'status': 'NOTSTARTED', 'complete': False, 'production_applied': False,
+                          'reload_usr2_tested': False, 'reload_required': True,
+                          'proc_identity': 'unavailable', 'arms': {}}
+        self.ab_assets = None
+        self.ab_plans, self.ab_profiles = {}, {}
 
     def save(self, name, content):
         if self.directory is None or not re.fullmatch(r'[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*', name):
@@ -1062,7 +1116,7 @@ class Controller:
         return code, out, err
 
     def show(self, unit, absent=False, timeout=3):
-        if unit != MAIN and not re.fullmatch(r'nathaya-haproxy-probe-' + self.nonce + r'-(?:plain|trace|cap-gated|cap-direct|mx(?:0[0-9]|1[0-9]|2[0-7]))\.service', unit):
+        if unit != MAIN and not re.fullmatch(r'nathaya-haproxy-probe-' + self.nonce + r'-(?:plain|trace|cap-gated|cap-direct|nnp-yes|nnp-no|mx(?:0[0-9]|1[0-9]|2[0-7]))\.service', unit):
             raise Unsupported('unit-name')
         code, out, _ = self.command(['/usr/bin/systemctl', 'show', '--all', '--no-pager', unit], timeout=timeout)
         if len(out) > SHOW_LIMIT:
@@ -1107,7 +1161,7 @@ class Controller:
         fragment = collect_unsupported(errors, validate_fragment, text)
         return raw, fragment, errors
 
-    def prepare(self, cap_boundaries=False):
+    def prepare(self, cap_boundaries=False, ab=False):
         if (os.geteuid() != 0 or os.getuid() != 0 or os.getegid() != 0 or os.getgid() != 0 or
                 platform.machine() != 'x86_64'):
             raise Unsupported('root-Ubuntu-24.04-amd64-required')
@@ -1134,7 +1188,9 @@ class Controller:
         if cap_boundaries:
             self.save('control.py', CONTROL_PROGRAM)
         executables = ['/usr/bin/python3', '/usr/bin/env', '/usr/bin/systemd-run',
-                       '/usr/bin/strace', HAPROXY, '/usr/lib/systemd/systemd-executor']
+                       HAPROXY, '/usr/lib/systemd/systemd-executor']
+        if not ab:
+            executables.append('/usr/bin/strace')
         if initial['manager'].get('exe'):
             executables.append(initial['manager']['exe'])
         self.record('boundaries.executables.json', {p: executable_metadata(p) for p in dict.fromkeys(executables)})
@@ -1163,25 +1219,163 @@ class Controller:
                 break
         else:
             self.record('getcap.unavailable.json', {'available': False})
-        if os.path.isfile('/usr/bin/strace'):
-            _secure_path('/usr/bin/strace')
-            self.command(['/usr/bin/strace', '-V'])
-        else:
-            self.record('strace.unavailable.json', {'available': False})
+        if not ab:
+            if os.path.isfile('/usr/bin/strace'):
+                _secure_path('/usr/bin/strace')
+                self.command(['/usr/bin/strace', '-V'])
+            else:
+                self.record('strace.unavailable.json', {'available': False})
         account, group = pwd.getpwnam('haproxy'), grp.getgrnam('haproxy')
         if account.pw_uid <= 0 or group.gr_gid <= 0 or account.pw_gid != group.gr_gid:
             raise Unsupported('haproxy-account')
         self.uid, self.gid = account.pw_uid, group.gr_gid
         self.record('account.metadata.json', {'uid': self.uid, 'gid': self.gid})
 
-    def reserve(self):
+    def ab_private_file(self, name, raw):
+        # Register the exclusively created FD BEFORE private bytes are written,
+        # including write/flush/close failures. Never authorize cleanup by name.
+        if name not in ('nnp-ab/private.key', 'nnp-ab/private.crt', 'nnp-ab/private.pem'):
+            raise Unsupported('ab-private-file-name')
+        path = self.directory / name
+        if stat.S_IMODE(_secure_path(path.parent, directory=True).st_mode) != 0o700:
+            raise Unsupported('ab-directory-mode')
+        self.ab_assets['owned'][name] = None
+        blocked = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM})
+        fd = None
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid or info.st_gid or info.st_nlink != 1
+                    or stat.S_IMODE(info.st_mode) != 0o600):
+                raise Unsupported('ab-private-file-mode')
+            self.ab_assets['owned'][name] = (info.st_dev, info.st_ino)
+            stream = os.fdopen(fd, 'wb')
+            fd = None  # The stream owns the descriptor from here.
+            with stream:
+                if stream.write(raw) != len(raw):
+                    raise Unsupported('ab-private-short-write')
+        finally:
+            try:
+                if fd is not None:
+                    os.close(fd)
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
+
+    def prepare_ab_assets(self):
+        self.ab_assets = {'owned': {}, 'metadata': {}, 'executables': {}}
+        (self.directory / 'nnp-ab').mkdir(mode=0o700)
+        for path in (HAPROXY, '/usr/bin/python3', '/usr/bin/openssl'):
+            metadata = executable_metadata(path)
+            cap = metadata.get('filecap', {})
+            if (not metadata.get('available') or not cap.get('available') or
+                    cap.get('present') is not False or int(metadata['mode'], 8) & 0o6000):
+                raise Unsupported('ab-executable-untrusted-or-filecaps')
+            self.ab_assets['executables'][path] = metadata
+        _secure_path('/usr/bin/openssl')
+        key, cert, pem = ('nnp-ab/' + n for n in ('private.key', 'private.crt', 'private.pem'))
+        for name in (key, cert, pem):
+            self.ab_private_file(name, b'')
+        # OpenSSL 3 req supports -noenc (not a network/trust-store operation):
+        # https://docs.openssl.org/3.0/man1/openssl-req/
+        argv = ['/usr/bin/openssl', 'req', '-new', '-x509', '-newkey', 'ec',
+                '-pkeyopt', 'ec_paramgen_curve:prime256v1', '-noenc', '-days', '1',
+                '-subj', '/CN=localhost', '-keyout', str(self.directory / key),
+                '-out', str(self.directory / cert)]
+        self.record('nnp-ab/tls-intent.json', {'argv': argv, 'owned': self.ab_assets['owned']})
+        start = time.monotonic()
+        generation = dict(argv=argv, returncode=None, errno=None, state='interrupted', exception_class=None)
+        try:
+            result = subprocess.run(argv, env=FIXED_ENV, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, timeout=3, check=False)
+            generation.update(returncode=result.returncode, state='returned')
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            generation.update(state='unavailable', errno=getattr(exc, 'errno', None),
+                              exception_class=type(exc).__name__)
+        finally:
+            generation['elapsed'] = time.monotonic() - start
+            self.record('nnp-ab/tls-generation.json', generation)
+        if generation['returncode'] != 0:
+            raise Unsupported('ab-tls-generation-unavailable')
+        private_key, _ = _read_private_source(self.directory / key, 65536)
+        certificate, _ = _read_private_source(self.directory / cert, 65536)
+        if not private_key or not certificate:
+            raise Unsupported('ab-tls-empty')
+        # Replace ONLY our still-empty, inode-checked placeholder via secure save.
+        self.ab_unlink_secret(pem)
+        self.ab_private_file(pem, private_key + b'\n' + certificate)
+        del private_key, certificate
+        endpoints = self.reserve()
+        self.ab_assets['endpoints'] = endpoints
+        self.save('nnp-ab/haproxy.cfg', make_ab_config(*endpoints, self.directory / pem))
+        for name in (key, cert, pem, 'nnp-ab/haproxy.cfg', 'gate.py'):
+            _, metadata = _read_private_source(self.directory / name, 65536)
+            self.ab_assets['metadata'][name] = metadata
+        self.verify_ab_assets()
+        self.record('nnp-ab/assets.json', self.ab_assets)  # Metadata/hashes, NEVER private bytes.
+
+    def verify_ab_assets(self):
+        assets = self.ab_assets
+        if assets is None or len(assets['metadata']) != 5:
+            raise Unsupported('ab-assets-unavailable')
+        for directory in (self.directory, self.directory / 'nnp-ab'):
+            if stat.S_IMODE(_secure_path(directory, directory=True).st_mode) != 0o700:
+                raise Unsupported('ab-directory-mode')
+        for name, expected in assets['metadata'].items():
+            _, metadata = _read_private_source(self.directory / name, 65536)
+            if metadata != expected or metadata['mode'] != '0o600':
+                raise Unsupported('ab-private-asset-changed')
+        for name, identity in assets['owned'].items():
+            info = _secure_path(self.directory / name)
+            if (info.st_dev, info.st_ino) != identity or stat.S_IMODE(info.st_mode) != 0o600:
+                raise Unsupported('ab-private-identity-changed')
+        for path, expected in assets['executables'].items():
+            if executable_metadata(path) != expected:
+                raise Unsupported('ab-executable-changed')
+
+    def ab_unlink_secret(self, name):
+        if name not in ('nnp-ab/private.key', 'nnp-ab/private.crt', 'nnp-ab/private.pem'):
+            raise Unsupported('ab-private-file-name')
+        identity = self.ab_assets['owned'][name]
+        path = self.directory / name
+        if not os.path.lexists(path):
+            if identity is None:
+                del self.ab_assets['owned'][name]
+                return
+            raise Unsupported('ab-private-file-missing')
+        info = _secure_path(path)
+        if (identity is None or (info.st_dev, info.st_ino) != identity or info.st_nlink != 1 or
+                stat.S_IMODE(info.st_mode) != 0o600):
+            raise Unsupported('ab-private-cleanup-identity')
+        path.unlink()  # Exact generated key/cert/PEM only; no logs/evidence deletion.
+        del self.ab_assets['owned'][name]
+
+    def cleanup_ab_keys(self, units_clean):
+        if not units_clean:
+            return False  # Retain keys and all evidence if ANY unit ownership is unresolved.
+        if self.ab_assets is None:
+            return True
+        # Execution-integrity failures (e.g. changed config/executable) must
+        # NOT strand still-owned keys. Authorize each unlink independently.
+        complete = True
+        for name in tuple(self.ab_assets['owned']):
+            try:
+                self.ab_unlink_secret(name)
+            except (OSError, ValueError):
+                complete = False
+        return complete and not self.ab_assets['owned']
+
+    def reserve(self, endpoints=None):
+        if endpoints is not None:
+            make_config(*endpoints)  # Exact high port/name; never port zero for B.
         tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.reservations.append(tcp)
-        tcp.bind(('127.0.0.1', 0))
+        tcp.bind(('127.0.0.1', 0 if endpoints is None else endpoints[0]))
         port = tcp.getsockname()[1]
         if port < 1024:
             raise Unsupported('high-port-reservation')
-        abstract = 'nathaya-probe-' + secrets.token_hex(16)
+        if endpoints is not None and port != endpoints[0]:
+            raise Unsupported('ab-endpoint-reservation-mismatch')
+        abstract = ('nathaya-probe-' + secrets.token_hex(16)) if endpoints is None else endpoints[1]
         unix = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.reservations.append(unix)
         # HAProxy abns@ uses sizeof(sockaddr_un.sun_path), including zero padding.
@@ -1194,6 +1388,13 @@ class Controller:
             self.reservations.pop().close()
 
     def factory(self, phase):
+        if phase in ('nnp-yes', 'nnp-no'):
+            self.verify_ab_assets()
+            (self.directory / phase).mkdir(mode=0o700)
+            self.save(phase + '/combined.log', b'')
+            plan = nnp_ab_plan(self.directory, self.nonce, self.caps, phase)
+            self.ab_plans[phase] = plan
+            return plan
         if phase not in ('plain', 'trace'):
             raise ValueError('probe-phase')
         directory = self.directory / phase
@@ -1224,7 +1425,7 @@ class Controller:
         # Never borrow the production destination, even if File metadata exists.
         phase = plan.get('phase')
         directory = str(self.directory)
-        if ((phase not in ('plain', 'trace', 'cap-gated', 'cap-direct') and
+        if ((phase not in ('plain', 'trace', 'cap-gated', 'cap-direct', 'nnp-yes', 'nnp-no') and
              not (isinstance(phase, str) and re.fullmatch(r'mx(?:0[0-9]|1[0-9]|2[0-7])', phase))) or not isinstance(self.directory, Path) or not re.fullmatch(
                 r'/run/nathaya-haproxy-probe\.[A-Za-z0-9_-]+', directory)):
             raise Unsupported('probe-output-plan')
@@ -1343,7 +1544,9 @@ class Controller:
             errors.append('probe-command-plan:ExecStartPre')
         _raise_unsupported(errors)
 
-    def _validate_probe_policy(self, probe, plan):
+    def _validate_probe_policy(self, probe, plan, expected_nnp='yes'):
+        if expected_nnp != 'yes' and not (expected_nnp == 'no' and plan.get('phase') == 'nnp-no'):
+            raise Unsupported('ab-policy-scope')
         errors = []
         unit = plan.get('unit')
         if not owned_unit(probe, unit, self.nonce):
@@ -1359,7 +1562,7 @@ class Controller:
             'TimeoutStopUSec': '2s', 'TimeoutAbortUSec': '2s', 'CanReload': 'no',
             'KillMode': 'control-group', 'SendSIGKILL': 'yes',
             'StandardOutput': 'append', 'StandardError': 'append',
-            'SecureBits': '0', 'NoNewPrivileges': 'yes', 'AmbientCapabilities': '',
+            'SecureBits': '0', 'NoNewPrivileges': expected_nnp, 'AmbientCapabilities': '',
             'UMask': '0077', 'ProtectSystem': 'strict', 'ProtectHome': 'yes',
             'PrivateTmp': 'yes', 'ProtectKernelTunables': 'yes', 'ProtectKernelModules': 'yes',
             'ProtectControlGroups': 'yes', 'RestrictSUIDSGID': 'yes', 'LockPersonality': 'yes',
@@ -1414,6 +1617,47 @@ class Controller:
         collect_unsupported(errors, self.control_empty_exec_fields, probe, plan)
         _raise_unsupported(errors)
 
+    def validate_nnp_ab(self, probe, plan):
+        """Only this exact closed plan may request an effective NNP=no."""
+        if not isinstance(probe, dict) or not isinstance(plan, dict):
+            raise Unsupported('ab-snapshot-or-plan-format')
+        expected = nnp_ab_plan(self.directory, self.nonce, self.caps, plan.get('phase'))
+        if (set(plan) - {'created_at'} != set(expected) or
+                any(plan.get(k) != v for k, v in expected.items()) or
+                ('created_at' in plan and (type(plan['created_at']) not in (int, float)
+                                          or not 0 < plan['created_at'] < float('inf')))):
+            raise Unsupported('ab-plan')
+        errors = []
+        collect_unsupported(errors, self._validate_probe_policy, probe, plan,
+                            expected_nnp=expected['properties']['NoNewPrivileges'])
+        if _capset(probe.get('CapabilityBoundingSet')) != self.caps:
+            errors.append('ab-bounding')
+        _require(probe, {'RestartUSec': '3s'})
+        collect_unsupported(errors, self.validate_probe_logging, probe, plan)
+        collect_unsupported(errors, self._validate_probe_watchdog, probe, plan)
+        for key in ('ExecStart', 'ExecStartPre'):
+            argv = expected['argv' if key == 'ExecStart' else 'pre']
+            for field in (key, key + 'Ex'):
+                if (field == key or field in probe) and not _exec_struct(probe.get(field), argv):
+                    errors.append(field)
+        collect_unsupported(errors, self.empty_probe_exec_fields, probe, plan)
+        _raise_unsupported(errors)
+
+    def compare_nnp_ab(self, a, b, a_plan, b_plan):
+        """Pure independent A/B proofs plus strict raw inventory; no mount waiver."""
+        if a_plan.get('phase') != 'nnp-yes' or b_plan.get('phase') != 'nnp-no':
+            raise Unsupported('ab-comparison-roles')
+        self.validate_nnp_ab(a, a_plan)
+        self.validate_nnp_ab(b, b_plan)
+        result = _comparison_inventory(a, b,
+            empty_source=self.empty_probe_exec_fields(a, a_plan),
+            empty_probe=self.empty_probe_exec_fields(b, b_plan))
+        _allow_nnp_ab_delta(result)
+        result['issues'] = list(result['unsupported'])
+        result['ok'] = not result['issues']
+        result['nuisance_differences'] = ['Description', 'ExecStartPre', 'private append log destination']
+        return result
+
     def audit_compatibility(self, source=None, probe=None, *, fragment=None, plan=None,
                             original=None, original_fragment=None,
                             original_bytes=None, current_bytes=None,
@@ -1427,7 +1671,8 @@ class Controller:
         No IO, execution, repairs, guessed hooks, or exception-based equivalence.
         """
         control = isinstance(plan, dict) and plan.get('phase') in ('cap-gated', 'cap-direct')
-        validator = self.validate_control if control else self.validate_probe
+        ab = isinstance(plan, dict) and plan.get('phase') in ('nnp-yes', 'nnp-no')
+        validator = self.validate_nnp_ab if ab else self.validate_control if control else self.validate_probe
         empty_fields = self.control_empty_exec_fields if control else self.empty_probe_exec_fields
         validation = {'source': [], 'probe': [], 'original': []}
         source_caps = None
@@ -1467,6 +1712,12 @@ class Controller:
             profile['raw_fragment_changed'] = (original_bytes != current_bytes
                                               if original_bytes is not None and current_bytes is not None else None)
             profile['changed'] = bool(profile['unsupported'] or profile['raw_fragment_changed'])
+        if (ab and plan['phase'] == 'nnp-no' and not probe_source and pair
+                and not any(validation.values()) and not inspection_errors
+                and not (profile is not None and profile['changed'])
+                and not (original_bytes is not None and current_bytes is not None
+                         and original_bytes != current_bytes)):
+            _allow_nnp_ab_delta(result)
         validation = {key: sorted(set(values)) for key, values in validation.items()}
         issues = list(inspection_errors)
         for values in validation.values():
@@ -1571,6 +1822,13 @@ class Controller:
         self.record(plan['phase'] + '/live-comparison.json', live_audit)
         _raise_unsupported(live_audit['issues'])
         release_errors = []
+        if plan['phase'] in ('nnp-yes', 'nnp-no'):
+            self.verify_ab_assets()
+            if plan['phase'] == 'nnp-no':
+                cross = self.compare_nnp_ab(self.ab_profiles['nnp-yes'], live,
+                                           self.ab_plans['nnp-yes'], plan)
+                self.record('nnp-ab/comparison.json', cross)
+                _raise_unsupported(cross['issues'])
         if time.monotonic() >= deadline:
             release_errors.append('prestart-deadline')
         collect_unsupported(release_errors, _no_lock)
@@ -1579,6 +1837,10 @@ class Controller:
             'purpose': 'last refusal check before atomic go creation',
         })
         _raise_unsupported(release_errors)
+        if plan['phase'] in ('nnp-yes', 'nnp-no'):
+            self.verify_ab_assets()
+            if time.monotonic() >= deadline:
+                raise Unsupported('prestart-deadline')
         self.release_reservations()
         self.save(plan['phase'] + '/' + plan['go'].name, b'')
         return live
@@ -1718,7 +1980,44 @@ class Controller:
             return None
         return (master['Pid'], tuple(sorted(p['Pid'] for p in workers)))
 
+    def ab_master_valid(self, master, phase, *, failed_arm=False):
+        if phase not in ('nnp-yes', 'nnp-no'):
+            raise Unsupported('ab-phase')
+        mask = sum(1 << CAP_BITS[c] for c in self.caps)
+        allowed = (mask, mask & ~0x80) if failed_arm and phase == 'nnp-yes' else (mask,)
+        return bool(master is not None and master['Uid'] == (0,) * 4 and master['Gid'] == (0,) * 4
+                    and master['NoNewPrivs'] == int(phase == 'nnp-yes')
+                    and master['CapInh'] == 0 and master['CapAmb'] == 0 and master['CapBnd'] == mask
+                    and master['CapEff'] == master['CapPrm'] and master['CapEff'] in allowed)
+
+    def ab_identity(self, captures, properties, phase):
+        haproxy = [p['status'] for p in captures if p['exe'] == HAPROXY]
+        masters = [s for s in haproxy if str(s['Pid']) == properties.get('MainPID')]
+        master = masters[0] if len(masters) == 1 else None
+        workers = [s for s in haproxy if master and s['Pid'] != master['Pid'] and s['PPid'] == master['Pid']]
+        # Keep bad masks/NNP too; never infer proc state from the gate or request.
+        self.ab_report['arms'][phase]['proc_samples'].append({
+            'MainPID': properties.get('MainPID'), 'master': master, 'workers': workers,
+            'availability': 'observed' if master else 'unavailable',
+            'other_haproxy': [s for s in haproxy if s is not master and s not in workers]})
+        observed = [s['master']['NoNewPrivs'] for s in self.ab_report['arms'][phase]['proc_samples']
+                    if s['master'] is not None]
+        self.ab_report['actual_master_NNP']['A' if phase == 'nnp-yes' else 'B'] = observed or 'unavailable'
+        mask, nnp = sum(1 << CAP_BITS[c] for c in self.caps), int(phase == 'nnp-yes')
+        if (not self.ab_master_valid(master, phase) or not workers or len(workers) + 1 != len(haproxy)):
+            return None
+        for worker in workers:
+            if (worker['Uid'] != (self.uid,) * 4 or worker['Gid'] != (self.gid,) * 4
+                    or any(g != self.gid for g in worker['Groups'])
+                    or any(worker[k] for k in ('CapInh', 'CapPrm', 'CapEff', 'CapAmb'))
+                    or worker['CapBnd'] != mask or worker['NoNewPrivs'] not in ((1,) if nnp else (0, 1))):
+                return None
+        # Credentials as well as PID identity must remain stable for two seconds.
+        return tuple(tuple((k, s[k]) for k in sorted(s)) for s in
+                     [master] + sorted(workers, key=lambda s: s['Pid']))
+
     def observe(self, plan):
+        ab = plan['phase'] in ('nnp-yes', 'nnp-no')
         start, stable_since, previous, count = time.monotonic(), None, None, 0
         before = self.show(plan['unit'])
         self.record(plan['phase'] + '/before.show.json', before)
@@ -1732,7 +2031,8 @@ class Controller:
                 break
             captures = self.capture(plan['unit'], plan['phase'] + '/sample-%03d' % count)
             count += 1
-            identity = self.identity(captures, last, plan['phase'] == 'trace')
+            identity = (self.ab_identity(captures, last, plan['phase']) if ab else
+                        self.identity(captures, last, plan['phase'] == 'trace'))
             if identity and last.get('ActiveState') == 'active' and last.get('SubState') == 'running':
                 if identity != previous:
                     stable_since = time.monotonic()
@@ -1749,7 +2049,8 @@ class Controller:
         final_identity = None
         if after.get('ControlGroup') == '/system.slice/' + plan['unit']:
             final_captures = self.capture(plan['unit'], plan['phase'] + '/sample-final')
-            final_identity = self.identity(final_captures, after, plan['phase'] == 'trace')
+            final_identity = (self.ab_identity(final_captures, after, plan['phase']) if ab else
+                              self.identity(final_captures, after, plan['phase'] == 'trace'))
         if (stable_since is not None and time.monotonic() - stable_since >= 2.0 and
                 final_identity == previous and final_identity is not None and
                 after.get('ActiveState') == 'active' and after.get('SubState') == 'running' and
@@ -1817,13 +2118,21 @@ class Controller:
         self.intents.append(plan['unit'])
         self.record(phase + '/intent.json', {'unit': plan['unit'], 'nonce': self.nonce,
                                            'command': plan['command']})
+        if phase in ('nnp-yes', 'nnp-no'):
+            self.verify_ab_assets()
         plan['created_at'] = time.monotonic()
         code, _, _ = self.command(plan['command'])
         if code != 0:
             raise Unsupported('transient-create-unavailable')
         self.creation_confirmed.add(plan['unit'])
-        self.gate(plan)
+        profile = self.gate(plan)
+        if phase in ('nnp-yes', 'nnp-no'):
+            self.ab_profiles[phase] = profile
+            self.ab_report['arms'][phase]['effective_NNP'] = profile['NoNewPrivileges']
+            self.ab_report['arms'][phase]['gate_boundaries'] = self.read_boundaries(plan)
         result = self.observe(plan)
+        if phase in ('nnp-yes', 'nnp-no'):
+            self.ab_report['arms'][phase]['startup'] = result
         self.record(phase + '/startup.json', {'status': result})
         if not self.cleanup_one(plan['unit']):
             self.cleanup_confirmed = False
@@ -1841,6 +2150,67 @@ class Controller:
             self.record('trace/sanitised.json', trace)
             return result, trace
         return result, None
+
+    def run_nnp_ab(self):
+        # Initialize BEFORE preflight/helpers: NOTSTARTED is not invented proc data.
+        self.ab_report = {'status': 'NOTSTARTED', 'complete': False, 'production_applied': False,
+            'diagnostic_finding_completed': False, 'confirmed_startup_difference': False,
+            'actual_master_NNP': {'A': 'unavailable', 'B': 'unavailable'},
+            'reload_usr2_tested': False, 'reload_required': True, 'startup_candidate': False,
+            'scope': 'environment/control-specific TLS-config startup only; not Linux-universal',
+            'prospective_fix': 'ONLY HAProxy NoNewPrivileges=no; NOT applied',
+            'risk': 'Loss of kernel NNP exec-gain barrier for setID/file capabilities in master and descendants '
+                    'that do not self-set NNP; bounding/other hardening are not a replacement.',
+            'limits': ['no connection/TLS health proof or production health claim',
+                       'no reload/USR2 proof, no CAP_KILL addition or capability promotion',
+                       'legacy make_config probe has no TLS; root master/nonroot workers unchanged'],
+            'arms': {p: {'startup': 'NOTSTARTED', 'proc_samples': [], 'proc_identity': 'unavailable',
+                         'effective_NNP': 'unavailable', 'gate_boundaries': 'unavailable',
+                         'cleanup_confirmed': False} for p in ('nnp-yes', 'nnp-no')}}
+        self.prepare(ab=True)
+        self.prepare_ab_assets()
+        self.ab_report['status'] = 'incomplete'
+        for phase in ('nnp-yes', 'nnp-no'):
+            if phase == 'nnp-no':
+                if self.intents or not self.cleanup_confirmed:
+                    raise Unsupported('ab-A-cleanup-unconfirmed')
+                self.reserve(self.ab_assets['endpoints'])  # Conflict refuses; NEVER choose new endpoints.
+            row = self.ab_report['arms'][phase]
+            row['startup'] = 'unavailable'
+            startup, _ = self.run_phase(phase)
+            row.update(startup=startup, cleanup_confirmed=True,
+                       proc_identity='stable-observed' if startup == 'observed-running' else 'unavailable',
+                       effective_NNP=self.ab_profiles[phase]['NoNewPrivileges'],
+                       gate_boundaries=self.read_boundaries(self.ab_plans[phase]))
+        a, b = (self.ab_report['arms'][p] for p in ('nnp-yes', 'nnp-no'))
+        a_masters = [s['master'] for s in a['proc_samples'] if s['master'] is not None]
+        b_masters = [s['master'] for s in b['proc_samples'] if s['master'] is not None]
+        self.ab_report['actual_master_NNP'] = {
+            'A': [s['NoNewPrivs'] for s in a_masters] if a_masters else 'unavailable',
+            'B': [s['NoNewPrivs'] for s in b_masters] if b_masters else 'unavailable'}
+        self.ab_report['comparative_verification'] = 'incomplete'
+        if (b['startup'] != 'observed-running' or not b_masters or b['effective_NNP'] != 'no'
+                or not all(self.ab_master_valid(s, 'nnp-no') for s in b_masters)):
+            self.ab_report['status'] = 'inconclusive'
+            return 2
+        # Failed A may lack SETUID exactly as observed in the Python control,
+        # but unrelated capability anomalies cannot confirm an NNP-only result.
+        if a_masters and not all(self.ab_master_valid(s, 'nnp-yes', failed_arm=a['startup'] == 'failed')
+                                 for s in a_masters):
+            self.ab_report['status'] = 'inconclusive-A-credentials'
+            return 2
+        if a['startup'] == 'observed-running':
+            self.ab_report.update(status='no-NNP-startup-differentiator', diagnostic_finding_completed=True,
+                                  comparative_verification='both-started')
+            return 0
+        self.ab_report.update(status='CANDIDATE-startup-only', startup_candidate=True)
+        if (a['startup'] == 'failed' and a_masters
+                and all(self.ab_master_valid(s, 'nnp-yes', failed_arm=True) for s in a_masters)
+                and all(self.ab_master_valid(s, 'nnp-no') for s in b_masters)):
+            self.ab_report.update(confirmed_startup_difference=True, diagnostic_finding_completed=True,
+                                  comparative_verification='confirmed-startup-only')
+            return 0  # Completed diagnostic finding, NEVER a complete production fix.
+        return 2
 
     def read_boundaries(self, plan):
         _secure_path(plan['output'])
@@ -2405,10 +2775,11 @@ class Controller:
 
 def main(argv=None):
     args = sys.argv[1:] if argv is None else argv
-    if args not in (['--run'], ['--cap-boundaries'], ['--cap-matrix']):
-        print('Usage: bash tools/diagnose-haproxy.sh --help | --run | --cap-boundaries | --cap-matrix', file=sys.stderr)
+    if args not in (['--run'], ['--cap-boundaries'], ['--cap-matrix'], ['--nnp-ab']):
+        print('Usage: bash tools/diagnose-haproxy.sh --help | --run | --cap-boundaries | --cap-matrix | --nnp-ab', file=sys.stderr)
         return 64
     cap_boundaries, cap_matrix = args == ['--cap-boundaries'], args == ['--cap-matrix']
+    nnp_ab = args == ['--nnp-ab']
     outcomes = {}
     controller, status, exitcode = Controller(), 'unavailable', 2
     interrupted = False
@@ -2420,7 +2791,9 @@ def main(argv=None):
     try:
         for signum in (signal.SIGINT, signal.SIGTERM):
             old_handlers[signum] = signal.signal(signum, interrupt)
-        if cap_matrix:
+        if nnp_ab:
+            exitcode = controller.run_nnp_ab()
+        elif cap_matrix:
             controller.prepare(cap_boundaries=True)
             exitcode = controller.run_matrix()
         elif cap_boundaries:
@@ -2431,9 +2804,9 @@ def main(argv=None):
             controller.prepare()
             status, _ = controller.run_phase('plain')
             print('plain startup: ' + status)
-        if status == 'observed-running':
+        if not nnp_ab and status == 'observed-running':
             exitcode = 0
-        elif status == 'failed':
+        elif not nnp_ab and status == 'failed':
             if os.path.isfile('/usr/bin/strace'):
                 _secure_path('/usr/bin/strace')
                 print('NOTICE: traced run does NOT represent the untraced run.')
@@ -2448,7 +2821,11 @@ def main(argv=None):
                 print('trace evidence: unavailable (strace not installed)')
     except Unsupported as exc:
         # All Unsupported labels originate in constants or parse_show keys.
-        print('matrix: refused' if cap_matrix else 'unsupported: ' + str(exc))
+        print('nnp-ab: refused' if nnp_ab else 'matrix: refused' if cap_matrix else 'unsupported: ' + str(exc))
+        if nnp_ab:
+            controller.ab_report['issues'] = list(exc.labels)
+            if controller.ab_report['status'] != 'NOTSTARTED':
+                controller.ab_report['status'] = 'refused'
         if cap_matrix:
             controller.matrix_report = getattr(controller, 'matrix_report', {'status': 'inconclusive', 'attempts': []})
             controller.matrix_report['issues'] = list(exc.labels)
@@ -2459,7 +2836,10 @@ def main(argv=None):
         print('interrupted: cleanup requested')
         exitcode = 130
     except (OSError, ValueError, KeyError, UnicodeError, subprocess.SubprocessError):
-        print('matrix: evidence-unavailable' if cap_matrix else 'unavailable: inspection or runtime evidence incomplete')
+        if nnp_ab:
+            controller.ab_report['issues'] = ['inspection-or-runtime-evidence-unavailable']
+        print('nnp-ab: evidence-unavailable' if nnp_ab else 'matrix: evidence-unavailable' if cap_matrix else
+              'unavailable: inspection or runtime evidence incomplete')
     finally:
         # Ignore a second INT/TERM while bounded cleanup runs. SIGKILL/power loss
         # cannot be handled; RuntimeMaxSec is the independent service guard.
@@ -2473,6 +2853,27 @@ def main(argv=None):
             print('cleanup: unconfirmed; inspect private evidence (RuntimeMaxSec=8s was requested)')
             if not interrupted:
                 exitcode = 2
+        if nnp_ab:
+            keys_clean = controller.cleanup_ab_keys(clean)
+            if not clean or not keys_clean:
+                if not interrupted:
+                    exitcode = 2
+                print('nnp-ab: private key cleanup unconfirmed; keys may remain in private evidence')
+            report = controller.ab_report
+            report.update(cleanup_confirmed=clean, tls_cleanup_confirmed=keys_clean,
+                          interrupted=interrupted, exitcode=exitcode)
+            if not clean or not keys_clean:
+                report.update(status='cleanup-unconfirmed', startup_candidate=False,
+                              diagnostic_finding_completed=False, confirmed_startup_difference=False)
+            elif interrupted and report['status'] != 'NOTSTARTED':
+                report['status'] = 'interrupted'
+            if controller.directory is not None:
+                try:
+                    controller.record('nnp-ab.report.json', report)
+                except (OSError, ValueError):
+                    exitcode = 130 if interrupted else 2
+                    print('nnp-ab: evidence-unavailable')
+            print('nnp-ab: ' + report['status'] + '; startup-only, production NOT changed; reload untested')
         if controller.directory is not None:
             if cap_matrix:
                 try:
@@ -2487,7 +2888,7 @@ def main(argv=None):
                     if not interrupted:
                         exitcode = 2
                     print('matrix: evidence-unavailable')
-            else:
+            elif not nnp_ab:
                 try:
                     first = controller.boundary_report()
                 except (OSError, ValueError):
