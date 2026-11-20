@@ -5157,7 +5157,7 @@ class OptionalReloadContracts(Offline):
             c.reload_report = self.D.reload_report(True)
             files, runner, patchers = self.tls_memory(c)
             self.invoke(c.prepare_ab_assets, patchers=patchers)
-            self.assertIn('pid=%pid', files['nnp-ab/haproxy.cfg'])
+            self.assertIn(b'pid=%pid', files['nnp-ab/haproxy.cfg'])
             plans = [self.invoke(c.factory, phase, patchers=patchers)
                      for phase in ('nnp-yes', 'nnp-no')]
             self.assertEqual(plans[0]['argv'], plans[1]['argv'])
