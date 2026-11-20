@@ -27,6 +27,8 @@ import platform
 import pwd
 import re
 import secrets
+import select
+import ssl
 import shlex
 import signal
 import socket
@@ -45,6 +47,8 @@ from unittest.mock import Mock, patch
 ORIGINAL_PATH_LSTAT = Path.lstat
 ORIGINAL_PATH_STAT = Path.stat
 ORIGINAL_PATH_UNLINK = Path.unlink
+ORIGINAL_SOCKET = socket.socket
+ORIGINAL_SSL_CONTEXT = ssl.SSLContext
 
 ROOT = Path(__file__).resolve().parent.parent
 # Checkout source reads happen during discovery or unguarded failure reporting.
@@ -133,6 +137,13 @@ class HostBoundary:
     Reentrant calls share the outer guards and its explicit in-memory fakes.
     Every stack unwinds before exceptions reach assertRaises/subTest/unittest.
     """
+    TARGETS = (
+        (os, ('pidfd_open',)), (signal, ('pidfd_send_signal',)),
+        (select, ('select', 'poll')), (ssl, ('SSLContext',)),
+        (ORIGINAL_SOCKET, ('connect', 'connect_ex')),
+        (ORIGINAL_SSL_CONTEXT, ('wrap_socket', 'load_verify_locations')),
+    )
+
     def __init__(self):
         self.depth = 0
 
@@ -176,9 +187,10 @@ class HostBoundary:
             (grp, ('getgrnam', 'getgrgid', 'getgrall')),
             (tempfile, ('mkdtemp', 'mkstemp', 'TemporaryDirectory', 'TemporaryFile', 'NamedTemporaryFile')),
             (urllib.request, ('urlopen', 'urlretrieve')),
-            (signal, ('signal', 'pthread_sigmask')), (time, ('sleep',)), (platform, ('machine',)),
+            (signal, ('getsignal', 'getitimer', 'setitimer', 'signal', 'pthread_sigmask')),
+            (time, ('sleep',)), (platform, ('machine',)),
         )
-        for obj, names in targets:
+        for obj, names in targets + HostBoundary.TARGETS:
             for name in names:
                 if hasattr(obj, name):
                     if obj is Path:
@@ -304,12 +316,13 @@ def assert_launcher_contract(case, shell):
     flat = re.sub(r'\\\n', '', prefix)
     structure = re.search(
         r'nathaya_diagnose_haproxy_main\s*\(\s*\)\s*\{\s*'
-        r'case\s+"\$#:\$\{1-\}"\s+in\s*'
-        r'1:--help\s*\)(?P<help>.*?)\s*;;\s*'
-        r'1:--run\s*\|\s*1:--cap-boundaries\s*\|\s*1:--cap-matrix\s*\|\s*1:--nnp-ab\s*\)\s*;;\s*'
+        r'case\s+"\$#:\$\{1-\}:\$\{2-\}"\s+in\s*'
+        r'1:--help:\s*\)(?P<help>.*?)\s*;;\s*'
+        r'1:--run:\s*\|\s*1:--cap-boundaries:\s*\|\s*1:--cap-matrix:\s*\|\s*'
+        r'1:--nnp-ab:\s*\|\s*2:--nnp-ab:--reload-usr2\s*\)\s*;;\s*'
         r'\*\s*\)(?P<default>.*?)\s*;;\s*'
         r'esac\s+(?P<dispatch>.*?)\s*\Z', flat, re.S)
-    case.assertIsNotNone(structure, 'One-argument allowlist before dispatch')
+    case.assertIsNotNone(structure, 'Complete one-flag/exact two-flag allowlist before dispatch')
     help_tokens = shlex.split(structure['help'], posix=False)
     case.assertEqual(help_tokens[:2], ['builtin', 'printf'])
     case.assertEqual(help_tokens[2], "'%s\\n'")
@@ -320,7 +333,7 @@ def assert_launcher_contract(case, shell):
                      r"^\s*builtin\s+printf\s+'%s\\n'\s+'[^']*'\s*>\s*&2\s*;\s*return\s+64\s*$")
     case.assertEqual(shlex.split(structure['dispatch'], posix=False), [
         'exec', '/usr/bin/env', '-i', 'PATH=/usr/sbin:/usr/bin:/sbin:/bin',
-        'LANG=C', 'LC_ALL=C', '/usr/bin/python3', '-I', '-B', '-', '"$1"',
+        'LANG=C', 'LC_ALL=C', '/usr/bin/python3', '-I', '-B', '-', '"$@"',
     ])
     case.assertNotRegex(prefix, r'\b(?:source|systemctl|systemd-run|sudo|apt|curl|wget)\b')
     tail = shell[closer.end():]
@@ -346,26 +359,28 @@ class ImportAndShellContracts(Offline):
 
     def test_launcher_contract_accepts_layout_not_dispatch_changes(self):
         # Text-only variants: never source the shell or launch its Python.
-        self.assertIn('1:--run|1:--cap-boundaries|1:--cap-matrix|1:--nnp-ab)', SHELL)
+        allowed = '1:--run:|1:--cap-boundaries:|1:--cap-matrix:|1:--nnp-ab:|2:--nnp-ab:--reload-usr2)'
+        self.assertIn(allowed, SHELL)
         variants = (
             SHELL.replace(') ;;', ')\n            ;;')
                  .replace('return 64 ;;', 'return\t64\n            ;;')
                  .replace('    exec /usr/bin/env', '\texec\t/usr/bin/env'),
-            SHELL.replace('1:--run|1:--cap-boundaries|1:--cap-matrix|1:--nnp-ab)',
-                          '1:--run | 1:--cap-boundaries | 1:--cap-matrix | 1:--nnp-ab )')
-                 .replace('case "$#:${1-}" in', 'case\t"$#:${1-}"\tin')
+            SHELL.replace(allowed,
+                          '1:--run: | 1:--cap-boundaries: | 1:--cap-matrix: | 1:--nnp-ab: | 2:--nnp-ab:--reload-usr2 )')
+                 .replace('case "$#:${1-}:${2-}" in', 'case\t"$#:${1-}:${2-}"\tin')
                  .replace(' -i PATH=', '  -i\tPATH=')
-                 .replace(' -I -B - "$1"', '\t-I  -B\t-  "$1"')
+                 .replace(' -I -B - "$@"', '\t-I  -B\t-  "$@"')
                  .replace("<<'" + MARKER + "'\n", "<<  '" + MARKER + "'  \n"),
         )
         for variant in variants:
             self.assertNotEqual(variant, SHELL, 'Layout mutation must exercise the prefix')
             assert_launcher_contract(self, variant)
         for before, after in (('-i PATH=', 'PATH='), (' -I -B ', ' -B '),
-                              ('- "$1"', '- $1'), ('- "$1"', '- "$@"'),
-                              ('return 64 ;;', 'return 0 ;;'),
-                              ('1:--run|1:--cap-boundaries|1:--cap-matrix|1:--nnp-ab)', '*)'),
-                              ('|1:--nnp-ab)', ')'),
+                              ('- "$@"', '- $@'), ('- "$@"', '- "$1"'),
+                              ('return 64 ;;', 'return 0 ;;'), (allowed, '*)'),
+                              ('|2:--nnp-ab:--reload-usr2)', ')'),
+                              ('2:--nnp-ab:--reload-usr2)', '2:*:--reload-usr2)'),
+                              ('case "$#:${1-}:${2-}"', 'case "${1-}:${2-}"'),
                               ('\n' + MARKER + '\n', '\n' + MARKER + ' \n'),
                               ('\n' + MARKER + '\n', '\n' + MARKER + '\t\n')):
             mutated = SHELL.replace(before, after)
@@ -378,15 +393,29 @@ class ImportAndShellContracts(Offline):
                           lambda: Path('/run/fixture-forbidden').mkdir(),
                           lambda: subprocess.run(['fixture-forbidden']),
                           lambda: socket.socket(), lambda: pwd.getpwnam('haproxy'),
-                          lambda: grp.getgrnam('haproxy'), lambda: tempfile.mkdtemp()):
+                          lambda: grp.getgrnam('haproxy'), lambda: tempfile.mkdtemp(),
+                          lambda: select.poll(), lambda: select.select([], [], [], 0),
+                          lambda: ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT),
+                          lambda: ORIGINAL_SOCKET.connect(None, ('127.0.0.1', 49173)),
+                          lambda: ORIGINAL_SOCKET.connect_ex(None, ('127.0.0.1', 49173))):
             with self.assertRaisesRegex(AssertionError, 'Real host operation forbidden'):
                 self.invoke(operation)
+        for obj, name, args in ((os, 'pidfd_open', (1, 0)),
+                                (signal, 'pidfd_send_signal', (700, signal.SIGUSR2, None, 0))):
+            if hasattr(obj, name):
+                with self.assertRaisesRegex(AssertionError, 'Real host operation forbidden'):
+                    self.invoke(lambda: getattr(obj, name)(*args))
 
     def test_main_invalid_arguments_never_construct_controller(self):
         factory = Mock()
         for args in ([], ['--help'], ['--run', 'extra'], ['--trace'],
                      ['--cap-matrix', 'extra'], ['--cap-matrix=PrivateTmp'],
-                     ['--nnp-ab', 'extra'], ['--nnp-ab=yes'], ['--run', '--nnp-ab']):
+                     ['--nnp-ab', 'extra'], ['--nnp-ab=yes'], ['--run', '--nnp-ab'],
+                     ['--reload-usr2'], ['--reload-usr2', '--nnp-ab'],
+                     ['--run', '--reload-usr2'], ['--cap-matrix', '--reload-usr2'],
+                     ['--cap-boundaries', '--reload-usr2'], ['--help', '--reload-usr2'],
+                     ['--nnp-ab', '--reload-usr2', 'extra'],
+                     ['--nnp-ab', '--reload-usr2', '--reload-usr2']):
             result = self.invoke(self.D.main, args, patchers=(
                 patch.object(self.D, 'Controller', factory),
                 patch.object(sys, 'stderr', io.StringIO()),
@@ -1715,7 +1744,8 @@ class CaptureContracts(Offline):
                 'CapAmb:\t0\nNoNewPrivs:\t1\n').encode()
 
     def virtual_capture(self, c, unit=None, changes=None, procs=b'101\n', links=None,
-                        extra=None, save_error=False, read_error=None, sample='plain/sample-000'):
+                        extra=None, save_error=False, read_error=None, sample='plain/sample-000',
+                        reload_evidence=False, deadline=None):
         unit = unit or 'nathaya-haproxy-probe-' + NONCE + '-plain.service'
         member = ('0::/system.slice/' + unit + '\n').encode()
         files = {101: {'cgroup': [member, member],
@@ -1740,6 +1770,7 @@ class CaptureContracts(Offline):
             nonlocal next_fd
             self.assertIsInstance(path, str)
             common = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+            bounded_flags = common | (os.O_NONBLOCK if reload_evidence else 0)
             if path.startswith('/proc/'):
                 self.assertIsNone(dir_fd)
                 self.assertEqual(flags, common | os.O_DIRECTORY)
@@ -1751,10 +1782,10 @@ class CaptureContracts(Offline):
             elif path.startswith('/sys/fs/cgroup/'):
                 self.assertEqual(path, '/sys/fs/cgroup/system.slice/' + unit + '/cgroup.procs')
                 self.assertIsNone(dir_fd)
-                self.assertEqual(flags, common)
+                self.assertEqual(flags, bounded_flags)
                 value = ('file', procs)
             else:
-                self.assertEqual(flags, common)
+                self.assertEqual(flags, bounded_flags)
                 self.assertIn(dir_fd, live)
                 kind, pid = live[dir_fd]
                 self.assertEqual(kind, 'dir')
@@ -1802,7 +1833,9 @@ class CaptureContracts(Offline):
 
         c.save.side_effect = saving
         try:
-            result = self.invoke(c.capture, unit, sample, patchers=(
+            result = self.invoke(c.capture, unit, sample,
+                                 **({'reload_evidence': True, 'deadline': deadline} if reload_evidence else {}),
+                                 patchers=(
                 patch.object(os, 'open', side_effect=opening),
                 patch.object(os, 'read', side_effect=reading),
                 patch.object(os, 'close', side_effect=closing),
@@ -4672,6 +4705,918 @@ class Pure2ArmReport(Offline):
                     self.assertNotIn('matrix:', out)
 
 
+class OptionalReloadContracts(Offline):
+    """Real reload engine; synthetic TLS/HTTP, cohorts and integer-only pidfds."""
+
+    # Share fixture builders, not a TestCase subclass (no inherited test copies).
+    ab_controller = Pure2ArmReport.ab_controller
+    ab_pair = Pure2ArmReport.ab_pair
+    tasks = Pure2ArmReport.tasks
+    sequence = Pure2ArmReport.sequence
+    tls_memory = Pure2ArmReport.tls_memory
+
+    @staticmethod
+    def response(pid=102, marker=NONCE):
+        body = ('nathaya-reload:' + marker + ' pid=' + str(pid)).encode()
+        return (b'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ' +
+                str(len(body)).encode() + b'\r\n\r\n' + body)
+
+    def reload_fixture(self, old=False, failure=None):
+        c = self.ab_controller(old)
+        plans, profiles = self.ab_pair(c)
+        plan = plans[1]
+        plan.update(created_at=0.5, release_time=1.0)
+        profile = dict(profiles[1], ActiveState='active', SubState='running',
+                       MainPID='101', ControlPID='0')
+        c.ab_plans = dict(zip(('nnp-yes', 'nnp-no'), plans))
+        c.ab_profiles = {'nnp-no': profile}
+        c.ab_report['arms']['nnp-no']['startup'] = 'observed-running'
+        c.reload_report = self.D.reload_report(True)
+        c.ab_report['reload'] = c.reload_report
+        c.ab_assets = {'endpoints': (49173, ABSTRACT)}
+        rows = self.tasks(c, 'nnp-no')
+        for row, identity in zip(rows, ((101, 1234), (102, 1235))):
+            row['identity'] = identity
+        master, worker = rows
+        new = copy.deepcopy(worker)
+        new['status']['Pid'], new['identity'] = 103, (103, 1236)
+        if failure == 'reused-pid':
+            new['status']['Pid'], new['identity'] = 102, (102, 2235)
+        if failure == 'same-identity':
+            new = copy.deepcopy(worker)
+        state = SimpleNamespace(now=4.0, sent=False, stage='', clients=[], fds={},
+                                opened=[], closed=[], events=[], timeouts=[], failure=failure,
+                                external_timer=(0.0, 0.0), installed_alarm=None, timer_owned=False,
+                                mask_api_available=True, mask_restore_error=OSError, reports=[])
+        outer = self
+
+        def previous_alarm(_signum, _frame):
+            raise AssertionError('Public fixture handler must never be delivered')
+
+        state.previous_alarm = state.current_alarm = previous_alarm
+        state.previous_mask = {signal.SIGUSR1}
+        state.inherited_mask = set(state.previous_mask)
+
+        def gettimer(which):
+            outer.assertEqual(which, signal.ITIMER_REAL)
+            state.events.append(('timer-query', which))
+            return state.external_timer
+
+        def gethandler(signum):
+            outer.assertEqual(signum, signal.SIGALRM)
+            state.events.append(('handler-query', signum))
+            return state.previous_alarm
+
+        def handler(signum, callback):
+            outer.assertEqual(signum, signal.SIGALRM)
+            restoring = callback is state.previous_alarm
+            state.events.append(('handler-restore' if restoring else 'handler-install', signum))
+            if restoring and failure == 'handler-restore':
+                raise ValueError('PUBLIC-FIXTURE-RESTORE-FAILURE')
+            old_handler, state.current_alarm = state.current_alarm, callback
+            if not restoring:
+                outer.assertTrue(callable(callback))
+                state.installed_alarm = callback
+            return old_handler
+
+        def timer(which, delay, interval):
+            outer.assertEqual(which, signal.ITIMER_REAL)
+            outer.assertEqual(interval, 0.0, 'One shot only; never periodic')
+            state.events.append(('timer-disable' if delay == 0.0 else 'timer-arm', delay))
+            if delay == 0.0:
+                # A queued alarm during cleanup must be harmless, even when
+                # disabling the timer fails. Never schedule a real signal.
+                state.installed_alarm(signal.SIGALRM, None)
+                if failure == 'timer-disable':
+                    raise OSError(errno.EIO, 'PUBLIC-FIXTURE-DISABLE-FAILURE')
+                state.timer_owned = False
+            else:
+                outer.assertGreater(delay, 0.0)
+                outer.assertAlmostEqual(delay, c.reload_report['deadline'] - state.now)
+                outer.assertIsNotNone(state.installed_alarm)
+                state.timer_owned = True
+            return (0.0, 0.0)
+
+        def mask(how, values):
+            if how == signal.SIG_BLOCK and values == set():
+                # Empty BLOCK is a read-only inherited-mask query, not cleanup
+                # blocking or an implicit env -i/RuntimeMaxSec unblocking step.
+                state.events.append(('mask-query', set(values)))
+                return None if state.inherited_mask is None else set(state.inherited_mask)
+            if how == signal.SIG_BLOCK:
+                state.events.append(('mask-block', set(values)))
+                outer.assertEqual(values, {signal.SIGINT, signal.SIGTERM})
+                if failure == 'mask-block':
+                    raise OSError(errno.EIO, 'PUBLIC-FIXTURE-MASK-FAILURE')
+            else:
+                state.events.append(('mask-restore', set(values)))
+                outer.assertEqual(how, signal.SIG_SETMASK)
+                outer.assertEqual(values, state.previous_mask)
+                if failure == 'mask-restore':
+                    raise state.mask_restore_error('PUBLIC-FIXTURE-MASK-RESTORE-FAILURE')
+                if failure == 'mask-restore-interrupt':
+                    raise KeyboardInterrupt
+            return set(state.previous_mask)
+
+        state.signal_fakes = dict(getitimer=Mock(side_effect=gettimer),
+            getsignal=Mock(side_effect=gethandler), signal=Mock(side_effect=handler),
+            setitimer=Mock(side_effect=timer), pthread_sigmask=Mock(side_effect=mask))
+
+        def guarded_io(label):
+            outer.assertIs(c.reload_report['deadline_signal_unblocked'], True)
+            outer.assertTrue(state.timer_owned, 'Guard must precede synchronous I/O')
+            state.events.append(('guarded-io', label))
+            if failure == label + '-alarm':
+                state.now = c.reload_report['deadline'] + 0.01
+                state.installed_alarm(signal.SIGALRM, None)
+                raise AssertionError('Expiration callback must interrupt synchronous I/O')
+
+        def mkdir(*args, **kwargs):
+            guarded_io('mkdir')
+
+        def verify_assets():
+            guarded_io('assets')
+            if failure == 'assets':
+                raise self.D.Unsupported('fixture-assets')
+
+        def clock():
+            state.now += 0.001
+            return state.now
+
+        def showing(unit, *, timeout):
+            guarded_io('show')
+            outer.assertGreater(timeout, 0)
+            outer.assertLessEqual(timeout, 0.25)
+            outer.assertLessEqual(timeout, c.reload_report['deadline'] - state.now + 0.002)
+            state.timeouts.append(timeout)
+            if unit == MAIN:
+                return dict(c.source, FutureSecurityKnob='drift') if failure == 'source' else dict(c.source)
+            outer.assertEqual(unit, plan['unit'])
+            drift = failure == 'policy' or failure == 'policy-after' and state.sent
+            return dict(profile, SystemCallFilter='@mount') if drift else dict(profile)
+
+        def capture(unit, sample, *, reload_evidence, deadline):
+            guarded_io('capture')
+            outer.assertEqual(unit, plan['unit'])
+            outer.assertIs(reload_evidence, True)
+            outer.assertEqual(deadline, c.reload_report['deadline'])
+            state.stage = sample
+            state.events.append(('capture', sample))
+            c.reload_capture_complete = not (
+                failure == 'coverage-before' or failure == 'coverage-after' and state.sent)
+            if failure == 'identity' and sample.endswith('-bound'):
+                changed = copy.deepcopy(master)
+                changed['identity'] = (101, 9999)
+                return [changed, worker]
+            if failure == 'credentials':
+                bad = copy.deepcopy(worker)
+                bad['status']['Uid'] = (0,) * 4
+                return [master, bad]
+            if not state.sent:
+                return copy.deepcopy(rows)
+            if sample.endswith(('-drained', '-final')) or failure == 'reused-pid':
+                return copy.deepcopy([master, new])
+            return copy.deepcopy([master, worker] if failure == 'same-identity' else [master, worker, new])
+
+        def reading(path, limit):
+            outer.assertEqual(limit, 65536)
+            guarded_io('source-read' if str(path) == self.D.FRAGMENT else 'certificate-read')
+            if failure == 'certificate-unavailable':
+                raise OSError(errno.EIO, 'PUBLIC-FIXTURE-METADATA-UNAVAILABLE')
+            if str(path) == self.D.FRAGMENT:
+                drift = failure == 'source-bytes' or failure == 'source-after' and state.sent
+                raw = c.source_bytes + (b'\n' if drift else b'')
+                return raw, {'uid': 0, 'gid': 0, 'mode': '0o600'}
+            outer.assertEqual(Path(path), c.directory / 'nnp-ab/private.crt')
+            return b'PUBLIC-CERT-FIXTURE', {}
+
+        class Raw:
+            def __init__(self):
+                self.closed = False
+                state.clients.append(self)
+            def setblocking(self, value):
+                outer.assertIs(value, False)
+            def connect_ex(self, address):
+                outer.assertEqual(address, ('127.0.0.1', 49173))
+                return 0
+            def close(self):
+                self.closed = True
+                state.events.append(('client-close', 'raw'))
+
+        class TLS(Raw):
+            def __init__(self):
+                super().__init__()
+                self.pid = 102 if not state.sent else new['identity'][0]
+                if state.sent and failure == 'wrong-pid':
+                    self.pid = 999
+                if state.sent and failure == 'old-pid':
+                    self.pid = 102
+                self.request, self.buffer = b'', b''
+            def do_handshake(self):
+                if failure == 'timeout':
+                    raise ssl.SSLWantReadError()
+            def getpeercert(self, *, binary_form):
+                outer.assertIs(binary_form, True)
+                return b'BAD-PIN' if failure == 'pin' else b'PUBLIC-DER'
+            def send(self, data):
+                self.request += data
+                if self.request.endswith(b'\r\n\r\n'):
+                    pid = 103 if failure == 'continuity' and state.sent and self.pid == 102 else self.pid
+                    self.buffer += outer.response(pid)
+                    self.request = b''
+                    if failure == 'protocol' and state.sent:
+                        self.buffer = self.buffer.replace(b'200 OK', b'500 NO')
+                return len(data)
+            def recv(self, size):
+                if not self.buffer:
+                    raise ssl.SSLWantReadError()
+                block, self.buffer = self.buffer[:size], self.buffer[size:]
+                return block
+            def pending(self):
+                return len(self.buffer)
+
+        def wrap(raw, *, server_hostname, do_handshake_on_connect):
+            outer.assertEqual(server_hostname, 'localhost')
+            outer.assertIs(do_handshake_on_connect, False)
+            return TLS()
+        context = SimpleNamespace(check_hostname=True,
+            load_verify_locations=Mock(side_effect=lambda **kwargs: guarded_io('ssl-trust')), wrap_socket=wrap)
+
+        def opening(pid, flags):
+            outer.assertIn(pid, (101, 102))
+            outer.assertEqual(flags, 0)
+            fd = 700 + len(state.opened)
+            state.opened.append(fd)
+            state.fds[fd] = pid
+            return fd
+
+        def sending(fd, sig, info, flags):
+            outer.assertEqual((state.fds[fd], sig, info, flags), (101, signal.SIGUSR2, None, 0))
+            outer.assertFalse(state.sent, 'No signal retry')
+            outer.assertTrue(c.reload_report['pidfd_binding_verified'])
+            outer.assertTrue(state.stage.endswith('-bound'))
+            state.sent = True
+            state.events.append(('signal', fd))
+            if failure == 'signal':
+                raise OSError(errno.EPERM, 'PRIVATE-SIGNAL-DETAIL')
+            if failure == 'interrupt':
+                raise KeyboardInterrupt()
+
+        class Poll:
+            def register(self, fd, flags):
+                outer.assertIn(fd, state.fds)
+                outer.assertEqual(flags, select.POLLIN)
+                self.fd = fd
+            def poll(self, timeout):
+                outer.assertEqual(timeout, 0)
+                state.events.append(('poll', self.fd))
+                if state.fds[self.fd] == 101:
+                    return []
+                drained = state.sent and all(client.closed for client in state.clients)
+                if failure == 'reused-pid' and state.sent:
+                    return [(self.fd, select.POLLIN)]
+                if drained:
+                    outer.assertTrue(c.reload_report['clients_closed'])
+                    flag = {'pollerr': select.POLLERR, 'pollnval': select.POLLNVAL}.get(failure, select.POLLIN)
+                    return [(self.fd, flag)]
+                return []
+
+        def check_alarm_cleanup():
+            if state.installed_alarm is None:
+                return
+            outer.assertTrue(any(event[0] == 'timer-disable' for event in state.events))
+            if failure == 'timer-disable':
+                outer.assertNotIn(('handler-restore', signal.SIGALRM), state.events)
+                outer.assertIs(state.current_alarm, state.installed_alarm)
+                outer.assertTrue(state.timer_owned)
+                # Synthetic delivery only: in_cleanup must ignore a late alarm,
+                # even if the previous disposition was SIG_DFL.
+                state.installed_alarm(signal.SIGALRM, None)
+            else:
+                outer.assertIn(('handler-restore', signal.SIGALRM), state.events)
+                if failure != 'handler-restore':
+                    outer.assertIs(state.current_alarm, state.previous_alarm)
+
+        def closing(fd):
+            outer.assertIn(fd, state.fds)
+            check_alarm_cleanup()
+            state.events.append(('pidfd-close', fd))
+            state.fds.pop(fd)
+            state.closed.append(fd)
+
+        def connecting(family, kind):
+            outer.assertEqual((family, kind), (socket.AF_INET, socket.SOCK_STREAM))
+            return Raw()
+
+        def selecting(readers, writers, errors, timeout):
+            outer.assertGreaterEqual(timeout, 0)
+            outer.assertLessEqual(timeout, 2.0)
+            outer.assertLessEqual(timeout, c.reload_report['deadline'] - state.now + 0.002)
+            state.timeouts.append(timeout)
+            return [], [], []
+
+        def recording(name, value):
+            if name.endswith('/report.json'):
+                check_alarm_cleanup()
+                outer.assertEqual(state.fds, {})
+                outer.assertTrue(all(client.closed for client in state.clients))
+                if state.mask_api_available and failure != 'mask-block':
+                    outer.assertIn(('mask-restore', state.previous_mask), state.events)
+                state.events.append(('report', name))
+                # Mock call arguments otherwise retain the mutable live report,
+                # concealing an issue appended only AFTER final evidence writes.
+                state.reports.append(copy.deepcopy(value))
+
+        c.record.side_effect = recording
+        sig = Mock(side_effect=sending)
+        patchers = (
+            patch.object(Path, 'mkdir', side_effect=mkdir), patch.object(time, 'monotonic', side_effect=clock),
+            patch.object(time, 'sleep', side_effect=lambda seconds: setattr(state, 'now', state.now + seconds)),
+            patch.object(c, 'show', side_effect=showing), patch.object(c, 'capture', side_effect=capture),
+            patch.object(c, 'verify_ab_assets', side_effect=verify_assets),
+            patch.object(self.D, '_no_lock', side_effect=self.D.Unsupported('fixture-lock') if failure == 'lock' else None),
+            patch.object(self.D, '_read_private_source', side_effect=reading),
+            patch.object(ssl, 'PEM_cert_to_DER_cert', return_value=b'PUBLIC-DER'),
+            patch.object(ssl, 'SSLContext', return_value=context),
+            patch.object(socket, 'socket', side_effect=connecting),
+            patch.object(os, 'pidfd_open', side_effect=opening, create=True),
+            patch.object(signal, 'pidfd_send_signal', sig, create=True),
+            patch.object(os, 'close', side_effect=closing), patch.object(select, 'poll', side_effect=Poll),
+            patch.object(select, 'select', side_effect=selecting),
+        ) + tuple(patch.object(signal, name, fake, create=True)
+                  for name, fake in state.signal_fakes.items())
+        return c, plan, state, sig, context, patchers
+
+    def assert_reload_closed(self, state):
+        self.assertEqual(self.host.depth, 0, 'All fakes unwind before assertions/reporting')
+        self.assertEqual(state.fds, {})
+        self.assertCountEqual(state.opened, state.closed)
+        self.assertTrue(all(client.closed for client in state.clients))
+        events = [event[0] for event in state.events]
+        self.assertEqual(events.count('report'), 1)
+        self.assertEqual(len(state.reports), 1)
+        if 'mask-query' in events:
+            self.assertEqual(events.count('mask-query'), 1)
+            self.assertIn(('mask-query', set()), state.events)
+            self.assertLess(events.index('mask-query'), events.index('mask-block'))
+            for label in ('timer-query', 'handler-query', 'handler-install', 'timer-arm', 'guarded-io'):
+                if label in events:
+                    self.assertLess(events.index('mask-query'), events.index(label))
+        if state.installed_alarm is not None:
+            self.assertEqual(events.count('mask-query'), 1, 'Unblocked must be observed, never assumed')
+            self.assertIs(state.reports[0]['deadline_signal_unblocked'], True)
+            self.assertEqual(events.count('timer-arm'), 1)
+            self.assertEqual(events.count('timer-disable'), 1)
+            timer_calls = state.signal_fakes['setitimer'].call_args_list
+            self.assertEqual(len(timer_calls), 2)
+            self.assertEqual(timer_calls[1].args, (signal.ITIMER_REAL, 0.0, 0.0))
+            self.assertEqual(events.count('handler-install'), 1)
+            self.assertLess(events.index('handler-install'), events.index('timer-arm'))
+            self.assertLess(events.index('timer-arm'), events.index('timer-disable'))
+            self.assertLess(events.index('mask-block'), events.index('timer-disable'))
+            cleanup_anchor = 'timer-disable'
+            if state.failure == 'timer-disable':
+                self.assertEqual(events.count('handler-restore'), 0)
+                self.assertIs(state.current_alarm, state.installed_alarm)
+                self.assertTrue(state.timer_owned)
+            else:
+                self.assertEqual(events.count('handler-restore'), 1)
+                self.assertLess(events.index('timer-disable'), events.index('handler-restore'))
+                if state.failure != 'handler-restore':
+                    self.assertIs(state.current_alarm, state.previous_alarm)
+                self.assertFalse(state.timer_owned)
+                cleanup_anchor = 'handler-restore'
+            # Final closes follow disarm ATTEMPT, not an unsafe unconditional
+            # handler restore; disable failure must still release every resource.
+            cleanup = events[events.index('timer-disable'):]
+            for label in ('client-close', 'pidfd-close', 'report'):
+                if label in cleanup:
+                    self.assertLess(cleanup.index(cleanup_anchor), cleanup.index(label))
+        else:
+            state.signal_fakes['setitimer'].assert_not_called()
+            state.signal_fakes['signal'].assert_not_called()
+        self.assertEqual(events.count('mask-block'), int(state.mask_api_available))
+        if state.mask_api_available and state.failure != 'mask-block':
+            self.assertEqual(events.count('mask-restore'), 1)
+            self.assertLess(events.index('mask-restore'), events.index('report'))
+            for label in ('client-close', 'pidfd-close'):
+                for index, event in enumerate(events):
+                    if event == label:
+                        self.assertLess(index, events.index('mask-restore'))
+        else:
+            self.assertEqual(events.count('mask-restore'), 0)
+        mask_calls = []
+        if 'mask-query' in events:
+            mask_calls.append((signal.SIG_BLOCK, set()))
+        if state.mask_api_available:
+            mask_calls.append((signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM}))
+            if state.failure != 'mask-block':
+                mask_calls.append((signal.SIG_SETMASK, state.previous_mask))
+        self.assertEqual([call.args for call in state.signal_fakes['pthread_sigmask'].call_args_list],
+                         mask_calls, 'Query, cleanup block, exact restore only; no silent unblocking')
+
+    def test_optional_report_fields_are_explicit_and_unobserved_caps_are_unknown(self):
+        c = self.D.Controller()
+        self.assertFalse(c.reload_capture_complete)
+        self.assertEqual(c.reload_report, self.D.reload_report(False))
+        for requested in (False, True):
+            report = self.D.reload_report(requested)
+            self.assertIs(report['requested'], requested)
+            self.assertEqual(report['status'], 'not-run-startup-unverified' if requested else 'not-requested')
+            for key in ('source_caps', 'startup_caps', 'reload_caps', 'source_mask', 'startup_mask',
+                        'reload_mask', 'cap_kill_present', 'before_master', 'deadline',
+                        'deadline_signal_unblocked'):
+                self.assertIsNone(report[key], key)
+            self.assertIsNone(report['capability_delta'])
+            self.assertFalse(report['unit_reload_wrapper_tested'])
+            self.assertFalse(report['signal_sent'])
+            self.assertEqual(report['budget_seconds'], 3.0)
+            self.assertEqual(report['deadline_enforcement'], 'not-armed')
+
+    def test_optional_responder_preserves_default_bytes_and_is_backend_only(self):
+        c = self.controller(True)
+        pem = c.directory / 'nnp-ab/private.pem'
+        legacy = self.D.make_config(49173, ABSTRACT).replace(
+            'bind 127.0.0.1:49173\n', 'bind 127.0.0.1:49173 ssl crt ' + str(pem) + '\n')
+        self.assertEqual(self.D.make_ab_config(49173, ABSTRACT, pem), legacy)
+        config = self.D.make_ab_config(49173, ABSTRACT, pem, reload_http=True, marker=NONCE)
+        self.assertEqual(config.count('http-request return status 200'), 1)
+        self.assertIn('nathaya-reload:' + NONCE + ' pid=%pid', config)
+        self.assertNotIn('proc.pid', config)
+        local = config.split('frontend probe_abstract\n')
+        self.assertEqual(len(local), 2)
+        self.assertNotIn('http-request return', local[0])
+        self.assertIn('http-request return status 200', local[1])
+        self.assertEqual(config.count(ABSTRACT), 2)
+        for option, marker in ((1, NONCE), (None, NONCE), (True, None), (True, 'A' * 32),
+                               (True, NONCE + '\ninject')):
+            with self.assertRaises(self.D.Unsupported):
+                self.D.make_ab_config(49173, ABSTRACT, pem, reload_http=option, marker=marker)
+        for old in (False, True):
+            c = self.controller(old)
+            c.reload_report = self.D.reload_report(True)
+            files, runner, patchers = self.tls_memory(c)
+            self.invoke(c.prepare_ab_assets, patchers=patchers)
+            self.assertIn('pid=%pid', files['nnp-ab/haproxy.cfg'])
+            plans = [self.invoke(c.factory, phase, patchers=patchers)
+                     for phase in ('nnp-yes', 'nnp-no')]
+            self.assertEqual(plans[0]['argv'], plans[1]['argv'])
+            self.assertEqual(c.ab_assets['endpoints'], (49173, ABSTRACT))
+            self.assertTrue(self.invoke(c.cleanup_ab_keys, True, patchers=patchers))
+
+    def test_reload_complete_engine_tls_http_pidfd_drain_preserves_source_caps(self):
+        for old, mask in ((True, 0x4c0), (False, 0x4e0)):
+            c, plan, state, sig, context, patchers = self.reload_fixture(old)
+            before = copy.deepcopy((c.source, c.source_bytes, c.caps, c.ab_report['arms']))
+            report = self.invoke(c.reload_usr2, plan, patchers=patchers)
+            self.assertEqual(report['status'], 'passed')
+            self.assertIs(report['deadline_signal_unblocked'], True)
+            self.assertEqual(report['deadline_enforcement'],
+                'SIGALRM wall-clock for interruptible controller work; kernel uninterruptible waits not guaranteed')
+            self.assertEqual(plan['properties']['RuntimeMaxSec'], '8s')
+            self.assertTrue(report['signal_sent'])
+            sig.assert_called_once_with(700, signal.SIGUSR2, None, 0)
+            context.load_verify_locations.assert_called_once_with(cafile=str(c.directory / 'nnp-ab/private.crt'))
+            self.assertTrue(report['tls']['hostname_check_required'])
+            self.assertEqual((report['source_mask'], report['startup_mask'], report['reload_mask']), (mask,) * 3)
+            self.assertIs(report['cap_kill_present'], not old)
+            self.assertEqual(report['capability_delta'], [])
+            self.assertEqual(report['reload_caps'], sorted(c.caps))
+            self.assertEqual(report['reload_caps_observation'], 'verified-after-drain')
+            self.assertEqual([report[k]['pid'] for k in ('baseline_request', 'new_request',
+                                                       'continuity_request', 'final_request')], [102, 103, 102, 103])
+            self.assertTrue(all(report[k]['marker_verified'] for k in ('baseline_request', 'new_request',
+                                                                      'continuity_request', 'final_request')))
+            self.assertEqual(report['old_worker_exit_proof'], 'pidfd-POLLIN-after-client-close')
+            self.assertTrue(report['old_workers_exited'])
+            self.assertTrue(all(row['complete'] for row in report['coverage']))
+            self.assertIs(c.ab_report['reload_required'], False)
+            self.assertFalse(report['unit_reload_wrapper_tested'])
+            self.assertFalse(c.ab_report['complete'])
+            self.assertFalse(c.ab_report['production_applied'])
+            self.assertEqual((c.source, c.source_bytes, c.caps, c.ab_report['arms']), before)
+            self.assertNotIn('nathaya-reload:', str(c.record.call_args_list))
+            self.assertNotIn('PUBLIC-CERT-FIXTURE', str(c.record.call_args_list))
+            self.assert_reload_closed(state)
+
+    def test_reload_refusals_before_signal_never_attempt_delivery(self):
+        for failure in ('source', 'source-bytes', 'policy', 'assets', 'lock', 'identity',
+                        'credentials', 'coverage-before', 'pin'):
+            with self.subTest(failure=failure):
+                c, plan, state, sig, _, patchers = self.reload_fixture(failure=failure)
+                report = self.invoke(c.reload_usr2, plan, patchers=patchers)
+                self.assertEqual(report['status'], 'unavailable')
+                self.assertTrue(report['issues'])
+                self.assertFalse(report['signal_attempted'])
+                sig.assert_not_called()
+                self.assertIs(c.ab_report['reload_required'], True)
+                self.assert_reload_closed(state)
+
+    def test_reload_post_signal_evidence_failures_are_not_promoted_to_pass(self):
+        for failure in ('coverage-after', 'wrong-pid', 'old-pid', 'protocol', 'pollerr', 'pollnval',
+                        'signal', 'continuity', 'source-after', 'policy-after', 'interrupt', 'report-write'):
+            with self.subTest(failure=failure):
+                c, plan, state, sig, _, patchers = self.reload_fixture(failure=failure)
+                if failure == 'report-write':
+                    recording = c.record.side_effect
+                    def fail_report(name, value):
+                        recording(name, value)
+                        if name.endswith('/report.json'):
+                            raise OSError(errno.ENOSPC, 'PRIVATE-WRITE')
+                    c.record.side_effect = fail_report
+                if failure == 'interrupt':
+                    with self.assertRaises(KeyboardInterrupt):
+                        self.invoke(c.reload_usr2, plan, patchers=patchers)
+                    report = c.reload_report
+                    self.assertEqual(report['status'], 'interrupted')
+                else:
+                    report = self.invoke(c.reload_usr2, plan, patchers=patchers)
+                sig.assert_called_once()
+                self.assertNotEqual(report['status'], 'passed')
+                if failure not in ('signal', 'interrupt'):
+                    self.assertTrue(report['signal_sent'], 'Delivery alone must not imply pass')
+                self.assertIs(c.ab_report['reload_required'], True)
+                self.assertEqual(c.ab_report['arms']['nnp-no']['startup'], 'observed-running')
+                self.assertNotIn('PRIVATE-SIGNAL-DETAIL', str(c.record.call_args_list))
+                if failure in ('pollerr', 'pollnval'):
+                    self.assertFalse(report['old_workers_exited'])
+                    self.assertIn('reload-pidfd-poll-unavailable', report['issues'])
+                self.assert_reload_closed(state)
+
+    def test_reload_pid_reuse_requires_starttime_and_old_pidfd_continuity(self):
+        for failure in ('reused-pid', 'same-identity'):
+            c, plan, state, sig, _, patchers = self.reload_fixture(failure=failure)
+            report = self.invoke(c.reload_usr2, plan, patchers=patchers)
+            self.assertNotEqual(report['status'], 'passed')
+            sig.assert_called_once()
+            if failure == 'reused-pid':
+                self.assertIn('reload-held-old-worker-exited-before-continuity', report['issues'])
+            else:
+                self.assertEqual(report['new_cohort'], [])
+            self.assert_reload_closed(state)
+
+    def test_reload_one_shared_deadline_and_network_timeout_never_reset(self):
+        for failure in ('timeout', 'same-identity'):
+            c, plan, state, sig, _, patchers = self.reload_fixture(failure=failure)
+            report = self.invoke(c.reload_usr2, plan, patchers=patchers)
+            self.assertNotEqual(report['status'], 'passed')
+            self.assertLessEqual(report['deadline'], 7.01)
+            self.assertLessEqual(report['deadline'], plan['release_time'] + 7.0)
+            self.assertLess(state.now, report['deadline'] + 0.1)
+            self.assertTrue(any('timeout' in issue or 'deadline' in issue for issue in report['issues']))
+            self.assertEqual(sig.call_count, int(failure == 'same-identity'))
+            self.assert_reload_closed(state)
+
+    def test_reload_alarm_interrupts_synchronous_reads_assets_and_ssl_trust(self):
+        references = HostBoundaryRegressions.references()
+        for failure in ('mkdir-alarm', 'certificate-read-alarm', 'source-read-alarm',
+                        'assets-alarm', 'ssl-trust-alarm', 'certificate-unavailable'):
+            with self.subTest(failure=failure):
+                c, plan, state, sig, context, patchers = self.reload_fixture(failure=failure)
+                report = self.invoke(c.reload_usr2, plan, patchers=patchers)
+                # These checks (and unittest formatting on failure) run AFTER
+                # every invocation-local fake and blanket host guard unwinds.
+                for obj, name, original in references:
+                    self.assertIs(getattr(obj, name), original, name)
+                self.assertEqual(report['status'], 'unavailable')
+                self.assertFalse(report['signal_attempted'])
+                self.assertFalse(report['signal_sent'])
+                self.assertTrue(c.ab_report['reload_required'])
+                sig.assert_not_called()
+                self.assertEqual(state.opened, [])
+                self.assertEqual(state.clients, [])
+                self.assertIsNone(report['before_master'])
+                self.assertIsNone(report['baseline_request'])
+                if failure in ('mkdir-alarm', 'certificate-read-alarm', 'certificate-unavailable'):
+                    context.load_verify_locations.assert_not_called()
+                    self.assertIsNone(report['effective_NNP'])
+                self.assertIn('kernel uninterruptible waits not guaranteed', report['deadline_enforcement'])
+                if failure.endswith('-alarm'):
+                    self.assertEqual(report['issues'], ['reload-deadline-inconclusive'])
+                    self.assertGreater(state.now, report['deadline'])
+                    self.assertLess(state.now, report['deadline'] + 0.1)
+                else:
+                    self.assertTrue(report['issues'])
+                self.assert_reload_closed(state)
+
+    def test_reload_guard_refusals_and_teardown_failures_preserve_resources_and_interrupt(self):
+        references = HostBoundaryRegressions.references()
+        cases = [('external', timer) for timer in ((0.5, 0.0), (0.0, 0.5), (0.5, 0.5))]
+        cases += [('missing', name) for name in
+                  ('SIGALRM', 'ITIMER_REAL', 'getitimer', 'setitimer', 'getsignal', 'signal',
+                   'pthread_sigmask')]
+        cases += [('blocked-inherited', None), ('query-none', None)]
+        cases += [('teardown', name) for name in ('timer-disable', 'handler-restore', 'mask-block')]
+        cases += [('teardown-dfl', 'timer-disable')]
+        cases += [('mask-restore', error) for error in
+                  (AttributeError, OSError, RuntimeError, TypeError, ValueError)]
+        cases += [('interrupt', name) for name in
+                  ('timer-disable', 'handler-restore', 'mask-block', 'mask-restore')]
+        cases += [('restore-interrupt', 'mask-restore-interrupt')]
+        for kind, value in cases:
+            with self.subTest(kind=kind, value=value):
+                failure = ('mask-restore' if kind == 'mask-restore' else
+                           value if kind in ('teardown', 'teardown-dfl', 'interrupt', 'restore-interrupt') else None)
+                c, plan, state, sig, context, patchers = self.reload_fixture(failure=failure)
+                if kind == 'external':
+                    state.external_timer = value
+                elif kind == 'blocked-inherited':
+                    state.previous_mask.add(signal.SIGALRM)
+                    state.inherited_mask = set(state.previous_mask)
+                elif kind == 'query-none':
+                    state.inherited_mask = None
+                elif kind == 'teardown-dfl':
+                    # Integer-only fake disposition: never install a real DFL
+                    # handler, arm a real timer or deliver an actual signal.
+                    state.previous_alarm = state.current_alarm = signal.SIG_DFL
+                elif kind == 'mask-restore':
+                    state.mask_restore_error = value
+                elif kind == 'missing':
+                    # Source namespace substitution must carry ALL timer/mask
+                    # fakes; copying signal's real APIs would escape the guards.
+                    fake_signal = SimpleNamespace(**vars(signal))
+                    for name, fake in state.signal_fakes.items():
+                        setattr(fake_signal, name, fake)
+                    fake_signal.pidfd_send_signal = sig
+                    delattr(fake_signal, value)
+                    state.mask_api_available = value != 'pthread_sigmask'
+                    patchers += (patch.dict(self.D.__dict__, {'signal': fake_signal}),)
+                if kind in ('interrupt', 'restore-interrupt'):
+                    if kind == 'interrupt':
+                        sending = sig.side_effect
+                        def interrupt(*args):
+                            sending(*args)
+                            raise KeyboardInterrupt
+                        sig.side_effect = interrupt
+                    # Real outer CLI: a restore-time interrupt must be deferred
+                    # past ALL closes and reload evidence, then still exit 130
+                    # after unit/key cleanup and the outer report (as body INT).
+                    def run_reload(**kwargs):
+                        try:
+                            return self.invoke(c.reload_usr2, plan, patchers=patchers)
+                        finally:
+                            state.events.append(('engine-unwound', None))
+                    c.run_nnp_ab = Mock(side_effect=run_reload)
+                    c.cleanup = Mock(side_effect=lambda: state.events.append(('unit-stop', None)) or True)
+                    c.cleanup_ab_keys = Mock(side_effect=lambda confirmed:
+                        state.events.append(('keys', confirmed)) or False)
+                    recording = c.record.side_effect
+                    def outer_report(name, report):
+                        recording(name, report)
+                        if name == 'nnp-ab.report.json':
+                            state.events.append(('outer-report', report['exitcode']))
+                    c.record.side_effect = outer_report
+                    rc, _, err = self.main_with(c, ['--nnp-ab', '--reload-usr2'])
+                    self.assertEqual((rc, err), (130, ''))
+                    report = c.reload_report
+                    self.assertEqual(report['status'], 'interrupted')
+                    self.assertEqual(c.ab_report['exitcode'], 130)
+                    self.assertTrue(c.ab_report['interrupted'])
+                    c.cleanup.assert_called_once_with()
+                    c.cleanup_ab_keys.assert_called_once_with(True)
+                    events = [event[0] for event in state.events]
+                    chronology = ['report', 'engine-unwound', 'unit-stop', 'keys', 'outer-report']
+                    if kind == 'restore-interrupt':
+                        chronology.insert(0, 'mask-restore')
+                        self.assertEqual(state.reports[0]['status'], 'interrupted')
+                    for before, after in zip(chronology, chronology[1:]):
+                        self.assertLess(events.index(before), events.index(after))
+                else:
+                    report = self.invoke(c.reload_usr2, plan, patchers=patchers)
+                for obj, name, original in references:
+                    self.assertIs(getattr(obj, name), original, name)
+                self.assertIs(self.D.signal, signal, 'No signal namespace override may escape finally')
+                self.assertNotEqual(report['status'], 'passed')
+                self.assertIs(c.ab_report['reload_required'], True)
+                if kind in ('external', 'missing', 'blocked-inherited', 'query-none'):
+                    self.assertEqual(report['status'], 'unavailable')
+                    self.assertEqual(report['deadline_enforcement'], 'not-armed')
+                    expected = ['reload-deadline-timer-active' if kind == 'external' else
+                                'reload-deadline-signal-blocked' if kind == 'blocked-inherited' else
+                                'reload-deadline-guard-unavailable']
+                    if not state.mask_api_available:
+                        expected.append('reload-cleanup-signal-mask-unavailable')
+                    self.assertEqual(report['issues'], expected)
+                    self.assertIs(report['deadline_signal_unblocked'], True if kind == 'external' else None)
+                    sig.assert_not_called()
+                    self.assertFalse(report['signal_attempted'])
+                    self.assertFalse(report['signal_sent'])
+                    self.assertEqual(state.opened, [])
+                    self.assertEqual(state.clients, [])
+                    self.assertFalse(any(event[0] == 'guarded-io' for event in state.events))
+                    context.load_verify_locations.assert_not_called()
+                    state.signal_fakes['getsignal'].assert_not_called()
+                    for key in ('before_master', 'source_caps', 'startup_caps', 'reload_caps',
+                                'source_mask', 'startup_mask', 'reload_mask', 'cap_kill_present',
+                                'effective_NNP', 'baseline_request', 'new_request', 'continuity_request',
+                                'final_request', 'old_worker_exit_proof'):
+                        self.assertIsNone(report[key], key)
+                    self.assertIsNone(report['capability_delta'])
+                    for key in ('old_cohort', 'new_cohort', 'coverage'):
+                        self.assertEqual(report[key], [], key)
+                    self.assertFalse(report['pidfd_binding_verified'])
+                    self.assertFalse(report['old_workers_exited'])
+                    queries = [call for call in state.signal_fakes['pthread_sigmask'].call_args_list
+                               if call.args == (signal.SIG_BLOCK, set())]
+                    self.assertEqual(len(queries), int(kind != 'missing'))
+                    if kind == 'external':
+                        self.assertEqual(state.external_timer, value, 'Never borrow/change an external timer')
+                        state.signal_fakes['getitimer'].assert_called_once_with(signal.ITIMER_REAL)
+                    else:
+                        state.signal_fakes['getitimer'].assert_not_called()
+                else:
+                    sig.assert_called_once()
+                    self.assertIs(report['deadline_signal_unblocked'], True)
+                    self.assertTrue(state.clients)
+                    self.assertEqual(len(state.opened), 2)
+                    label = {'timer-disable': 'reload-deadline-timer-disable-unconfirmed',
+                             'handler-restore': 'reload-deadline-handler-restore-unconfirmed',
+                             'mask-block': 'reload-cleanup-signal-mask-unavailable',
+                             'mask-restore': 'reload-cleanup-signal-mask-restore-unconfirmed'}.get(failure)
+                    if label:
+                        self.assertIn(label, report['issues'])
+                        self.assertIn(label, state.reports[0]['issues'])
+                    if failure == 'timer-disable':
+                        self.assertIn('reload-deadline-handler-left-installed', report['issues'])
+                        self.assertIn('reload-deadline-handler-left-installed', state.reports[0]['issues'])
+                        self.assertIs(state.current_alarm, state.installed_alarm)
+                        self.assertNotIn(('handler-restore', signal.SIGALRM), state.events)
+                    if kind in ('teardown', 'teardown-dfl', 'mask-restore'):
+                        self.assertEqual(report['status'], 'unavailable')
+                        self.assertEqual(state.reports[0]['status'], 'unavailable')
+                self.assertEqual(state.reports[0]['issues'], report['issues'])
+                self.assert_reload_closed(state)
+
+    def test_reload_capture_optional_identity_coverage_keeps_legacy_shape(self):
+        fixture = CaptureContracts()
+        fixture.host, fixture.D = self.host, self.D
+        for optional in (False, True):
+            for failure in (None, 'membership-before', 'membership-after', 'identity-after', 'inventory'):
+                c = self.controller()
+                unit = 'nathaya-haproxy-probe-' + NONCE + '-plain.service'
+                member = ('0::/system.slice/' + unit + '\n').encode()
+                changes = {}
+                if failure == 'membership-before':
+                    changes['cgroup'] = [b'0::/outside\n']
+                elif failure == 'membership-after':
+                    changes['cgroup'] = [member, b'0::/outside\n']
+                elif failure == 'identity-after':
+                    changes['stat'] = [fixture.stat_bytes(), fixture.stat_bytes(start=999)]
+                result, _, _ = fixture.virtual_capture(c, changes=changes,
+                    procs=b'' if failure == 'inventory' else b'101\n', reload_evidence=optional)
+                metadata = c.record.call_args.args[1]
+                self.assertEqual('complete_coverage' in metadata, optional)
+                self.assertEqual(c.reload_capture_complete, optional and failure is None)
+                if result:
+                    self.assertEqual('identity' in result[0], optional)
+                    if optional:
+                        self.assertEqual(result[0]['identity'], (101, 1234))
+                if failure:
+                    self.assertEqual(result, [])
+
+    def test_reload_cohort_credentials_and_bounded_http_parser_fail_closed(self):
+        c, _, _, _, _, _ = self.reload_fixture()
+        rows = self.tasks(c, 'nnp-no')
+        c.reload_capture_complete = True
+        self.assertEqual(c.reload_cohort(rows, {'MainPID': '101'}), (rows[0], rows[1:]))
+        for index in (0, 1):
+            for key, value in (('Uid', (0, 1, 0, 0)), ('Gid', (0, 1, 0, 0)),
+                               ('CapBnd', 0), ('CapEff', 1), ('CapPrm', 1), ('CapInh', 1), ('CapAmb', 1)):
+                bad = copy.deepcopy(rows)
+                bad[index]['status'][key] = value
+                with self.subTest(index=index, key=key), self.assertRaises(self.D.Unsupported):
+                    c.reload_cohort(bad, {'MainPID': '101'})
+        good = self.response()
+        bad_responses = [good.replace(b'200 OK', b'201 OK'), good.replace(b'HTTP/1.1', b'HTTP/1.0'),
+            good.replace(b'Content-Length:', b'Transfer-Encoding:'), good + b'extra',
+            good.replace(NONCE.encode(), b'b' * 32), good.replace(b'pid=102', b'pid=0'),
+            good.replace(b'Content-Type: text/plain', b'Connection: close\r\nContent-Type: text/plain'),
+            b'x' * 8193, good[:-1], good.replace(b'Content-Length:', b'Content-Length: 999\r\nX:')]
+        for raw in [good] + bad_responses:
+            sock = Mock()
+            sock.recv.side_effect = [raw, ssl.SSLWantReadError()] if raw == good else [raw, b'']
+            sock.pending.return_value = 0
+            def io_call(sock, operation, size):
+                self.assertLessEqual(size, 8193)
+                return operation(size)
+            if raw == good:
+                self.assertEqual(self.D._reload_response(sock, io_call, NONCE)['pid'], 102)
+            else:
+                with self.assertRaises(self.D.Unsupported):
+                    self.D._reload_response(sock, io_call, NONCE)
+
+    def test_reload_phase_dispatches_only_requested_verified_existing_b(self):
+        for phase in ('nnp-yes', 'nnp-no'):
+            for startup in ('failed', 'observed-running'):
+                c = self.ab_controller()
+                c.reload_report = self.D.reload_report(True)
+                _, events, patchers = self.sequence(c, a=startup)
+                c.ab_report['arms'][phase]['startup'] = startup
+                helper = Mock(side_effect=lambda plan: events.append('reload:' + plan['phase']))
+                result = self.invoke(c.run_phase, phase, patchers=patchers + (
+                    patch.object(c, 'observe', return_value=startup), patch.object(c, 'reload_usr2', helper)))
+                self.assertEqual(result, (startup, None))
+                self.assertEqual(helper.call_count, int(phase == 'nnp-no' and startup == 'observed-running'))
+                self.assertEqual(c.ab_report['arms'][phase]['startup'], startup)
+                self.assertTrue(any(str(event).startswith('cleanup:') for event in events))
+                if helper.called:
+                    self.assertIs(helper.call_args.args[0], c.ab_plans['nnp-no'])
+        for failure in ('wrong-arm', 'startup', 'not-requested', 'copied-plan'):
+            c, plan, state, sig, _, patchers = self.reload_fixture()
+            if failure == 'wrong-arm':
+                plan = c.ab_plans['nnp-yes']
+                plan.update(created_at=0.5, release_time=1.0)
+            elif failure == 'startup':
+                c.ab_report['arms']['nnp-no']['startup'] = 'failed'
+            elif failure == 'not-requested':
+                c.reload_report['requested'] = False
+            else:
+                plan = dict(plan)
+            report = self.invoke(c.reload_usr2, plan, patchers=patchers)
+            self.assertNotEqual(report['status'], 'passed')
+            sig.assert_not_called()
+            state.signal_fakes['getitimer'].assert_not_called()
+            state.signal_fakes['getsignal'].assert_not_called()
+            self.assertFalse(any(event[0] == 'guarded-io' for event in state.events))
+            self.assert_reload_closed(state)
+
+    def test_reload_cli_final_exit_cleanup_and_interrupt_are_independent(self):
+        for status in ('passed', 'failed', 'not-run-startup-unverified'):
+            for units_clean, tls_clean in ((True, True), (False, True), (True, False), (False, False)):
+                for interrupted in (False, True):
+                    c = self.ab_controller()
+                    c.reload_report = self.D.reload_report(True)
+                    c.reload_report['status'] = status
+                    reload_snapshot = copy.deepcopy(c.reload_report)
+                    c.ab_report.update(status='CANDIDATE-startup-only', startup_status='CANDIDATE-startup-only',
+                                       startup_candidate=True, diagnostic_finding_completed=True,
+                                       confirmed_startup_difference=True)
+                    c.ab_report['reload_required'] = status != 'passed'
+                    for phase, startup in (('nnp-yes', 'failed'), ('nnp-no', 'observed-running')):
+                        master, worker = self.tasks(c, phase)
+                        c.ab_report['arms'][phase].update(startup=startup,
+                            proc_samples=[{'master': master['status'], 'workers': [worker['status']]}])
+                    arms_snapshot = copy.deepcopy(c.ab_report['arms'])
+                    events = []
+                    c.run_nnp_ab = Mock(return_value=0, side_effect=KeyboardInterrupt if interrupted else None)
+                    c.cleanup = Mock(side_effect=lambda: events.append('unit-stop') or units_clean)
+                    c.cleanup_ab_keys = Mock(side_effect=lambda confirmed: events.append(('keys', confirmed)) or tls_clean)
+                    rc, out, err = self.main_with(c, ['--nnp-ab', '--reload-usr2'])
+                    expected = 130 if interrupted else 0 if status == 'passed' and units_clean and tls_clean else 2
+                    self.assertEqual(rc, expected)
+                    self.assertEqual(err, '')
+                    c.run_nnp_ab.assert_called_once_with(reload_usr2=True)
+                    self.assertEqual(events, ['unit-stop', ('keys', units_clean)])
+                    report = next(call.args[1] for call in c.record.call_args_list if call.args[0] == 'nnp-ab.report.json')
+                    self.assertIs(report, c.ab_report)
+                    self.assertEqual(report['exitcode'], expected)
+                    self.assertEqual(report['interrupted'], interrupted)
+                    self.assertEqual(report['cleanup_confirmed'], units_clean)
+                    self.assertEqual(report['tls_cleanup_confirmed'], tls_clean)
+                    self.assertEqual(report['cleanup'], {'units_confirmed': units_clean, 'tls_confirmed': tls_clean,
+                                                        'status': 'confirmed' if units_clean and tls_clean else 'unconfirmed'})
+                    self.assertEqual(report['startup_status'], 'CANDIDATE-startup-only')
+                    self.assertEqual(report['arms'], arms_snapshot)
+                    self.assertEqual(report['reload'], reload_snapshot)
+                    self.assertEqual(report['reload']['status'], status)
+                    if not units_clean or not tls_clean:
+                        self.assertEqual(report['status'], 'cleanup-unconfirmed')
+                        for flag in ('startup_candidate', 'diagnostic_finding_completed', 'confirmed_startup_difference'):
+                            self.assertFalse(report[flag])
+                        self.assertIn('nnp-ab: cleanup-unconfirmed;', out)
+                    else:
+                        self.assertEqual(report['status'], 'interrupted' if interrupted else 'CANDIDATE-startup-only')
+                        for flag in ('startup_candidate', 'diagnostic_finding_completed', 'confirmed_startup_difference'):
+                            self.assertTrue(report[flag])
+                    self.assertIs(report['reload_required'], status != 'passed')
+                    self.assertFalse(report['complete'])
+                    self.assertFalse(report['production_applied'])
+                    self.assertIn('unit wrapper untested', out)
+                    self.assertNotIn('trace startup:', out)
+
+    def test_reload_requested_scheduler_keeps_two_arms_and_separate_startup_status(self):
+        for passed in (False, True):
+            c = self.ab_controller(True)
+            _, events, patchers = self.sequence(c)
+            def reload(plan):
+                events.append(('reload', plan['phase']))
+                c.reload_report.update(status='passed' if passed else 'failed', signal_attempted=True, signal_sent=True)
+                c.ab_report.update(reload_usr2_tested=True, reload_required=not passed)
+            rc = self.invoke(c.run_nnp_ab, reload_usr2=True, patchers=patchers + (
+                patch.object(c, 'reserve'), patch.object(c, 'reload_usr2', side_effect=reload)))
+            self.assertEqual(rc, 0 if passed else 2)
+            self.assertEqual([event for event in events if event in ('nnp-yes', 'nnp-no')], ['nnp-yes', 'nnp-no'])
+            self.assertEqual(events.count(('reload', 'nnp-no')), 1)
+            self.assertLess(events.index(('reload', 'nnp-no')), events.index('cleanup:' + c.ab_plans['nnp-no']['unit']))
+            self.assertEqual(c.ab_report['startup_status'], 'CANDIDATE-startup-only')
+            self.assertEqual(c.ab_report['arms']['nnp-no']['startup'], 'observed-running')
+            self.assertEqual(c.reload_report['source_mask'], 0x4c0)
+            self.assertEqual(c.reload_report['startup_mask'], 0x4c0)
+            self.assertFalse(c.ab_report['complete'])
+            self.assertFalse(c.ab_report['production_applied'])
+            self.assertIs(c.ab_report['reload_required'], not passed)
+
+
 class HostBoundaryRegressions(unittest.TestCase):
     """Reporting uses an ordinary TestCase, outside the diagnostic boundary."""
 
@@ -4682,7 +5627,11 @@ class HostBoundaryRegressions(unittest.TestCase):
             (os, 'fdopen'), (Path, 'stat'), (Path, 'read_text'),
             (Path, 'open'), (Path, 'lstat'), (Path, 'mkdir'),
             (Path, 'readlink'), (Path, 'resolve'), (Path, 'unlink'),
-        ))
+        )) + tuple((signal, name, getattr(signal, name)) for name in
+                   ('getsignal', 'getitimer', 'setitimer', 'signal', 'pthread_sigmask')
+                   if hasattr(signal, name)) + tuple(
+                       (obj, name, getattr(obj, name)) for obj, names in HostBoundary.TARGETS
+                       for name in names if hasattr(obj, name))
 
     def assert_restored(self, references):
         for obj, name, original in references:
@@ -4930,7 +5879,13 @@ class HostBoundaryRegressions(unittest.TestCase):
                           lambda: os.fdopen(-1),
                           lambda: Path('/fixture-forbidden').read_text(),
                           lambda: subprocess.run(['fixture-forbidden']),
-                          lambda: socket.socket()) + path_operations:
+                          lambda: socket.socket()) + tuple(
+                              lambda name=name, args=args: getattr(signal, name)(*args)
+                              for name, args in (
+                                  ('getitimer', (getattr(signal, 'ITIMER_REAL', 0),)),
+                                  ('setitimer', (getattr(signal, 'ITIMER_REAL', 0), 0.0, 0.0)),
+                                  ('getsignal', (getattr(signal, 'SIGALRM', 0),)),
+                              ) if hasattr(signal, name)) + path_operations:
             with self.assertRaisesRegex(AssertionError, 'Real host operation forbidden'):
                 boundary.invoke(operation)
             self.assert_restored(references)

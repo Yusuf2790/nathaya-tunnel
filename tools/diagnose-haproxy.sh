@@ -1,12 +1,14 @@
 #!/bin/bash
 # Operator-only, opt-in diagnostic. Sourcing defines functions and does nothing.
 nathaya_diagnose_haproxy_main() {
-    case "$#:${1-}" in
-        1:--help)
+    case "$#:${1-}:${2-}" in
+        1:--help:)
             builtin printf '%s\n' \
-                'Usage: bash tools/diagnose-haproxy.sh --help | --run | --cap-boundaries | --cap-matrix | --nnp-ab' \
+                'Usage: bash tools/diagnose-haproxy.sh --help | --run | --cap-boundaries | --cap-matrix | --nnp-ab [--reload-usr2]' \
                 '--nnp-ab runs ONLY two isolated TLS-config startup arms: NNP=yes then no.' \
-                'No production change, handshake/health, tracing or USR2/reload proof.' \
+                '--nnp-ab --reload-usr2 optionally proves USR2 on the existing B arm before cleanup.' \
+                'The option adds a fixed private HTTP responder to BOTH arms; no production change.' \
+                'Without that option: no handshake/health, tracing or USR2/reload proof.' \
                 'NNP=no loses the kernel exec-gain barrier; other hardening is not a replacement.' \
                 '--cap-matrix tests a finite requested-restriction matrix using fixed Python only.' \
                 '--cap-boundaries runs only fixed Python controls; no HAProxy, strace or listeners.' \
@@ -17,11 +19,11 @@ nathaya_diagnose_haproxy_main() {
                 'Tracing changes privilege/timing; traced results do not represent an untraced run.'
             return 0
             ;;
-        1:--run|1:--cap-boundaries|1:--cap-matrix|1:--nnp-ab) ;;
-        *) builtin printf '%s\n' 'Usage: bash tools/diagnose-haproxy.sh --help | --run | --cap-boundaries | --cap-matrix | --nnp-ab' >&2; return 64 ;;
+        1:--run:|1:--cap-boundaries:|1:--cap-matrix:|1:--nnp-ab:|2:--nnp-ab:--reload-usr2) ;;
+        *) builtin printf '%s\n' 'Usage: bash tools/diagnose-haproxy.sh --help | --run | --cap-boundaries | --cap-matrix | --nnp-ab [--reload-usr2]' >&2; return 64 ;;
     esac
     exec /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C \
-        /usr/bin/python3 -I -B - "$1" <<'NATHAYA_HAPROXY_DIAG_PY'
+        /usr/bin/python3 -I -B - "$@" <<'NATHAYA_HAPROXY_DIAG_PY'
 """Self-contained, fail-closed HAProxy probe. Importing defines APIs only.
 
 Pure public interfaces:
@@ -32,11 +34,13 @@ Pure public interfaces:
   restriction_differences(source, probe) -> sorted list[str]
   Controller.audit_compatibility(...) -> private aggregate dict (pure, no IO)
   make_config(port, abstract_name) -> str (legacy NO_TLS)
-  make_ab_config(port, abstract_name, private_pem) -> str (TLS startup only)
+  make_ab_config(port, abstract_name, private_pem, reload_http=False, marker=None) -> str
   nnp_ab_plan(directory, nonce, caps, phase) -> closed A/B plan
   Controller.validate_nnp_ab(probe, plan) -> None (pure exact-plan proof)
   Controller.compare_nnp_ab(a, b, a_plan, b_plan) -> private raw inventory
-  Controller.run_nnp_ab() -> diagnostic exit code; nnp-ab.report.json
+  Controller.run_nnp_ab(reload_usr2=False) -> diagnostic exit code; nnp-ab.report.json
+  Controller.capture(unit, sample, reload_evidence=False, deadline=None) -> anchored records
+  Controller.reload_usr2(plan) -> private report; existing B only, clients closed on return
   trace_command(haproxy_argv) -> list[str]
   sanitise_trace(text) -> dict (no arguments, IDs or raw log text)
   owned_unit(properties, unit, nonce) -> bool
@@ -58,8 +62,10 @@ import platform
 import pwd
 import re
 import secrets
+import select
 import signal
 import socket
+import ssl
 import stat
 import subprocess
 import sys
@@ -547,14 +553,83 @@ frontend probe_abstract
 '''
 
 
-def make_ab_config(port, abstract_name, private_pem):
-    """Startup TLS configuration only; the legacy make_config remains NO_TLS."""
+def make_ab_config(port, abstract_name, private_pem, reload_http=False, marker=None):
+    """Default bytes unchanged; opt-in responder is necessary for local reload proof."""
     if (not isinstance(private_pem, (str, Path)) or not re.fullmatch(
             r'/run/nathaya-haproxy-probe\.[A-Za-z0-9_-]+/nnp-ab/private.pem', str(private_pem))):
         raise Unsupported('ab-pem-path')
     config = make_config(port, abstract_name)  # Validates high port and abstract name.
+    if type(reload_http) is not bool or (reload_http and
+            (not isinstance(marker, str) or not re.fullmatch(r'[0-9a-f]{32}', marker))):
+        raise Unsupported('ab-reload-marker')
+    if reload_http:
+        # %pid is HAProxy's log-format PID variable (NOT proc.pid):
+        # https://docs.haproxy.org/2.8/configuration.html#8.2.6
+        config = config.replace('    tcp-request content reject\n',
+            '    mode http\n    option http-keep-alive\n'
+            '    http-request return status 200 content-type text/plain lf-string '
+            f'"nathaya-reload:{marker} pid=%pid"\n')
     return config.replace(f'bind 127.0.0.1:{port}\n',
                           f'bind 127.0.0.1:{port} ssl crt {private_pem}\n')
+
+
+def reload_report(requested):
+    """Explicitly initialized before any preflight or optional helper."""
+    return dict(requested=requested, status='not-run-startup-unverified' if requested else 'not-requested',
+        signal_attempted=False, signal_sent=False,
+        source_mechanism='ExecReload=/bin/kill -USR2 $MAINPID', delivery='linux-pidfd-SIGUSR2',
+        unit_reload_wrapper_tested=False, source_caps=None, startup_caps=None, reload_caps=None,
+        source_mask=None, startup_mask=None, reload_mask=None, capability_delta=None, cap_kill_present=None,
+        reload_caps_observation='unavailable',
+        before_master=None, old_cohort=[], new_cohort=[], effective_NNP=None,
+        baseline_request=None, new_request=None, continuity_request=None, final_request=None,
+        clients_closed=True, old_workers_exited=False, old_worker_exit_proof=None, budget_seconds=3.0,
+        release_time=None, deadline=None, deadline_enforcement='not-armed', deadline_signal_unblocked=None,
+        coverage=[], pidfd_binding_verified=False, issues=[])
+
+
+def _reload_response(sock, io, marker):
+    """Read one bounded HTTP/1.1 response; never persist payload or headers."""
+    data = b''
+    while b'\r\n\r\n' not in data:
+        block = io(sock, sock.recv, 8193 - len(data))
+        if not block:
+            raise Unsupported('reload-http-eof')
+        data += block
+        if len(data) > 8192 and b'\r\n\r\n' not in data:
+            raise Unsupported('reload-http-headers-size')
+    head, body = data.split(b'\r\n\r\n', 1)
+    lines, headers = head.split(b'\r\n'), {}
+    if len(head) + 4 > 8192 or not re.fullmatch(rb'HTTP/1\.1 200 [\x20-\x7e]*', lines[0]):
+        raise Unsupported('reload-http-status-or-size')
+    for line in lines[1:]:
+        name, sep, value = line.partition(b':')
+        name, value = name.lower(), value.strip()
+        if (not sep or not re.fullmatch(rb'[a-z0-9-]+', name) or name in headers
+                or any(c < 32 or c > 126 for c in value)):
+            raise Unsupported('reload-http-headers')
+        headers[name] = value
+    length = headers.get(b'content-length', b'')
+    if (not re.fullmatch(rb'[0-9]{1,3}', length) or not 1 <= int(length) <= 128
+            or b'transfer-encoding' in headers or headers.get(b'content-type') != b'text/plain'
+            or b'close' in [t.strip().lower() for t in headers.get(b'connection', b'').split(b',')]):
+        raise Unsupported('reload-http-framing-or-close')
+    size = int(length)
+    while len(body) < size:
+        block = io(sock, sock.recv, size - len(body))
+        if not block:
+            raise Unsupported('reload-http-body-eof')
+        body += block
+    match = re.fullmatch(b'nathaya-reload:' + marker.encode('ascii') + rb' pid=([1-9][0-9]{0,9})', body)
+    if len(body) != size or not match or sock.pending():
+        raise Unsupported('reload-http-body-or-extra')
+    try:
+        sock.recv(1)  # Nonblocking: reject buffered extras/EOF, never pretend an idle hold.
+    except (ssl.SSLWantReadError, BlockingIOError):
+        pass
+    else:
+        raise Unsupported('reload-http-extra-or-eof')
+    return {'status': 200, 'pid': int(match[1]), 'body_bytes': size, 'marker_verified': True}
 
 
 def nnp_ab_plan(directory, nonce, caps, phase):
@@ -1068,6 +1143,8 @@ class Controller:
         self.ab_report = {'status': 'NOTSTARTED', 'complete': False, 'production_applied': False,
                           'reload_usr2_tested': False, 'reload_required': True,
                           'proc_identity': 'unavailable', 'arms': {}}
+        self.reload_report = reload_report(False)
+        self.reload_capture_complete = False
         self.ab_assets = None
         self.ab_plans, self.ab_profiles = {}, {}
 
@@ -1306,7 +1383,9 @@ class Controller:
         del private_key, certificate
         endpoints = self.reserve()
         self.ab_assets['endpoints'] = endpoints
-        self.save('nnp-ab/haproxy.cfg', make_ab_config(*endpoints, self.directory / pem))
+        config = (make_ab_config(*endpoints, self.directory / pem, reload_http=True, marker=self.nonce)
+                  if self.reload_report['requested'] else make_ab_config(*endpoints, self.directory / pem))
+        self.save('nnp-ab/haproxy.cfg', config)  # Once, before either arm; never rewrite a live config.
         for name in (key, cert, pem, 'nnp-ab/haproxy.cfg', 'gate.py'):
             _, metadata = _read_private_source(self.directory / name, 65536)
             self.ab_assets['metadata'][name] = metadata
@@ -1622,10 +1701,13 @@ class Controller:
         if not isinstance(probe, dict) or not isinstance(plan, dict):
             raise Unsupported('ab-snapshot-or-plan-format')
         expected = nnp_ab_plan(self.directory, self.nonce, self.caps, plan.get('phase'))
-        if (set(plan) - {'created_at'} != set(expected) or
+        if (set(plan) - {'created_at', 'release_time'} != set(expected) or
                 any(plan.get(k) != v for k, v in expected.items()) or
                 ('created_at' in plan and (type(plan['created_at']) not in (int, float)
-                                          or not 0 < plan['created_at'] < float('inf')))):
+                                          or not 0 < plan['created_at'] < float('inf'))) or
+                ('release_time' in plan and (type(plan['release_time']) is not float
+                    or not 0 < plan['release_time'] < float('inf')
+                    or 'created_at' not in plan or plan['release_time'] < plan['created_at']))):
             raise Unsupported('ab-plan')
         errors = []
         collect_unsupported(errors, self._validate_probe_policy, probe, plan,
@@ -1843,26 +1925,36 @@ class Controller:
                 raise Unsupported('prestart-deadline')
         self.release_reservations()
         self.save(plan['phase'] + '/' + plan['go'].name, b'')
+        if plan['phase'] in ('nnp-yes', 'nnp-no') and self.reload_report['requested']:
+            plan['release_time'] = time.monotonic()
+            self.record(plan['phase'] + '/release-time.json', {'release_time': plan['release_time']})
         return live
 
-    def capture(self, unit, sample):
+    def capture(self, unit, sample, reload_evidence=False, deadline=None):
         """Stage bounded metadata on an anchored task FD, then validate and save.
 
         Never reopen a PID path after anchoring: a reused PID must not redirect
         any read to a different task. No maps, environment, arguments or memory.
         """
+        self.reload_capture_complete = False
         if not _capture_unit(unit, self.nonce):
             raise Unsupported('probe-ownership')
         cg = '/system.slice/' + unit
         membership = ('0::' + cg + '\n').encode('ascii')
         captures, errors, exe_unavailable = [], [], False
 
+        def budget():
+            if reload_evidence and deadline is not None and time.monotonic() >= deadline:
+                raise Unsupported('reload-capture-deadline-inconclusive')
+
         def bounded(name, limit, directory=None):
-            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                         dir_fd=directory)
+            budget()
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC |
+                         (os.O_NONBLOCK if reload_evidence else 0), dir_fd=directory)
             try:
                 data = bytearray()
                 while len(data) <= limit:
+                    budget()
                     block = os.read(fd, min(4096, limit + 1 - len(data)))
                     if not block:
                         return bytes(data)
@@ -1884,9 +1976,11 @@ class Controller:
                 raise ValueError('cgroup-procs')
             pids = sorted(set(map(int, fields)))
         except (OSError, ValueError) as exc:
-            self.record(sample + '.json', {'unavailable': type(exc).__name__})
+            self.record(sample + '.json', {'unavailable': type(exc).__name__,
+                        **({'complete_coverage': False} if reload_evidence else {})})
             return []
         for pid in pids:
+            budget()
             directory = None
             prefix = sample + '-pid-' + str(pid)
             try:
@@ -1932,7 +2026,8 @@ class Controller:
                 for name, data in staged.items():
                     self.save(prefix + '.' + name, data)
                 if link is not None:
-                    captures.append({'exe': link, 'status': parsed})
+                    captures.append({'exe': link, 'status': parsed,
+                                     **({'identity': identity} if reload_evidence else {})})
                 role = ('haproxy-root' if parsed['Uid'][1] == 0 else 'haproxy-worker') if link == HAPROXY else 'strace' if link == '/usr/bin/strace' else 'other'
                 stage = sample.split('/')[0] + ':' + role
                 # Retain the first observation of every credential/capability
@@ -1947,7 +2042,17 @@ class Controller:
             finally:
                 if directory is not None:
                     os.close(directory)
-        self.record(sample + '.json', {'pids': pids, 'errors': errors})
+        if reload_evidence:
+            try:
+                if bounded('/sys/fs/cgroup' + cg + '/cgroup.procs', 4096).split() != raw.split():
+                    errors.append({'error': 'cgroup-inventory-changed'})
+            except (OSError, ValueError):
+                errors.append({'error': 'cgroup-inventory-unavailable'})
+            self.reload_capture_complete = (bool(pids) and not errors and not exe_unavailable
+                                             and len(captures) == len(pids))
+        self.record(sample + '.json', {'pids': pids, 'errors': errors,
+                    **({'complete_coverage': self.reload_capture_complete,
+                        'identities': [r['identity'] for r in captures]} if reload_evidence else {})})
         # Persist capability evidence even when exe is denied, but do not let an
         # incomplete executable inventory establish an observed startup identity.
         return [] if exe_unavailable else captures
@@ -1990,6 +2095,27 @@ class Controller:
                     and master['CapInh'] == 0 and master['CapAmb'] == 0 and master['CapBnd'] == mask
                     and master['CapEff'] == master['CapPrm'] and master['CapEff'] in allowed)
 
+    def ab_worker_valid(self, worker, nnp):
+        mask = sum(1 << CAP_BITS[c] for c in self.caps)
+        return (worker['Uid'] == (self.uid,) * 4 and worker['Gid'] == (self.gid,) * 4
+                and all(g == self.gid for g in worker['Groups'])
+                and not any(worker[k] for k in ('CapInh', 'CapPrm', 'CapEff', 'CapAmb'))
+                and worker['CapBnd'] == mask and worker['NoNewPrivs'] in ((1,) if nnp else (0, 1)))
+
+    def reload_cohort(self, captures, properties):
+        """Separate checker: never appends reload transitions to startup proc_samples."""
+        masters = [r for r in captures if str(r['status']['Pid']) == properties.get('MainPID')]
+        if (not self.reload_capture_complete or len(masters) != 1
+                or any(r['exe'] != HAPROXY for r in captures)):
+            raise Unsupported('reload-incomplete-cohort')
+        master = masters[0]
+        workers = [r for r in captures if r is not master]
+        if (not self.ab_master_valid(master['status'], 'nnp-no') or not workers
+                or any(r['status']['PPid'] != master['status']['Pid']
+                       or not self.ab_worker_valid(r['status'], False) for r in workers)):
+            raise Unsupported('reload-cohort-credentials')
+        return master, workers
+
     def ab_identity(self, captures, properties, phase):
         haproxy = [p['status'] for p in captures if p['exe'] == HAPROXY]
         masters = [s for s in haproxy if str(s['Pid']) == properties.get('MainPID')]
@@ -2007,10 +2133,7 @@ class Controller:
         if (not self.ab_master_valid(master, phase) or not workers or len(workers) + 1 != len(haproxy)):
             return None
         for worker in workers:
-            if (worker['Uid'] != (self.uid,) * 4 or worker['Gid'] != (self.gid,) * 4
-                    or any(g != self.gid for g in worker['Groups'])
-                    or any(worker[k] for k in ('CapInh', 'CapPrm', 'CapEff', 'CapAmb'))
-                    or worker['CapBnd'] != mask or worker['NoNewPrivs'] not in ((1,) if nnp else (0, 1))):
+            if not self.ab_worker_valid(worker, nnp):
                 return None
         # Credentials as well as PID identity must remain stable for two seconds.
         return tuple(tuple((k, s[k]) for k in sorted(s)) for s in
@@ -2130,10 +2253,19 @@ class Controller:
             self.ab_profiles[phase] = profile
             self.ab_report['arms'][phase]['effective_NNP'] = profile['NoNewPrivileges']
             self.ab_report['arms'][phase]['gate_boundaries'] = self.read_boundaries(plan)
+            if phase == 'nnp-no' and self.reload_report['requested']:
+                caps = _capset(profile['CapabilityBoundingSet'])
+                self.reload_report.update(startup_caps=sorted(caps),
+                                          startup_mask=sum(1 << CAP_BITS[c] for c in caps))
         result = self.observe(plan)
         if phase in ('nnp-yes', 'nnp-no'):
             self.ab_report['arms'][phase]['startup'] = result
         self.record(phase + '/startup.json', {'status': result})
+        if phase == 'nnp-no' and self.reload_report['requested']:
+            if result == 'observed-running':
+                self.reload_usr2(plan)
+            else:
+                self.reload_report['status'] = 'not-run-startup-unverified'
         if not self.cleanup_one(plan['unit']):
             self.cleanup_confirmed = False
             raise Unsupported('cleanup-unconfirmed')
@@ -2151,8 +2283,353 @@ class Controller:
             return result, trace
         return result, None
 
-    def run_nnp_ab(self):
+    def reload_usr2(self, plan):
+        """One signal, existing verified B only; all client/pidfds close before cleanup."""
+        report, clients, pidfds = self.reload_report, [], []
+        report.update(status='in-progress', release_time=plan.get('release_time'))
+        deadline, network_end = time.monotonic(), float('inf')
+        base, count = 'nnp-no/reload', 0
+        master_before, old = None, []
+        previous_alarm_handler = None
+        alarm_handler_installed, alarm_timer_owned, in_cleanup = False, False, False
+
+        def reload_alarm(_signum, _frame):
+            # A queued alarm must not interrupt teardown or resource closing.
+            if not in_cleanup:
+                raise Unsupported('reload-deadline-inconclusive')
+
+        def left():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise Unsupported('reload-deadline-inconclusive')
+            return remaining
+
+        def pause():
+            time.sleep(min(0.025, left()))
+
+        def io(sock, operation, *args):
+            end = min(deadline, network_end, time.monotonic() + 2.0)  # Never enlarge the 2s network timeout.
+            while True:
+                if time.monotonic() >= end:
+                    raise Unsupported('reload-network-timeout-inconclusive')
+                left()
+                try:
+                    return operation(*args)
+                except (ssl.SSLWantReadError, ssl.SSLWantWriteError, BlockingIOError) as exc:
+                    writing = (isinstance(exc, ssl.SSLWantWriteError) or
+                               isinstance(exc, BlockingIOError) and operation.__name__ == 'send')
+                    select.select([] if writing else [sock], [sock] if writing else [], [],
+                                  min(0.025, left(), max(0, end - time.monotonic())))
+
+        def send(sock, data):
+            while data:
+                sent = io(sock, sock.send, data)
+                if sent <= 0:
+                    raise Unsupported('reload-client-send-unavailable')
+                data = data[sent:]
+
+        def closed(fd):
+            left()
+            poller = select.poll()
+            poller.register(fd, select.POLLIN)
+            events = poller.poll(0)
+            if any(flags & (select.POLLERR | select.POLLNVAL) for _, flags in events):
+                raise Unsupported('reload-pidfd-poll-unavailable')
+            if events and not any(flags & select.POLLIN for _, flags in events):
+                raise Unsupported('reload-pidfd-unexpected-event')
+            return bool(events)
+
+        def snapshot(label, source=False):
+            nonlocal count
+            left()
+            stem = base + '/%03d-' % count + label
+            count += 1
+            live = self.show(plan['unit'], timeout=min(0.25, left()))
+            self.validate_nnp_ab(live, plan)
+            _require(live, {'ActiveState': 'active', 'SubState': 'running'})
+            audit = self.audit_compatibility(self.ab_profiles['nnp-no'], live, plan=plan, probe_source=True)
+            self.record(stem + '.unit.json', audit)
+            _raise_unsupported(audit['issues'])
+            self.reload_capture_complete = False
+            captures = self.capture(plan['unit'], stem, reload_evidence=True, deadline=deadline)
+            report['coverage'].append({'artifact': stem + '.json', 'complete': self.reload_capture_complete})
+            master, workers = self.reload_cohort(captures, live)
+            if master_before is not None and (master['identity'] != master_before['identity']
+                                              or closed(pidfds[0])):
+                raise Unsupported('reload-master-identity-or-liveness')
+            if source:
+                left()
+                raw, metadata = _read_private_source(FRAGMENT, 65536)
+                left()
+                fragment = validate_fragment(raw.decode('utf-8', 'strict'))
+                current = self.show(MAIN, timeout=min(0.25, left()))
+                audit = self.audit_compatibility(current, live, fragment=fragment, plan=plan,
+                    original=self.source, original_fragment=self.fragment,
+                    original_bytes=self.source_bytes, current_bytes=raw)
+                self.record(stem + '.source.json', {'audit': audit, 'fragment_metadata': metadata})
+                _raise_unsupported(audit['issues'])
+                if raw != self.source_bytes or _capset(current['CapabilityBoundingSet']) != self.caps:
+                    raise Unsupported('reload-source-changed')
+                left()
+                self.verify_ab_assets()
+                left()
+                _no_lock()
+            left()
+            return master, workers
+
+        def fresh():
+            nonlocal network_end
+            left()
+            network_end = min(deadline, time.monotonic() + 2.0)
+            report['clients_closed'] = False
+            raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            clients.append(raw)
+            raw.setblocking(False)
+            code = raw.connect_ex(('127.0.0.1', self.ab_assets['endpoints'][0]))
+            if code not in (0, errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EALREADY, errno.EINTR):
+                raise Unsupported('reload-loopback-connect-unavailable')
+            end = network_end
+            while code:
+                if time.monotonic() >= end:
+                    raise Unsupported('reload-connect-timeout-inconclusive')
+                _, ready, _ = select.select([], [raw], [], min(0.025, left(), max(0, end - time.monotonic())))
+                if ready:
+                    if raw.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR):
+                        raise Unsupported('reload-loopback-connect-unavailable')
+                    break
+            tls = context.wrap_socket(raw, server_hostname='localhost', do_handshake_on_connect=False)
+            clients.append(tls)
+            tls.setblocking(False)
+            io(tls, tls.do_handshake)
+            if hashlib.sha256(tls.getpeercert(binary_form=True)).hexdigest() != pin:
+                raise Unsupported('reload-leaf-pin')
+            send(tls, b'GET / HTTP/1.1\r\nHost: localhost\r\n\r\n')
+            response = _reload_response(tls, io, self.nonce)
+            network_end = deadline
+            return tls, response
+
+        def ids(rows):
+            return {r['identity'] for r in rows}
+
+        def serves(response, rows):
+            return any(response['pid'] == r['identity'][0] for r in rows)
+
+        try:
+            if report['signal_attempted']:
+                raise Unsupported('reload-signal-already-attempted')
+            if type(plan.get('release_time')) is not float or not 0 < plan['release_time'] < float('inf'):
+                raise Unsupported('reload-release-time-unavailable')
+            deadline = min(time.monotonic() + 3.0, plan['release_time'] + 7.0)
+            report['deadline'] = deadline
+            if (plan['phase'] != 'nnp-no' or self.ab_plans.get('nnp-no') is not plan
+                    or self.ab_report['arms']['nnp-no']['startup'] != 'observed-running'
+                    or not report['requested']):
+                raise Unsupported('reload-B-startup-unverified')
+            if not hasattr(os, 'pidfd_open') or not hasattr(signal, 'pidfd_send_signal'):
+                raise Unsupported('reload-linux-pidfd-unavailable')
+            # Fresh Linux/root CLI only (preflight); signal.signal also refuses
+            # non-main-thread use. Never borrow or overwrite an existing timer.
+            # RuntimeMaxSec=8s independently bounds the service, not this controller.
+            try:
+                if sys.platform != 'linux' or not all(hasattr(signal, name) for name in (
+                        'SIGALRM', 'ITIMER_REAL', 'getitimer', 'setitimer', 'getsignal', 'signal',
+                        'pthread_sigmask')):
+                    raise Unsupported('reload-deadline-guard-unavailable')
+                # env -i does not reset inherited masks; query without changing one.
+                inherited_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+                if signal.SIGALRM in inherited_mask:
+                    raise Unsupported('reload-deadline-signal-blocked')
+                report['deadline_signal_unblocked'] = True
+                if any(signal.getitimer(signal.ITIMER_REAL)):
+                    raise Unsupported('reload-deadline-timer-active')
+                previous_alarm_handler = signal.getsignal(signal.SIGALRM)
+                # Register intent before mutation so even partial setup is undone.
+                alarm_handler_installed = True
+                signal.signal(signal.SIGALRM, reload_alarm)
+                alarm_timer_owned = True
+                signal.setitimer(signal.ITIMER_REAL, left(), 0.0)  # Once, never renewed per I/O.
+            except Unsupported:
+                raise
+            except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+                raise Unsupported('reload-deadline-guard-unavailable') from None
+            report['deadline_enforcement'] = ('SIGALRM wall-clock for interruptible controller work; '
+                                               'kernel uninterruptible waits not guaranteed')
+            (self.directory / base).mkdir(mode=0o700)
+            left()
+            certificate, _ = _read_private_source(self.directory / 'nnp-ab/private.crt', 65536)
+            left()
+            pin = hashlib.sha256(ssl.PEM_cert_to_DER_cert(certificate.decode('ascii'))).hexdigest()
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            left()
+            context.load_verify_locations(cafile=str(self.directory / 'nnp-ab/private.crt'))
+            left()
+            report['tls'] = {'own_certificate_trust_only': True, 'leaf_sha256': pin,
+                             'hostname_check_required': context.check_hostname}
+            master, old = snapshot('before', source=True)
+            report.update(before_master=master, old_cohort=old,
+                source_caps=sorted(self.caps), startup_caps=sorted(_capset(self.ab_profiles['nnp-no']['CapabilityBoundingSet'])),
+                source_mask=sum(1 << CAP_BITS[c] for c in self.caps),
+                startup_mask=master['status']['CapBnd'], reload_mask=master['status']['CapBnd'],
+                reload_caps_observation='verified-before-signal',
+                reload_caps=sorted(c for c, bit in CAP_BITS.items() if master['status']['CapBnd'] & (1 << bit)),
+                cap_kill_present=bool(master['status']['CapBnd'] & (1 << CAP_BITS['CAP_KILL'])),
+                effective_NNP={'unit': 'no', 'master': master['status']['NoNewPrivs'],
+                               'workers': [r['status']['NoNewPrivs'] for r in old]})
+            report['cap_kill_note'] = ('already in source/startup profile; no difference' if report['cap_kill_present'] else
+                                      'absent in observed profile; failure possible, not an automatic causal diagnosis')
+            report['capability_delta'] = sorted(set(report['startup_caps']) ^ set(report['reload_caps']))
+            held, response = fresh()
+            report['baseline_request'] = response
+            if not serves(response, old):
+                raise Unsupported('reload-baseline-not-old-worker')
+            # Busy across reload, NOT idle keepalive (HAProxy may close idle clients).
+            send(held, b'GET / HTTP/1.1\r\nHost: localhost\r\n')
+            for row in [master] + old:
+                fd = os.pidfd_open(row['identity'][0], 0)
+                pidfds.append(fd)
+            master_before = master
+            again, workers = snapshot('bound', source=True)
+            if again != master or workers != old or any(closed(fd) for fd in pidfds):
+                raise Unsupported('reload-pidfd-binding-changed')
+            report['pidfd_binding_verified'] = True
+            # Last complete identity/unit/source/config/TLS/executable/lock checks
+            # are above; no numeric-PID signal, arbitrary target or unit hook.
+            left()
+            report.update(signal_attempted=True, signal_sent=None)
+            self.ab_report['reload_usr2_tested'] = True
+            try:
+                signal.pidfd_send_signal(pidfds[0], signal.SIGUSR2, None, 0)
+            except OSError:
+                report['signal_sent'] = False
+                raise
+            report['signal_sent'] = True
+            while True:
+                _, workers = snapshot('generation')
+                new = [r for r in workers if r['identity'] not in ids(old)]
+                if new:
+                    tls, response = fresh()
+                    tls.close()
+                    if serves(response, new):
+                        _, confirmed = snapshot('new-confirmed')
+                        if not ids(new) <= ids(confirmed):
+                            raise Unsupported('reload-new-cohort-changed')
+                        report.update(new_cohort=new, new_request=response)
+                        break
+                    if not serves(response, old):
+                        raise Unsupported('reload-fresh-unanchored-worker')
+                pause()  # Only read-only inventory/request retries, NEVER signal retry.
+            held_index = next(i for i, r in enumerate(old) if r['identity'][0] == report['baseline_request']['pid'])
+            if closed(pidfds[held_index + 1]):
+                raise Unsupported('reload-held-old-worker-exited-before-continuity')
+            send(held, b'\r\n')
+            network_end = min(deadline, time.monotonic() + 2.0)
+            response = _reload_response(held, io, self.nonce)
+            network_end = deadline
+            report['continuity_request'] = response
+            if not serves(response, old):
+                raise Unsupported('reload-continuity-not-old-worker')
+            for client in clients:
+                client.close()
+            report['clients_closed'] = True
+            while not all(closed(fd) for fd in pidfds[1:]):
+                pause()  # POLLIN proves exit even for a zombie; absence is not death.
+            report.update(old_workers_exited=True, old_worker_exit_proof='pidfd-POLLIN-after-client-close')
+            _, workers = snapshot('drained', source=True)
+            if ids(workers) != ids(new) or ids(workers) & ids(old):
+                raise Unsupported('reload-post-drain-cohort')
+            tls, response = fresh()
+            report['clients_closed'] = False
+            tls.close()
+            report['final_request'] = response
+            if not serves(response, workers):
+                raise Unsupported('reload-final-not-new-worker')
+            final_master, final_workers = snapshot('final', source=True)
+            if ids(final_workers) != ids(new):
+                raise Unsupported('reload-final-cohort-changed')
+            report.update(status='passed', after_master=final_master, final_cohort=final_workers,
+                reload_mask=final_master['status']['CapBnd'], reload_caps_observation='verified-after-drain',
+                reload_caps=sorted(c for c, bit in CAP_BITS.items() if final_master['status']['CapBnd'] & (1 << bit)),
+                cap_kill_present=bool(final_master['status']['CapBnd'] & (1 << CAP_BITS['CAP_KILL'])),
+                effective_NNP={'unit': 'no', 'master': final_master['status']['NoNewPrivs'],
+                               'workers': [r['status']['NoNewPrivs'] for r in final_workers]})
+            report['capability_delta'] = sorted(set(report['startup_caps']) ^ set(report['reload_caps']))
+        except KeyboardInterrupt:
+            report['status'] = 'interrupted'
+            raise
+        except Unsupported as exc:
+            report.update(status='failed' if report['signal_sent'] else 'unavailable', issues=list(exc.labels))
+        except (OSError, ValueError, subprocess.SubprocessError):
+            report.update(status='unavailable', issues=['reload-inspection-or-io-unavailable'])
+        finally:
+            in_cleanup = True
+            blocked, deferred_interrupt = None, False
+            try:
+                blocked = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM})
+            except KeyboardInterrupt:
+                report['status'] = 'interrupted'
+                deferred_interrupt = True
+            except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+                report['issues'].append('reload-cleanup-signal-mask-unavailable')
+            # Only a successful disable confirms our timer is disarmed. If it
+            # fails, leave reload_alarm installed: in_cleanup ignores late ALRM,
+            # whereas restoring a previous SIG_DFL could terminate the controller.
+            disarm_confirmed = not alarm_timer_owned
+            if alarm_timer_owned:
+                try:
+                    signal.setitimer(signal.ITIMER_REAL, 0.0, 0.0)
+                    disarm_confirmed = True
+                except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+                    report['issues'].extend(['reload-deadline-timer-disable-unconfirmed',
+                                             'reload-deadline-handler-left-installed'])
+                    if report['status'] != 'interrupted':
+                        report['status'] = 'unavailable'
+            if alarm_handler_installed and disarm_confirmed:
+                try:
+                    signal.signal(signal.SIGALRM, previous_alarm_handler)
+                except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+                    report['issues'].append('reload-deadline-handler-restore-unconfirmed')
+            report['clients_closed'] = True
+            for client in clients:
+                try:
+                    client.close()
+                except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+                    report['clients_closed'] = False
+                    report['issues'].append('reload-client-close-unconfirmed')
+            for fd in pidfds:
+                try:
+                    os.close(fd)
+                except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+                    report['issues'].append('reload-pidfd-close-unconfirmed')
+            # Unmask before final evidence so failures/pending INT or TERM are
+            # reflected in it, but defer any interrupt until finalization ends.
+            if blocked is not None:
+                try:
+                    signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
+                except KeyboardInterrupt:
+                    report['status'] = 'interrupted'
+                    deferred_interrupt = True
+                except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+                    report['issues'].append('reload-cleanup-signal-mask-restore-unconfirmed')
+            if report['issues'] and report['status'] == 'passed':
+                report['status'] = 'unavailable'
+            if type(report['release_time']) is float:
+                report['elapsed_after_release'] = time.monotonic() - report['release_time']
+            try:
+                self.record(base + '/report.json', report)
+            except (OSError, ValueError):
+                if report['status'] != 'interrupted':
+                    report['status'] = 'unavailable'
+                report['issues'].append('reload-evidence-write-unavailable')
+            self.ab_report['reload_required'] = report['status'] != 'passed'
+            if deferred_interrupt:
+                raise KeyboardInterrupt
+        return report
+
+    def run_nnp_ab(self, reload_usr2=False):
         # Initialize BEFORE preflight/helpers: NOTSTARTED is not invented proc data.
+        if type(reload_usr2) is not bool:
+            raise Unsupported('ab-reload-option')
+        self.reload_report = reload_report(reload_usr2)
         self.ab_report = {'status': 'NOTSTARTED', 'complete': False, 'production_applied': False,
             'diagnostic_finding_completed': False, 'confirmed_startup_difference': False,
             'actual_master_NNP': {'A': 'unavailable', 'B': 'unavailable'},
@@ -2164,10 +2641,22 @@ class Controller:
             'limits': ['no connection/TLS health proof or production health claim',
                        'no reload/USR2 proof, no CAP_KILL addition or capability promotion',
                        'legacy make_config probe has no TLS; root master/nonroot workers unchanged'],
+            'reload': self.reload_report,
             'arms': {p: {'startup': 'NOTSTARTED', 'proc_samples': [], 'proc_identity': 'unavailable',
                          'effective_NNP': 'unavailable', 'gate_boundaries': 'unavailable',
                          'cleanup_confirmed': False} for p in ('nnp-yes', 'nnp-no')}}
+        def finding(code):
+            self.ab_report['startup_status'] = self.ab_report['status']
+            return 2 if reload_usr2 and self.reload_report['status'] != 'passed' else code
+
         self.prepare(ab=True)
+        if reload_usr2:
+            self.reload_report.update(source_caps=sorted(self.caps),
+                                      source_mask=sum(1 << CAP_BITS[c] for c in self.caps))
+            self.ab_report['scope'] = 'isolated TLS-config startup A/B plus B pidfd USR2/local-request proof'
+            self.ab_report['limits'] = ['probe-only HTTP responder; not production health',
+                'unit reload wrapper untested; no production change or complete fix',
+                'same source capabilities; no CAP_KILL addition or capability promotion']
         self.prepare_ab_assets()
         self.ab_report['status'] = 'incomplete'
         for phase in ('nnp-yes', 'nnp-no'):
@@ -2192,25 +2681,25 @@ class Controller:
         if (b['startup'] != 'observed-running' or not b_masters or b['effective_NNP'] != 'no'
                 or not all(self.ab_master_valid(s, 'nnp-no') for s in b_masters)):
             self.ab_report['status'] = 'inconclusive'
-            return 2
+            return finding(2)
         # Failed A may lack SETUID exactly as observed in the Python control,
         # but unrelated capability anomalies cannot confirm an NNP-only result.
         if a_masters and not all(self.ab_master_valid(s, 'nnp-yes', failed_arm=a['startup'] == 'failed')
                                  for s in a_masters):
             self.ab_report['status'] = 'inconclusive-A-credentials'
-            return 2
+            return finding(2)
         if a['startup'] == 'observed-running':
             self.ab_report.update(status='no-NNP-startup-differentiator', diagnostic_finding_completed=True,
                                   comparative_verification='both-started')
-            return 0
+            return finding(0)
         self.ab_report.update(status='CANDIDATE-startup-only', startup_candidate=True)
         if (a['startup'] == 'failed' and a_masters
                 and all(self.ab_master_valid(s, 'nnp-yes', failed_arm=True) for s in a_masters)
                 and all(self.ab_master_valid(s, 'nnp-no') for s in b_masters)):
             self.ab_report.update(confirmed_startup_difference=True, diagnostic_finding_completed=True,
                                   comparative_verification='confirmed-startup-only')
-            return 0  # Completed diagnostic finding, NEVER a complete production fix.
-        return 2
+            return finding(0)  # Completed diagnostic finding, NEVER a complete production fix.
+        return finding(2)
 
     def read_boundaries(self, plan):
         _secure_path(plan['output'])
@@ -2775,11 +3264,13 @@ class Controller:
 
 def main(argv=None):
     args = sys.argv[1:] if argv is None else argv
-    if args not in (['--run'], ['--cap-boundaries'], ['--cap-matrix'], ['--nnp-ab']):
-        print('Usage: bash tools/diagnose-haproxy.sh --help | --run | --cap-boundaries | --cap-matrix | --nnp-ab', file=sys.stderr)
+    if args not in (['--run'], ['--cap-boundaries'], ['--cap-matrix'], ['--nnp-ab'],
+                    ['--nnp-ab', '--reload-usr2']):
+        print('Usage: bash tools/diagnose-haproxy.sh --help | --run | --cap-boundaries | --cap-matrix | --nnp-ab [--reload-usr2]', file=sys.stderr)
         return 64
     cap_boundaries, cap_matrix = args == ['--cap-boundaries'], args == ['--cap-matrix']
-    nnp_ab = args == ['--nnp-ab']
+    reload_usr2 = args == ['--nnp-ab', '--reload-usr2']
+    nnp_ab = args == ['--nnp-ab'] or reload_usr2
     outcomes = {}
     controller, status, exitcode = Controller(), 'unavailable', 2
     interrupted = False
@@ -2792,7 +3283,8 @@ def main(argv=None):
         for signum in (signal.SIGINT, signal.SIGTERM):
             old_handlers[signum] = signal.signal(signum, interrupt)
         if nnp_ab:
-            exitcode = controller.run_nnp_ab()
+            exitcode = (controller.run_nnp_ab(reload_usr2=True) if reload_usr2 else
+                        controller.run_nnp_ab())
         elif cap_matrix:
             controller.prepare(cap_boundaries=True)
             exitcode = controller.run_matrix()
@@ -2862,9 +3354,17 @@ def main(argv=None):
             report = controller.ab_report
             report.update(cleanup_confirmed=clean, tls_cleanup_confirmed=keys_clean,
                           interrupted=interrupted, exitcode=exitcode)
+            if reload_usr2:
+                report['reload'] = controller.reload_report
+                report['cleanup'] = {'units_confirmed': clean, 'tls_confirmed': keys_clean,
+                                     'status': 'confirmed' if clean and keys_clean else 'unconfirmed'}
+                if controller.reload_report['status'] != 'passed' and not interrupted:
+                    exitcode = report['exitcode'] = 2
             if not clean or not keys_clean:
                 report.update(status='cleanup-unconfirmed', startup_candidate=False,
                               diagnostic_finding_completed=False, confirmed_startup_difference=False)
+                if reload_usr2:
+                    report['cleanup']['status'] = 'unconfirmed'
             elif interrupted and report['status'] != 'NOTSTARTED':
                 report['status'] = 'interrupted'
             if controller.directory is not None:
@@ -2873,7 +3373,11 @@ def main(argv=None):
                 except (OSError, ValueError):
                     exitcode = 130 if interrupted else 2
                     print('nnp-ab: evidence-unavailable')
-            print('nnp-ab: ' + report['status'] + '; startup-only, production NOT changed; reload untested')
+            if reload_usr2:
+                print('nnp-ab: ' + report['status'] + '; production NOT changed; pidfd USR2: ' +
+                      controller.reload_report['status'] + '; unit wrapper untested')
+            else:
+                print('nnp-ab: ' + report['status'] + '; startup-only, production NOT changed; reload untested')
         if controller.directory is not None:
             if cap_matrix:
                 try:
