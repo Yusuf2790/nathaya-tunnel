@@ -41,6 +41,17 @@ get_width() {
     printf '%s' "$width"
 }
 
+# Kolom (mulai dari 1) untuk garis pemisah panel dashboard.
+dashboard_divider_column() {
+    local width="$1" column
+    column=$(( (width - 2) / 2 + 2 ))
+    # Pada tata letak bot satu baris, sisakan spasi dan 22 kolom di kanan.
+    if (( width >= 40 && column > width - 23 )); then
+        column=$((width - 23))
+    fi
+    printf '%s' "$column"
+}
+
 repeat_char() {
     local char="$1"
     local count="$2"

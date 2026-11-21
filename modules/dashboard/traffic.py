@@ -130,14 +130,16 @@ def period_rows(label, period, counters):
     return (f"{label} :", period, f"RX : {rx}", f"TX : {tx}")
 
 
-def print_periods(daily, monthly, width):
+def print_periods(daily, monthly, width, divider_column=None):
     separator = "  " + "─" * max(0, width - 2)
     for left, right in (
         (daily, monthly),
         (("Harian :",) + daily[1:], ("Bulanan :",) + monthly[1:]),
     ):
-        left_width = max(map(len, left))
-        if 2 + left_width + 3 + max(map(len, right)) <= width:
+        min_left_width = max(map(len, left))
+        # Dua spasi indentasi dan satu spasi sebelum pembatas.
+        left_width = min_left_width if divider_column is None else divider_column - 4
+        if min_left_width <= left_width and 2 + left_width + 3 + max(map(len, right)) <= width:
             for day_line, month_line in zip(left, right):
                 print(f"  {day_line:<{left_width}} │ {month_line}")
             print(separator)
@@ -150,7 +152,7 @@ def print_periods(daily, monthly, width):
         print(separator)
 
 
-def report(previous=None, width=None):
+def report(previous=None, width=None, divider_column=None):
     current = sample()
     state = load()
     totals = project(state, current)
@@ -162,7 +164,7 @@ def report(previous=None, width=None):
     daily = period_rows("Monitoring Harian", date_label, totals["day"][1] if state else None)
     monthly = period_rows("Monitoring Bulanan", MONTHS_ID[now.month - 1],
                           totals["month"][1] if state else None)
-    print_periods(daily, monthly, panel_width)
+    print_periods(daily, monthly, panel_width, divider_column)
 
     print("  Trafik Realtime :")
     if previous and previous["identity"] == current["identity"]:
@@ -198,6 +200,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", choices=("collect", "show", "live"))
     parser.add_argument("--width", type=int, help="Lebar panel trafik")
+    parser.add_argument("--divider-column", type=int, help="Kolom pemisah dashboard")
     args = parser.parse_args()
     mode = args.mode
     if mode == "collect":
@@ -209,7 +212,7 @@ def main():
     while True:
         if mode == "live":
             print("\033[H\033[JMONITORING TRAFIK")
-        previous = report(previous, args.width)
+        previous = report(previous, args.width, args.divider_column)
         if mode == "show":
             return
         print("\n  [z]  Kembali\n  [x]  Keluar\n  z/x: tekan Enter\n  Ctrl+C untuk kembali", flush=True)

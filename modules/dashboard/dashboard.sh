@@ -7,7 +7,7 @@ source "$NATHAYA_BASE/modules/common/functions.sh"
 
 draw_service_status() {
     local width="$1" index state badge_width bot_index
-    local left_width=$(( (width - 2) / 2 )) inline_bots=0
+    local divider_column inline_bots=0
     local -a names=(SSH XRAY DROPBEAR NGINX OPENVPN)
     local -a units=(ssh xray dropbear nginx openvpn)
     local -a bots=("Bot Akses VPS" "Bot Notifikasi")
@@ -15,9 +15,9 @@ draw_service_status() {
 
     # Sisakan ruang untuk nama dan lencana bot. Di panel sempit,
     # lencana bot tampil di bawah nama, tetap di kolom kanan.
+    divider_column=$(dashboard_divider_column "$width")
     if (( width >= 40 )); then
         inline_bots=1
-        (( left_width > width - 25 )) && left_width=$((width - 25))
     fi
 
     printf '\n'
@@ -28,7 +28,7 @@ draw_service_status() {
         [[ "$state" == ON ]] && badge_width=4
         printf ' %-8s ' "${names[index]}"
         status_badge "$state"
-        printf '%*s %b│%b' "$((left_width - 10 - badge_width))" '' "$CYAN" "$RESET"
+        printf '%*s │' "$((divider_column - 12 - badge_width))" ''
 
         if (( inline_bots )); then
             if (( index < ${#bots[@]} )); then

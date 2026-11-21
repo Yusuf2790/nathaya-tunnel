@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 
 draw_traffic_summary() {
-    local width="$1"
+    local width="$1" divider_column
+    divider_column=$(dashboard_divider_column "$width")
     draw_section_title "MONITORING TRAFIK" "$width"
-    if ! python3 "$NATHAYA_BASE/modules/dashboard/traffic.py" show --width "$width" 2>/dev/null; then
+    if ! python3 "$NATHAYA_BASE/modules/dashboard/traffic.py" show --width "$width" \
+        --divider-column "$divider_column" 2>/dev/null; then
         printf '  Data trafik tidak tersedia.\n'
     fi
     draw_box_bottom "$width"
