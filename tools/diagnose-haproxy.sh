@@ -2980,16 +2980,29 @@ class Controller:
                 raise KeyboardInterrupt
         return report
 
+    def cap_kill_startup_samples_valid(self, samples, phase):
+        complete_cohort_seen = False
+        for sample in samples:
+            master, workers = sample['master'], sample['workers']
+            if sample['other_haproxy'] or (master is not None and not self.ab_master_valid(master, phase)):
+                return False
+            if not workers:
+                # The gate can release before HAProxy execs or forks workers.
+                if complete_cohort_seen:
+                    return False
+                continue
+            if master is None or not all(self.ab_worker_valid(worker, False, phase) for worker in workers):
+                return False
+            complete_cohort_seen = True
+        return complete_cohort_seen
+
     def cap_kill_arm_valid(self, phase):
         """A timeout is a failed reload, not a pass; accept only proved live-old failure."""
         row = self.ab_report['arms'][phase]
         report = row['reload']
-        samples = row['proc_samples']
         if (row['startup'] != 'observed-running' or row['effective_NNP'] != 'no'
-                or not row['cleanup_confirmed'] or not samples
-                or not all(s['master'] is not None and s['workers'] and not s['other_haproxy']
-                    and self.ab_master_valid(s['master'], phase)
-                    and all(self.ab_worker_valid(w, False, phase) for w in s['workers']) for s in samples)
+                or not row['cleanup_confirmed']
+                or not self.cap_kill_startup_samples_valid(row['proc_samples'], phase)
                 or not report['signal_sent'] or not report['pidfd_binding_verified']
                 or not report['clients_closed'] or report['unit_cleanup']['confirmed'] is not True
                 or not report['coverage'] or not all(c['complete'] for c in report['coverage'])

@@ -6431,7 +6431,9 @@ class CapKillComparisonContracts(Offline):
             plan['release_time'] = 100.0
             return profile
         def observe(plan):
-            c.ab_identity(self.tasks(c, plan['phase']), {'MainPID': '101'}, plan['phase'])
+            rows = self.tasks(c, plan['phase'])
+            for captures in ([], rows[:1], rows):
+                c.ab_identity(captures, {'MainPID': '101'}, plan['phase'])
             return 'observed-running'
         def reload(plan):
             events.append('reload:' + plan['phase'])
@@ -6463,7 +6465,7 @@ class CapKillComparisonContracts(Offline):
         self.assertNotEqual(a['unit_cleanup']['old_exit_proof_status'], 'PROVEN-before-cleanup')
         self.assertTrue(all(c.ab_report['cap_kill_comparison']['valid_runs'].values()))
         self.assertTrue(c.ab_report['cap_kill_comparison']['proven'])
-        self.assertEqual(c.ab_report['actual_master_NNP'], {'A': [0], 'B': [0]})
+        self.assertEqual(c.ab_report['actual_master_NNP'], {'A': [0, 0], 'B': [0, 0]})
         self.assertTrue(c.ab_report['reload_usr2_tested'])
         self.assertFalse(c.ab_report['startup_candidate'])
         self.assertFalse(c.ab_report['confirmed_startup_difference'])
@@ -6473,6 +6475,27 @@ class CapKillComparisonContracts(Offline):
         self.assertFalse(b['unit_reload_wrapper_tested'])
         self.assertEqual((c.source, c.fragment, c.source_bytes, c.caps), before)
         self.assertFalse(c.intents)
+
+    def test_cap_kill_startup_requires_complete_cohort_and_valid_observed_credentials(self):
+        c, plans, _ = self.pair()
+        c.uid, c.gid = 200, 201
+        for plan in plans:
+            phase = plan['phase']
+            master, worker = (row['status'] for row in self.tasks(c, phase))
+            empty = dict(master=None, workers=[], other_haproxy=[])
+            master_only = dict(empty, master=master)
+            complete = dict(master_only, workers=[worker])
+            bad_master = dict(master_only, master=dict(master, CapEff=0))
+            bad_worker = dict(complete, workers=[dict(worker, CapEff=1 << 5)])
+            unexpected_process = dict(empty, other_haproxy=[worker])
+            worker_without_master = dict(empty, workers=[worker])
+            for invalid in ([], [empty, master_only], [empty, bad_master, complete],
+                            [bad_worker, complete], [unexpected_process, complete],
+                            [worker_without_master, complete], [master_only, complete, empty],
+                            [complete, master_only, complete]):
+                with self.subTest(phase=phase, samples=invalid):
+                    self.assertFalse(c.cap_kill_startup_samples_valid(invalid, phase))
+            self.assertTrue(c.cap_kill_startup_samples_valid([empty, master_only, complete], phase))
 
     def test_scheduler_cleanup_or_unproved_a_stops_b_and_b_final_failure_is_exit2(self):
         for clean, late in ((False, False), (True, True)):
