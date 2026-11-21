@@ -377,3 +377,28 @@ python3 -I -B tests/diagnose_haproxy_test.py
 Runtime opsional **hanya operator root staging Ubuntu24.04 amd64/systemd PID1 setelah review dan tes offline aktual**, bukan Acode/produksi: `bash tools/diagnose-haproxy.sh --nnp-ab --reload-usr2`. Belum dijalankan; bukan uji wrapper ExecReload deployed.
 
 Referensi primer lama dipertahankan, **tanpa network baru**, semantik bukan bukti VPS: https://docs.haproxy.org/2.8/configuration.html#8.2.6 ; https://docs.python.org/3.12/library/os.html#os.pidfd_open ; https://docs.python.org/3.12/library/signal.html#signal.pidfd_send_signal ; https://docs.python.org/3.12/library/signal.html#signal.setitimer ; https://docs.python.org/3.12/library/signal.html#signal.pthread_sigmask ; https://docs.kernel.org/userspace-api/no_new_privs.html .
+
+## 24 — CHECKPOINT24: pembanding CAP_KILL opt-in, bukan perubahan produksi
+
+- User-reported staging context terbaru: masterUID0/workerUID109, `cap_kill_present=false`; USR2 delivered, new worker TLS200, continuity dan semua client close terbukti, tetapi old worker masih hidup sesudah drain5s. Agen tidak membaca dump privat atau menjalankan probe; ini bukan diagnosis sebab CAP_KILL.
+- User menyetujui kontrak **`--nnp-ab --reload-usr2 --compare-cap-kill`**: tepat dua run NNP=no, A=`cap-kill-a` dengan source CAPS3, B=`cap-kill-b` dengan hanya tambahan CAP_KILL. Source CAPS4 ditolak sebelum assets/unit pembanding. Mode NNP=yes/no lama tetap; source baseline immutable, waiver directed CAPS3→CAPS4 hanya pada registered source→B / A→B, bukan production drift atau same-arm live drift.
+- Engine reload yang sama, aset/config/TLS/marker/endpoints dibangun sekali, timeout per-run tetap24/release29, stages5/5/2/5/4, runtime30/config15/network2. B memverifikasi master actual Bnd=Prm=Eff0x4e0, root I=A0/NNP0; A0x4c0. Workers nonroot I=P=E=A0 dan bounding sesuai arm, NNP0/1 boleh. Satu master pidfd USR2 per run; **tidak menambah SIGUSR1/manual signal ke worker**.
+- Syarat PASS tiap reload tidak berubah: baseline, new-worker TLS200, continuity old connection, semua clients closed → old pidfd POLLIN dalam drain5s/sebelum cleanup → fresh final TLS200 dan final source/cohort. A valid bila lulus atau membuktikan semua old worker masih hidup saat deadline setelah continuity; outcome gagal A tetap gagal. Evidence A lain incomplete/unknown atau cleanup A unconfirmed menghentikan B. B hanya mulai setelah cleanup A dan reservasi endpoint yang sama berhasil.
+- Canonical `nnp-ab.report.json:arms.cap-kill-a.reload.unit_cleanup` / `arms.cap-kill-b.reload.unit_cleanup` menyimpan cleanup masing-masing; phase snapshot `pre-unit-cleanup` tidak diganti bukti graceful exit. `master_cap_kill_effective`/`source_to_startup_delta` mencatat proof aktual Afalse/[] dan Btrue/[CAP_KILL], bukan bounding request saja. Top-level reload alias arm terakhir, kedua arm wajib dibaca. `cap_kill_comparison` menyimpan valid_runs/inventory/proven/finding terpisah dari startup candidate.
+- Exit0 hanya untuk dua run valid, B seluruh reload PASS, exact inventory delta dan seluruh unit/TLS cleanup confirmed. A gagal-drain yang valid tidak diubah menjadi PASS. B gagal/invalid/cleanup unconfirmed2; interupsi130. `complete=false`, `production_applied=false`, `startup_candidate=false`, wrapper untested. CAP_KILL memperluas otorisasi signal master; tetap eksperimen staging, bukan fix produksi atau causal proof.
+- Ditambahkan fixture `CapKillComparisonContracts`, termasuk B real engine dengan mocks, strict caps/plan/scope, scheduler cleanup ordering, timeout/final TLS failure dan final cleanup/interruption. Review lanjutan mempertahankan worker self-set NNP1, flag tested walau comparison gagal, metadata efektif dalam snapshot, dan alias A saat B belum dimulai. Tes **WRITTEN, belum dieksekusi**; hitungan fixture bukan PASS.
+- Scope hanya probe, tes, docs. Patch lokal checkpoint23 dipertahankan; tidak reset/Undo, commit atau push. Review independen dan pemeriksaan tekstual JavaScript pada keempat buffer selesai: **203 metode total = 194 checkpoint23 + 9 CapKillComparisonContracts**, tanpa trailing whitespace/marker konflik atau field timeout lama; footer source/fixture utuh. Ini **bukan syntax check atau PASS tes**. Fixture sukses kini memodelkan exit strictly sesudah client close; comparison juga mensyaratkan canonical old-exit proof sebelum cleanup untuk arm yang passed. Pemilihan arm baru mengembalikan `reload_required=true` sampai arm itu diverifikasi. Storage content masih tanpa shell exec: Git status/diff/check, bash-n dan Python tests **belum dijalankan**. Tidak mengklaim tree bersih, parser/syntax PASS atau staging sukses.
+
+Validasi berikut dari checkout yang dapat diakses shell, sebelum operator root staging menjalankan opt-in:
+
+```sh
+git status --short
+git diff HEAD
+git diff --check
+bash -n tools/diagnose-haproxy.sh
+python3 -I -B tests/diagnose_haproxy_test.py OptionalReloadContracts CapKillComparisonContracts
+python3 -I -B tests/diagnose_haproxy_test.py Pure2ArmReport HostBoundaryRegressions
+python3 -I -B tests/diagnose_haproxy_test.py
+```
+
+Di staging, bandingkan effective master/zero worker caps dan kedua outcome reload/cleanup canonical; pastikan drain setelah clients close, exit lama sebelum cleanup, final TLS200 wajib, cleanup tidak backfill proof. Tidak ada izin menjalankan probe nyata di Acode atau mengubah unit produksi.

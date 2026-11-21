@@ -4,8 +4,10 @@ nathaya_diagnose_haproxy_main() {
     case "$#:${1-}:${2-}" in
         1:--help:)
             builtin printf '%s\n' \
-                'Usage: bash tools/diagnose-haproxy.sh --help | --run | --cap-boundaries | --cap-matrix | --nnp-ab [--reload-usr2]' \
-                '--nnp-ab runs ONLY two isolated TLS-config startup arms: NNP=yes then no.' \
+                'Usage: bash tools/diagnose-haproxy.sh --help | --run | --cap-boundaries | --cap-matrix | --nnp-ab [--reload-usr2 [--compare-cap-kill]]' \
+                '--compare-cap-kill requires --nnp-ab --reload-usr2: NNP=no in both arms,' \
+                'A=source CAPS3, B=CAPS3 plus only CAP_KILL; source CAP_KILL refuses.' \
+                '--nnp-ab without comparison runs startup arms NNP=yes then no.' \
                 '--nnp-ab --reload-usr2 optionally proves USR2 on the existing B arm before cleanup.' \
                 'The option adds a fixed private HTTP responder to BOTH arms; no production change.' \
                 'Without that option: no handshake/health, tracing or USR2/reload proof.' \
@@ -20,7 +22,8 @@ nathaya_diagnose_haproxy_main() {
             return 0
             ;;
         1:--run:|1:--cap-boundaries:|1:--cap-matrix:|1:--nnp-ab:|2:--nnp-ab:--reload-usr2) ;;
-        *) builtin printf '%s\n' 'Usage: bash tools/diagnose-haproxy.sh --help | --run | --cap-boundaries | --cap-matrix | --nnp-ab [--reload-usr2]' >&2; return 64 ;;
+        3:--nnp-ab:--reload-usr2) [[ "$3" == --compare-cap-kill ]] || return 64 ;;
+        *) builtin printf '%s\n' 'Usage: bash tools/diagnose-haproxy.sh --help | --run | --cap-boundaries | --cap-matrix | --nnp-ab [--reload-usr2 [--compare-cap-kill]]' >&2; return 64 ;;
     esac
     exec /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C \
         /usr/bin/python3 -I -B - "$@" <<'NATHAYA_HAPROXY_DIAG_PY'
@@ -35,7 +38,7 @@ Pure public interfaces:
   Controller.audit_compatibility(...) -> private aggregate dict (pure, no IO)
   make_config(port, abstract_name) -> str (legacy NO_TLS)
   make_ab_config(port, abstract_name, private_pem, reload_http=False, marker=None) -> str
-  nnp_ab_plan(directory, nonce, caps, phase, reload_usr2=False) -> closed A/B plan
+  nnp_ab_plan(directory, nonce, caps, phase, reload_usr2=False, compare_cap_kill=False) -> closed A/B plan
   Controller.validate_nnp_ab(probe, plan) -> None (pure exact-plan proof)
   Controller.compare_nnp_ab(a, b, a_plan, b_plan) -> private raw inventory
   Controller.run_nnp_ab(reload_usr2=False) -> diagnostic exit code; nnp-ab.report.json
@@ -91,6 +94,9 @@ SYSCALLS = (
 )
 IDENTITY_CALLS = frozenset(('getuid', 'geteuid', 'getresuid', 'setuid',
                             'setreuid', 'setresuid', 'setfsuid'))
+NNP_PHASES = ('nnp-yes', 'nnp-no')
+CAP_KILL_PHASES = ('cap-kill-a', 'cap-kill-b')
+AB_PHASES = NNP_PHASES + CAP_KILL_PHASES
 RELOAD_OVERALL_SECONDS = 24.0
 RELOAD_RELEASE_LIMIT_SECONDS = 29.0
 RELOAD_STAGES = (('preparation', 5.0), ('new_worker', 5.0), ('continuity', 2.0),
@@ -652,9 +658,12 @@ def _reload_response(sock, io, marker):
     return {'status': 200, 'pid': int(match[1]), 'body_bytes': size, 'marker_verified': True}
 
 
-def nnp_ab_plan(directory, nonce, caps, phase, reload_usr2=False):
-    """Closed two-arm plan; all non-NNP security properties are identical."""
-    if (type(reload_usr2) is not bool or phase not in ('nnp-yes', 'nnp-no') or not isinstance(nonce, str)
+def nnp_ab_plan(directory, nonce, caps, phase, reload_usr2=False, compare_cap_kill=False):
+    """Closed plans selected by trusted mode, never caller-supplied properties."""
+    if (type(compare_cap_kill) is not bool or type(reload_usr2) is not bool
+            or (compare_cap_kill and (not reload_usr2 or caps != CAPS3))
+            or phase not in (CAP_KILL_PHASES if compare_cap_kill else NNP_PHASES)
+            or not isinstance(nonce, str)
             or not re.fullmatch(r'[0-9a-f]{32}', nonce) or not re.fullmatch(
                 r'/run/nathaya-haproxy-probe\.[A-Za-z0-9_-]+', str(directory))):
         raise Unsupported('ab-plan')
@@ -663,7 +672,8 @@ def nnp_ab_plan(directory, nonce, caps, phase, reload_usr2=False):
     argv = [HAPROXY, '-W', '-db', '-f', str(directory / 'nnp-ab/haproxy.cfg')]
     pre = ['/usr/bin/python3', '-I', '-B', str(directory / 'gate.py'), str(go)]
     unit = 'nathaya-haproxy-probe-' + nonce + '-' + phase + '.service'
-    properties = {**restriction_properties(caps),
+    arm_caps = CAPS4 if compare_cap_kill and phase == CAP_KILL_PHASES[1] else caps
+    properties = {**restriction_properties(arm_caps),
                   'NoNewPrivileges': 'yes' if phase == 'nnp-yes' else 'no',
                   'Description': 'Nathaya HAProxy probe ' + nonce + ' ' + phase,
                   'ExecStartPre': ' '.join(pre),
@@ -681,6 +691,18 @@ def _allow_nnp_ab_delta(inventory):
                 and row['source'] == 'yes' and row['probe'] == 'no'):
             row.update(unsupported=False, classification='validated-nnp-ab-delta',
                        reason='closed-startup-AB-only-NNP-yes-to-no')
+    inventory['unsupported'] = [r['property'] for r in inventory['properties'] if r['unsupported']]
+    inventory['mismatches'] = [r for r in inventory['properties'] if r['unsupported']]
+
+
+def _allow_cap_kill_delta(inventory):
+    # ONLY called after closed, registered source->B or A->B context proofs.
+    for row in inventory['properties']:
+        if (row['property'] == 'CapabilityBoundingSet' and row['source_present']
+                and row['probe_present'] and _capset(row['source']) == CAPS3
+                and _capset(row['probe']) == CAPS4):
+            row.update(unsupported=False, classification='validated-cap-kill-ab-delta',
+                       reason='closed-directed-CAPS3-to-CAPS4-only')
     inventory['unsupported'] = [r['property'] for r in inventory['properties'] if r['unsupported']]
     inventory['mismatches'] = [r for r in inventory['properties'] if r['unsupported']]
 
@@ -738,7 +760,7 @@ def owned_unit(properties, unit, nonce):
     if (not isinstance(properties, dict) or not isinstance(unit, str) or
             not isinstance(nonce, str) or not re.fullmatch(r'[0-9a-f]{32}', nonce)):
         return False
-    match = re.fullmatch(r'nathaya-haproxy-probe-' + nonce + r'-(plain|trace|cap-gated|cap-direct|nnp-yes|nnp-no|mx(?:0[0-9]|1[0-9]|2[0-7]))\.service', unit)
+    match = re.fullmatch(r'nathaya-haproxy-probe-' + nonce + r'-(plain|trace|cap-gated|cap-direct|nnp-yes|nnp-no|cap-kill-a|cap-kill-b|mx(?:0[0-9]|1[0-9]|2[0-7]))\.service', unit)
     if not match:
         return False
     expected = {
@@ -873,7 +895,7 @@ def _capture_unit(unit, nonce):
     return (isinstance(unit, str) and isinstance(nonce, str) and
             re.fullmatch(r'[0-9a-f]{32}', nonce) is not None and
             re.fullmatch(r'nathaya-haproxy-probe-' + nonce +
-                         r'-(plain|trace|cap-gated|cap-direct|nnp-yes|nnp-no|mx(?:0[0-9]|1[0-9]|2[0-7]))\.service', unit) is not None)
+                         r'-(plain|trace|cap-gated|cap-direct|nnp-yes|nnp-no|cap-kill-a|cap-kill-b|mx(?:0[0-9]|1[0-9]|2[0-7]))\.service', unit) is not None)
 
 
 def _proc_identity(raw):
@@ -1165,6 +1187,7 @@ class Controller:
         self.ab_report = {'status': 'NOTSTARTED', 'complete': False, 'production_applied': False,
                           'reload_usr2_tested': False, 'reload_required': True,
                           'proc_identity': 'unavailable', 'arms': {}}
+        self.compare_cap_kill = False
         self.reload_report = reload_report(False)
         self.reload_capture_complete = False
         self.ab_assets = None
@@ -1215,7 +1238,7 @@ class Controller:
         return code, out, err
 
     def show(self, unit, absent=False, timeout=3):
-        if unit != MAIN and not re.fullmatch(r'nathaya-haproxy-probe-' + self.nonce + r'-(?:plain|trace|cap-gated|cap-direct|nnp-yes|nnp-no|mx(?:0[0-9]|1[0-9]|2[0-7]))\.service', unit):
+        if unit != MAIN and not re.fullmatch(r'nathaya-haproxy-probe-' + self.nonce + r'-(?:plain|trace|cap-gated|cap-direct|nnp-yes|nnp-no|cap-kill-a|cap-kill-b|mx(?:0[0-9]|1[0-9]|2[0-7]))\.service', unit):
             raise Unsupported('unit-name')
         code, out, _ = self.command(['/usr/bin/systemctl', 'show', '--all', '--no-pager', unit], timeout=timeout)
         if len(out) > SHOW_LIMIT:
@@ -1488,13 +1511,28 @@ class Controller:
         while self.reservations:
             self.reservations.pop().close()
 
+    def ab_phases(self):
+        return CAP_KILL_PHASES if self.compare_cap_kill else NNP_PHASES
+
+    def ab_caps(self, phase):
+        if phase not in self.ab_phases():
+            raise Unsupported('ab-phase')
+        if self.compare_cap_kill and self.caps != CAPS3:
+            raise Unsupported('cap-kill-already-in-source')
+        return CAPS4 if self.compare_cap_kill and phase == CAP_KILL_PHASES[1] else self.caps
+
+    def reload_phase(self, phase):
+        return self.reload_report['requested'] and (
+            phase in CAP_KILL_PHASES if self.compare_cap_kill else phase == 'nnp-no')
+
     def factory(self, phase):
-        if phase in ('nnp-yes', 'nnp-no'):
+        if phase in self.ab_phases():
             self.verify_ab_assets()
             (self.directory / phase).mkdir(mode=0o700)
             self.save(phase + '/combined.log', b'')
             plan = nnp_ab_plan(self.directory, self.nonce, self.caps, phase,
-                               reload_usr2=self.reload_report['requested'])
+                               reload_usr2=self.reload_report['requested'],
+                               compare_cap_kill=self.compare_cap_kill)
             self.ab_plans[phase] = plan
             return plan
         if phase not in ('plain', 'trace'):
@@ -1527,7 +1565,7 @@ class Controller:
         # Never borrow the production destination, even if File metadata exists.
         phase = plan.get('phase')
         directory = str(self.directory)
-        if ((phase not in ('plain', 'trace', 'cap-gated', 'cap-direct', 'nnp-yes', 'nnp-no') and
+        if ((phase not in ('plain', 'trace', 'cap-gated', 'cap-direct', 'nnp-yes', 'nnp-no', 'cap-kill-a', 'cap-kill-b') and
              not (isinstance(phase, str) and re.fullmatch(r'mx(?:0[0-9]|1[0-9]|2[0-7])', phase))) or not isinstance(self.directory, Path) or not re.fullmatch(
                 r'/run/nathaya-haproxy-probe\.[A-Za-z0-9_-]+', directory)):
             raise Unsupported('probe-output-plan')
@@ -1655,7 +1693,9 @@ class Controller:
                     or expected['properties']['RuntimeMaxSec'] != '30s'
                     or expected_nnp != expected['properties']['NoNewPrivileges']):
                 raise Unsupported('ab-runtime-scope')
-        if expected_nnp != 'yes' and not (expected_nnp == 'no' and plan.get('phase') == 'nnp-no'):
+        if expected_nnp != 'yes' and not (expected_nnp == 'no' and (
+                plan.get('phase') == 'nnp-no' or
+                self.compare_cap_kill and plan.get('phase') in CAP_KILL_PHASES)):
             raise Unsupported('ab-policy-scope')
         errors = []
         unit = plan.get('unit')
@@ -1732,7 +1772,8 @@ class Controller:
         if not isinstance(plan, dict):
             raise Unsupported('ab-plan')
         expected = nnp_ab_plan(self.directory, self.nonce, self.caps, plan.get('phase'),
-                               reload_usr2=self.reload_report['requested'])
+                               reload_usr2=self.reload_report['requested'],
+                               compare_cap_kill=self.compare_cap_kill)
         if (set(plan) - {'created_at', 'release_time'} != set(expected) or
                 any(plan.get(k) != v for k, v in expected.items()) or
                 ('created_at' in plan and (type(plan['created_at']) not in (int, float)
@@ -1752,7 +1793,7 @@ class Controller:
         collect_unsupported(errors, self._validate_probe_policy, probe, plan,
                             expected_nnp=expected['properties']['NoNewPrivileges'],
                             expected_runtime=expected['properties']['RuntimeMaxSec'])
-        if _capset(probe.get('CapabilityBoundingSet')) != self.caps:
+        if _capset(probe.get('CapabilityBoundingSet')) != self.ab_caps(plan['phase']):
             errors.append('ab-bounding')
         _require(probe, {'RestartUSec': '3s'})
         collect_unsupported(errors, self.validate_probe_logging, probe, plan)
@@ -1767,14 +1808,20 @@ class Controller:
 
     def compare_nnp_ab(self, a, b, a_plan, b_plan):
         """Pure independent A/B proofs plus strict raw inventory; no mount waiver."""
-        if a_plan.get('phase') != 'nnp-yes' or b_plan.get('phase') != 'nnp-no':
+        a_phase, b_phase = self.ab_phases()
+        if a_plan.get('phase') != a_phase or b_plan.get('phase') != b_phase:
             raise Unsupported('ab-comparison-roles')
         self.validate_nnp_ab(a, a_plan)
         self.validate_nnp_ab(b, b_plan)
         result = _comparison_inventory(a, b,
             empty_source=self.empty_probe_exec_fields(a, a_plan),
             empty_probe=self.empty_probe_exec_fields(b, b_plan))
-        _allow_nnp_ab_delta(result)
+        if self.compare_cap_kill:
+            if any(self.ab_plans.get(p['phase']) != p for p in (a_plan, b_plan)):
+                raise Unsupported('ab-plan-not-registered')
+            _allow_cap_kill_delta(result)
+        else:
+            _allow_nnp_ab_delta(result)
         result['issues'] = list(result['unsupported'])
         result['ok'] = not result['issues']
         result['nuisance_differences'] = ['Description', 'ExecStartPre', 'private append log destination']
@@ -1793,7 +1840,7 @@ class Controller:
         No IO, execution, repairs, guessed hooks, or exception-based equivalence.
         """
         control = isinstance(plan, dict) and plan.get('phase') in ('cap-gated', 'cap-direct')
-        ab = isinstance(plan, dict) and plan.get('phase') in ('nnp-yes', 'nnp-no')
+        ab = isinstance(plan, dict) and plan.get('phase') in AB_PHASES
         validator = self.validate_nnp_ab if ab else self.validate_control if control else self.validate_probe
         empty_fields = self.control_empty_exec_fields if control else self.empty_probe_exec_fields
         validation = {'source': [], 'probe': [], 'original': []}
@@ -1834,12 +1881,15 @@ class Controller:
             profile['raw_fragment_changed'] = (original_bytes != current_bytes
                                               if original_bytes is not None and current_bytes is not None else None)
             profile['changed'] = bool(profile['unsupported'] or profile['raw_fragment_changed'])
-        if (ab and plan['phase'] == 'nnp-no' and not probe_source and pair
+        if (ab and plan['phase'] in ('nnp-no', 'cap-kill-a', 'cap-kill-b') and not probe_source and pair
                 and not any(validation.values()) and not inspection_errors
                 and not (profile is not None and profile['changed'])
                 and not (original_bytes is not None and current_bytes is not None
                          and original_bytes != current_bytes)):
             _allow_nnp_ab_delta(result)
+            if (self.compare_cap_kill and plan['phase'] == CAP_KILL_PHASES[1]
+                    and self.ab_plans.get(plan['phase']) == plan and source_caps == CAPS3):
+                _allow_cap_kill_delta(result)
         validation = {key: sorted(set(values)) for key, values in validation.items()}
         issues = list(inspection_errors)
         for values in validation.values():
@@ -1944,11 +1994,12 @@ class Controller:
         self.record(plan['phase'] + '/live-comparison.json', live_audit)
         _raise_unsupported(live_audit['issues'])
         release_errors = []
-        if plan['phase'] in ('nnp-yes', 'nnp-no'):
+        if plan['phase'] in self.ab_phases():
             self.verify_ab_assets()
-            if plan['phase'] == 'nnp-no':
-                cross = self.compare_nnp_ab(self.ab_profiles['nnp-yes'], live,
-                                           self.ab_plans['nnp-yes'], plan)
+            if plan['phase'] == self.ab_phases()[1]:
+                a_phase = self.ab_phases()[0]
+                cross = self.compare_nnp_ab(self.ab_profiles[a_phase], live,
+                                           self.ab_plans[a_phase], plan)
                 self.record('nnp-ab/comparison.json', cross)
                 _raise_unsupported(cross['issues'])
         if time.monotonic() >= deadline:
@@ -1959,13 +2010,13 @@ class Controller:
             'purpose': 'last refusal check before atomic go creation',
         })
         _raise_unsupported(release_errors)
-        if plan['phase'] in ('nnp-yes', 'nnp-no'):
+        if plan['phase'] in self.ab_phases():
             self.verify_ab_assets()
             if time.monotonic() >= deadline:
                 raise Unsupported('prestart-deadline')
         self.release_reservations()
         self.save(plan['phase'] + '/' + plan['go'].name, b'')
-        if plan['phase'] in ('nnp-yes', 'nnp-no') and self.reload_report['requested']:
+        if plan['phase'] in self.ab_phases() and self.reload_report['requested']:
             plan['release_time'] = time.monotonic()
             self.record(plan['phase'] + '/release-time.json', {'release_time': plan['release_time']})
         return live
@@ -2133,23 +2184,22 @@ class Controller:
         return (master['Pid'], tuple(sorted(p['Pid'] for p in workers)))
 
     def ab_master_valid(self, master, phase, *, failed_arm=False):
-        if phase not in ('nnp-yes', 'nnp-no'):
-            raise Unsupported('ab-phase')
-        mask = sum(1 << CAP_BITS[c] for c in self.caps)
+        mask = sum(1 << CAP_BITS[c] for c in self.ab_caps(phase))
         allowed = (mask, mask & ~0x80) if failed_arm and phase == 'nnp-yes' else (mask,)
         return bool(master is not None and master['Uid'] == (0,) * 4 and master['Gid'] == (0,) * 4
                     and master['NoNewPrivs'] == int(phase == 'nnp-yes')
                     and master['CapInh'] == 0 and master['CapAmb'] == 0 and master['CapBnd'] == mask
                     and master['CapEff'] == master['CapPrm'] and master['CapEff'] in allowed)
 
-    def ab_worker_valid(self, worker, nnp):
-        mask = sum(1 << CAP_BITS[c] for c in self.caps)
+    def ab_worker_valid(self, worker, nnp, phase=None):
+        caps = self.ab_caps(phase) if phase is not None else self.caps
+        mask = sum(1 << CAP_BITS[c] for c in caps)
         return (worker['Uid'] == (self.uid,) * 4 and worker['Gid'] == (self.gid,) * 4
                 and all(g == self.gid for g in worker['Groups'])
                 and not any(worker[k] for k in ('CapInh', 'CapPrm', 'CapEff', 'CapAmb'))
                 and worker['CapBnd'] == mask and worker['NoNewPrivs'] in ((1,) if nnp else (0, 1)))
 
-    def reload_cohort(self, captures, properties):
+    def reload_cohort(self, captures, properties, phase='nnp-no'):
         """Separate checker: never appends reload transitions to startup proc_samples."""
         masters = [r for r in captures if str(r['status']['Pid']) == properties.get('MainPID')]
         if (not self.reload_capture_complete or len(masters) != 1
@@ -2157,9 +2207,9 @@ class Controller:
             raise Unsupported('reload-incomplete-cohort')
         master = masters[0]
         workers = [r for r in captures if r is not master]
-        if (not self.ab_master_valid(master['status'], 'nnp-no') or not workers
+        if (not self.ab_master_valid(master['status'], phase) or not workers
                 or any(r['status']['PPid'] != master['status']['Pid']
-                       or not self.ab_worker_valid(r['status'], False) for r in workers)):
+                       or not self.ab_worker_valid(r['status'], False, phase) for r in workers)):
             raise Unsupported('reload-cohort-credentials')
         return master, workers
 
@@ -2175,19 +2225,19 @@ class Controller:
             'other_haproxy': [s for s in haproxy if s is not master and s not in workers]})
         observed = [s['master']['NoNewPrivs'] for s in self.ab_report['arms'][phase]['proc_samples']
                     if s['master'] is not None]
-        self.ab_report['actual_master_NNP']['A' if phase == 'nnp-yes' else 'B'] = observed or 'unavailable'
-        mask, nnp = sum(1 << CAP_BITS[c] for c in self.caps), int(phase == 'nnp-yes')
+        self.ab_report['actual_master_NNP']['A' if phase == self.ab_phases()[0] else 'B'] = observed or 'unavailable'
+        nnp = int(phase == 'nnp-yes')
         if (not self.ab_master_valid(master, phase) or not workers or len(workers) + 1 != len(haproxy)):
             return None
         for worker in workers:
-            if not self.ab_worker_valid(worker, nnp):
+            if not self.ab_worker_valid(worker, nnp, phase):
                 return None
         # Credentials as well as PID identity must remain stable for two seconds.
         return tuple(tuple((k, s[k]) for k in sorted(s)) for s in
                      [master] + sorted(workers, key=lambda s: s['Pid']))
 
     def observe(self, plan):
-        ab = plan['phase'] in ('nnp-yes', 'nnp-no')
+        ab = plan['phase'] in self.ab_phases()
         start, stable_since, previous, count = time.monotonic(), None, None, 0
         before = self.show(plan['unit'])
         self.record(plan['phase'] + '/before.show.json', before)
@@ -2239,9 +2289,16 @@ class Controller:
         return result
 
     def _reload_unit_cleanup(self, unit, kind, info, confirmed=None, interrupted=False):
-        """Private temporal evidence for registered opt-in B only, NEVER exit proof."""
-        report = self.reload_report
-        plan = self.ab_plans.get('nnp-no')
+        """Canonical registered-arm cleanup evidence, NEVER graceful exit proof."""
+        phase = next((p for p in self.ab_phases()
+                      if self.ab_plans.get(p, {}).get('unit') == unit), None)
+        report = (self.ab_report['arms'].get(phase, {}).get('reload')
+                  if self.compare_cap_kill else self.reload_report)
+        if report is None:
+            return
+        if not self.compare_cap_kill and phase != 'nnp-no':
+            return
+        plan = self.ab_plans.get(phase)
         if (report['requested'] is not True or not isinstance(plan, dict)
                 or unit not in self.intents or unit != plan.get('unit')):
             return
@@ -2256,7 +2313,7 @@ class Controller:
         if not owned and not (kind == 'finished' and
                 (cleanup['requested_at'] is not None or
                  info.get('LoadState') == 'not-found' and
-                 owned_unit(self.ab_profiles.get('nnp-no', {}), unit, self.nonce))):
+                 owned_unit(self.ab_profiles.get(phase, {}), unit, self.nonce))):
             return
         now = time.monotonic()
         if cleanup['requested_at'] is None:
@@ -2279,6 +2336,8 @@ class Controller:
                         elapsed_after_release=now - report['release_time']
                             if type(report['release_time']) is float else None))
         elif kind == 'finished':
+            if self.compare_cap_kill:
+                report['snapshot_phase'] = 'post-unit-cleanup'
             cleanup.update(finished_at=now, confirmed=confirmed,
                 outcome='interrupted-unconfirmed' if interrupted else
                         'unit-stop-confirmed' if confirmed and cleanup['old_exit_verified_before_cleanup'] else
@@ -2350,7 +2409,7 @@ class Controller:
         self.intents.append(plan['unit'])
         self.record(phase + '/intent.json', {'unit': plan['unit'], 'nonce': self.nonce,
                                            'command': plan['command']})
-        if phase in ('nnp-yes', 'nnp-no'):
+        if phase in self.ab_phases():
             self.verify_ab_assets()
         plan['created_at'] = time.monotonic()
         code, _, _ = self.command(plan['command'])
@@ -2358,19 +2417,19 @@ class Controller:
             raise Unsupported('transient-create-unavailable')
         self.creation_confirmed.add(plan['unit'])
         profile = self.gate(plan)
-        if phase in ('nnp-yes', 'nnp-no'):
+        if phase in self.ab_phases():
             self.ab_profiles[phase] = profile
             self.ab_report['arms'][phase]['effective_NNP'] = profile['NoNewPrivileges']
             self.ab_report['arms'][phase]['gate_boundaries'] = self.read_boundaries(plan)
-            if phase == 'nnp-no' and self.reload_report['requested']:
+            if self.reload_phase(phase):
                 caps = _capset(profile['CapabilityBoundingSet'])
                 self.reload_report.update(startup_caps=sorted(caps),
                                           startup_mask=sum(1 << CAP_BITS[c] for c in caps))
         result = self.observe(plan)
-        if phase in ('nnp-yes', 'nnp-no'):
+        if phase in self.ab_phases():
             self.ab_report['arms'][phase]['startup'] = result
         self.record(phase + '/startup.json', {'status': result})
-        if phase == 'nnp-no' and self.reload_report['requested']:
+        if self.reload_phase(phase):
             if result == 'observed-running':
                 self.reload_usr2(plan)
             else:
@@ -2393,13 +2452,17 @@ class Controller:
         return result, None
 
     def reload_usr2(self, plan):
-        """One signal, existing verified B only; all client/pidfds close before cleanup."""
+        """One master USR2 per registered arm; clients/pidfds close before cleanup."""
         report, clients, pidfds = self.reload_report, [], []
         entry = time.monotonic()
         report.update(status='in-progress', release_time=plan.get('release_time'), entry_at=entry)
         overall = entry + RELOAD_OVERALL_SECONDS
         deadline, network_end = overall, float('inf')
-        base, count = 'nnp-no/reload', 0
+        phase = plan['phase']
+        base, count = phase + '/reload', 0
+        if self.compare_cap_kill:
+            report['cleanup_evidence'] = ('nnp-ab.report.json:arms.' + phase +
+                '.reload.unit_cleanup (canonical after unit cleanup)')
         master_before, old = None, []
         previous_alarm_handler = None
         alarm_handler_installed, alarm_timer_owned, in_cleanup = False, False, False
@@ -2554,7 +2617,7 @@ class Controller:
                 left()
             self.validate_nnp_ab(live, plan)
             _require(live, {'ActiveState': 'active', 'SubState': 'running'})
-            audit = self.audit_compatibility(self.ab_profiles['nnp-no'], live, plan=plan, probe_source=True)
+            audit = self.audit_compatibility(self.ab_profiles[phase], live, plan=plan, probe_source=True)
             self.record(stem + '.unit.json', audit)
             _raise_unsupported(audit['issues'])
             self.reload_capture_complete = False
@@ -2564,7 +2627,7 @@ class Controller:
             finally:
                 left()
             report['coverage'].append({'artifact': stem + '.json', 'complete': self.reload_capture_complete})
-            master, workers = self.reload_cohort(captures, live)
+            master, workers = self.reload_cohort(captures, live, phase)
             if master_before is not None and (master['identity'] != master_before['identity']
                                               or closed(pidfds[0])):
                 raise Unsupported('reload-master-identity-or-liveness')
@@ -2643,8 +2706,8 @@ class Controller:
             deadline = overall
             report.update(deadline=overall, overall_deadline=overall)
             start_stage('preparation', entry)
-            if (plan['phase'] != 'nnp-no' or self.ab_plans.get('nnp-no') is not plan
-                    or self.ab_report['arms']['nnp-no']['startup'] != 'observed-running'
+            if (not self.reload_phase(phase) or self.ab_plans.get(phase) is not plan
+                    or self.ab_report['arms'][phase]['startup'] != 'observed-running'
                     or not report['requested']):
                 raise Unsupported('reload-B-startup-unverified')
             if not hasattr(os, 'pidfd_open') or not hasattr(signal, 'pidfd_send_signal'):
@@ -2693,7 +2756,7 @@ class Controller:
                              'hostname_check_required': context.check_hostname}
             master, old = snapshot('before', source=True)
             report.update(before_master=master, old_cohort=old,
-                source_caps=sorted(self.caps), startup_caps=sorted(_capset(self.ab_profiles['nnp-no']['CapabilityBoundingSet'])),
+                source_caps=sorted(self.caps), startup_caps=sorted(_capset(self.ab_profiles[phase]['CapabilityBoundingSet'])),
                 source_mask=sum(1 << CAP_BITS[c] for c in self.caps),
                 startup_mask=master['status']['CapBnd'], reload_mask=master['status']['CapBnd'],
                 reload_caps_observation='verified-before-signal',
@@ -2701,9 +2764,14 @@ class Controller:
                 cap_kill_present=bool(master['status']['CapBnd'] & (1 << CAP_BITS['CAP_KILL'])),
                 effective_NNP={'unit': 'no', 'master': master['status']['NoNewPrivs'],
                                'workers': [r['status']['NoNewPrivs'] for r in old]})
-            report['cap_kill_note'] = ('already in source/startup profile; no difference' if report['cap_kill_present'] else
+            report['cap_kill_note'] = ('probe B only; CAP_KILL effective/permitted verified'
+                if self.compare_cap_kill and phase == CAP_KILL_PHASES[1] else
+                'already in source/startup profile; no difference' if report['cap_kill_present'] else
                                       'absent in observed profile; failure possible, not an automatic causal diagnosis')
             report['capability_delta'] = sorted(set(report['startup_caps']) ^ set(report['reload_caps']))
+            if self.compare_cap_kill:
+                report['master_cap_kill_effective'] = bool(master['status']['CapEff'] & (1 << CAP_BITS['CAP_KILL']))
+                report['source_to_startup_delta'] = sorted(set(report['startup_caps']) - set(report['source_caps']))
             held, response = fresh()
             report['baseline_request'] = response
             if not serves(response, old):
@@ -2901,7 +2969,8 @@ class Controller:
             if type(report['release_time']) is float:
                 report['elapsed_after_release'] = finished - report['release_time']
             try:
-                self.record(base + '/report.json', report)
+                snapshot_report = dict(report, snapshot_phase='pre-unit-cleanup') if self.compare_cap_kill else report
+                self.record(base + '/report.json', snapshot_report)
             except (OSError, ValueError):
                 if report['status'] != 'interrupted':
                     report['status'] = 'unavailable'
@@ -2911,10 +2980,65 @@ class Controller:
                 raise KeyboardInterrupt
         return report
 
-    def run_nnp_ab(self, reload_usr2=False):
+    def cap_kill_arm_valid(self, phase):
+        """A timeout is a failed reload, not a pass; accept only proved live-old failure."""
+        row = self.ab_report['arms'][phase]
+        report = row['reload']
+        samples = row['proc_samples']
+        if (row['startup'] != 'observed-running' or row['effective_NNP'] != 'no'
+                or not row['cleanup_confirmed'] or not samples
+                or not all(s['master'] is not None and s['workers'] and not s['other_haproxy']
+                    and self.ab_master_valid(s['master'], phase)
+                    and all(self.ab_worker_valid(w, False, phase) for w in s['workers']) for s in samples)
+                or not report['signal_sent'] or not report['pidfd_binding_verified']
+                or not report['clients_closed'] or report['unit_cleanup']['confirmed'] is not True
+                or not report['coverage'] or not all(c['complete'] for c in report['coverage'])
+                or report['before_master'] is None
+                or not self.ab_master_valid(report['before_master']['status'], phase)
+                or not report['old_cohort']
+                or not all(self.ab_worker_valid(r['status'], False, phase)
+                           for r in report['old_cohort'] + report['new_cohort'])):
+            return False
+        if report['status'] == 'passed':
+            return (not report['issues']
+                    and report['unit_cleanup']['old_exit_verified_before_cleanup'] is True)
+        # No inference from late POLLIN, missing evidence, cleanup or TLS errors.
+        observations = report['old_worker_timeout_observations']
+        return bool(phase == CAP_KILL_PHASES[0] and report['status'] == 'failed'
+            and report['issues'] == ['reload-old-worker-exit-deadline-inconclusive']
+            and report['new_request'] and report['continuity_request']
+            and report['stages']['continuity']['status'] == 'success'
+            and observations and len(observations) == len(report['old_cohort'])
+            and {tuple(r['identity']) for r in observations} ==
+                {tuple(r['identity']) for r in report['old_cohort']}
+            and all(r['alive_at_deadline'] is True for r in observations))
+
+    def finish_cap_kill_comparison(self):
+        a_phase, b_phase = CAP_KILL_PHASES
+        comparison = self.compare_nnp_ab(self.ab_profiles[a_phase], self.ab_profiles[b_phase],
+                                         self.ab_plans[a_phase], self.ab_plans[b_phase])
+        valid = {p: self.cap_kill_arm_valid(p) for p in CAP_KILL_PHASES}
+        passed = self.ab_report['arms'][b_phase]['reload']['status'] == 'passed'
+        proven = comparison['ok'] and all(valid.values()) and passed
+        a_passed = self.ab_report['arms'][a_phase]['reload']['status'] == 'passed'
+        self.ab_report['cap_kill_comparison'].update(
+            valid_runs=valid, inventory=comparison, proven=proven,
+            finding=('both-reloads-passed' if a_passed else 'A-old-worker-alive-at-deadline-B-passed')
+                    if proven else 'inconclusive')
+        self.ab_report.update(status='cap-kill-comparison-proven' if proven else 'inconclusive',
+            diagnostic_finding_completed=proven,
+            reload_usr2_tested=any(self.ab_report['arms'][p]['reload']['signal_attempted']
+                                  for p in CAP_KILL_PHASES),
+            reload_required=not passed)
+        return 0 if proven else 2
+
+    def run_nnp_ab(self, reload_usr2=False, compare_cap_kill=False):
         # Initialize BEFORE preflight/helpers: NOTSTARTED is not invented proc data.
-        if type(reload_usr2) is not bool:
+        if (type(reload_usr2) is not bool or type(compare_cap_kill) is not bool
+                or compare_cap_kill and not reload_usr2):
             raise Unsupported('ab-reload-option')
+        self.compare_cap_kill = compare_cap_kill
+        phases = self.ab_phases()
         self.reload_report = reload_report(reload_usr2)
         self.ab_report = {'status': 'NOTSTARTED', 'complete': False, 'production_applied': False,
             'diagnostic_finding_completed': False, 'confirmed_startup_difference': False,
@@ -2930,13 +3054,27 @@ class Controller:
             'reload': self.reload_report,
             'arms': {p: {'startup': 'NOTSTARTED', 'proc_samples': [], 'proc_identity': 'unavailable',
                          'effective_NNP': 'unavailable', 'gate_boundaries': 'unavailable',
-                         'cleanup_confirmed': False} for p in ('nnp-yes', 'nnp-no')}}
+                         'cleanup_confirmed': False} for p in phases}}
+        if compare_cap_kill:
+            self.ab_report.update(
+                scope='isolated CAP_KILL reload comparison; NNP=no both arms',
+                prospective_fix='probe-only CAP_KILL addition; production NOT changed',
+                limits=['not causal or production health proof', 'unit reload wrapper untested'],
+                cap_kill_comparison={'proven': False, 'valid_runs': {}, 'finding': 'inconclusive'})
+            for phase in phases:
+                report = reload_report(True)
+                report.update(master_cap_kill_effective=None, source_to_startup_delta=None)
+                report['cleanup_evidence'] = ('nnp-ab.report.json:arms.' + phase +
+                    '.reload.unit_cleanup (canonical after unit cleanup)')
+                self.ab_report['arms'][phase]['reload'] = report
         def finding(code):
             self.ab_report['startup_status'] = self.ab_report['status']
             return 2 if reload_usr2 and self.reload_report['status'] != 'passed' else code
 
         self.prepare(ab=True)
-        if reload_usr2:
+        if compare_cap_kill and self.caps != CAPS3:
+            raise Unsupported('cap-kill-already-in-source')
+        if reload_usr2 and not compare_cap_kill:
             self.reload_report.update(source_caps=sorted(self.caps),
                                       source_mask=sum(1 << CAP_BITS[c] for c in self.caps))
             self.ab_report['scope'] = 'isolated TLS-config startup A/B plus B pidfd USR2/local-request proof'
@@ -2945,11 +3083,19 @@ class Controller:
                 'same source capabilities; no CAP_KILL addition or capability promotion']
         self.prepare_ab_assets()
         self.ab_report['status'] = 'incomplete'
-        for phase in ('nnp-yes', 'nnp-no'):
-            if phase == 'nnp-no':
+        for phase in phases:
+            if phase == phases[1]:
+                if compare_cap_kill and not self.cap_kill_arm_valid(phases[0]):
+                    raise Unsupported('cap-kill-A-run-invalid')
                 if self.intents or not self.cleanup_confirmed:
                     raise Unsupported('ab-A-cleanup-unconfirmed')
                 self.reserve(self.ab_assets['endpoints'])  # Conflict refuses; NEVER choose new endpoints.
+            if compare_cap_kill:
+                self.reload_report = self.ab_report['arms'][phase]['reload']
+                self.ab_report['reload'] = self.reload_report  # Last selected arm, NOT canonical cleanup.
+                self.ab_report['reload_required'] = True  # This arm has not verified reload yet.
+                self.reload_report.update(source_caps=sorted(self.caps),
+                    source_mask=sum(1 << CAP_BITS[c] for c in self.caps))
             row = self.ab_report['arms'][phase]
             row['startup'] = 'unavailable'
             startup, _ = self.run_phase(phase)
@@ -2957,12 +3103,14 @@ class Controller:
                        proc_identity='stable-observed' if startup == 'observed-running' else 'unavailable',
                        effective_NNP=self.ab_profiles[phase]['NoNewPrivileges'],
                        gate_boundaries=self.read_boundaries(self.ab_plans[phase]))
-        a, b = (self.ab_report['arms'][p] for p in ('nnp-yes', 'nnp-no'))
+        a, b = (self.ab_report['arms'][p] for p in phases)
         a_masters = [s['master'] for s in a['proc_samples'] if s['master'] is not None]
         b_masters = [s['master'] for s in b['proc_samples'] if s['master'] is not None]
         self.ab_report['actual_master_NNP'] = {
             'A': [s['NoNewPrivs'] for s in a_masters] if a_masters else 'unavailable',
             'B': [s['NoNewPrivs'] for s in b_masters] if b_masters else 'unavailable'}
+        if compare_cap_kill:
+            return self.finish_cap_kill_comparison()
         self.ab_report['comparative_verification'] = 'incomplete'
         if (b['startup'] != 'observed-running' or not b_masters or b['effective_NNP'] != 'no'
                 or not all(self.ab_master_valid(s, 'nnp-no') for s in b_masters)):
@@ -3551,11 +3699,13 @@ class Controller:
 def main(argv=None):
     args = sys.argv[1:] if argv is None else argv
     if args not in (['--run'], ['--cap-boundaries'], ['--cap-matrix'], ['--nnp-ab'],
-                    ['--nnp-ab', '--reload-usr2']):
-        print('Usage: bash tools/diagnose-haproxy.sh --help | --run | --cap-boundaries | --cap-matrix | --nnp-ab [--reload-usr2]', file=sys.stderr)
+                    ['--nnp-ab', '--reload-usr2'],
+                    ['--nnp-ab', '--reload-usr2', '--compare-cap-kill']):
+        print('Usage: bash tools/diagnose-haproxy.sh --help | --run | --cap-boundaries | --cap-matrix | --nnp-ab [--reload-usr2 [--compare-cap-kill]]', file=sys.stderr)
         return 64
     cap_boundaries, cap_matrix = args == ['--cap-boundaries'], args == ['--cap-matrix']
-    reload_usr2 = args == ['--nnp-ab', '--reload-usr2']
+    compare_cap_kill = args == ['--nnp-ab', '--reload-usr2', '--compare-cap-kill']
+    reload_usr2 = args == ['--nnp-ab', '--reload-usr2'] or compare_cap_kill
     nnp_ab = args == ['--nnp-ab'] or reload_usr2
     outcomes = {}
     controller, status, exitcode = Controller(), 'unavailable', 2
@@ -3569,8 +3719,8 @@ def main(argv=None):
         for signum in (signal.SIGINT, signal.SIGTERM):
             old_handlers[signum] = signal.signal(signum, interrupt)
         if nnp_ab:
-            exitcode = (controller.run_nnp_ab(reload_usr2=True) if reload_usr2 else
-                        controller.run_nnp_ab())
+            exitcode = (controller.run_nnp_ab(reload_usr2=True, compare_cap_kill=True) if compare_cap_kill else
+                        controller.run_nnp_ab(reload_usr2=True) if reload_usr2 else controller.run_nnp_ab())
         elif cap_matrix:
             controller.prepare(cap_boundaries=True)
             exitcode = controller.run_matrix()
@@ -3644,15 +3794,22 @@ def main(argv=None):
                 report['reload'] = controller.reload_report
                 report['cleanup'] = {'units_confirmed': clean, 'tls_confirmed': keys_clean,
                                      'status': 'confirmed' if clean and keys_clean else 'unconfirmed'}
-                if controller.reload_report['status'] != 'passed' and not interrupted:
+                comparison_ok = (not compare_cap_kill or
+                    report.get('cap_kill_comparison', {}).get('proven') is True)
+                if (controller.reload_report['status'] != 'passed' or not comparison_ok) and not interrupted:
                     exitcode = report['exitcode'] = 2
             if not clean or not keys_clean:
                 report.update(status='cleanup-unconfirmed', startup_candidate=False,
                               diagnostic_finding_completed=False, confirmed_startup_difference=False)
+                if compare_cap_kill:
+                    report['cap_kill_comparison']['proven'] = False
                 if reload_usr2:
                     report['cleanup']['status'] = 'unconfirmed'
             elif interrupted and report['status'] != 'NOTSTARTED':
                 report['status'] = 'interrupted'
+            if compare_cap_kill and interrupted:
+                report['cap_kill_comparison']['proven'] = False
+                report['diagnostic_finding_completed'] = False
             if controller.directory is not None:
                 try:
                     controller.record('nnp-ab.report.json', report)

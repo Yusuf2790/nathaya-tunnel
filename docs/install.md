@@ -289,7 +289,7 @@ Evidence privat aktual, file0600/dir0700: preflight `production.show`/`productio
 
 **Default `--nnp-ab` tidak melakukan handshake/client connection, routing/health check, USR2/reload/reexec, verifikasi exit worker lama atau low-port production test**; yang diamati hanya stable master/nonroot-worker pada TLS-config startup. Opsi di bawah menambahkan bukti USR2/request lokal terbatas pada B, bukan health produksi atau validasi wrapper unit. Bahkan kandidat dengan exit0 tetap incomplete: review risiko, cold start, low ports, abstract/PROXY routing produksi, TLS/renewal dan seluruh rest checks nyata masih diperlukan. Tidak memberi izin migrasi default, mengubah source unit/renderer/installer/updater/akun/SSH, melonggarkan production validator atau menerapkan NNP=no sekarang. Core/full belum terbukti; full tetap BLOCKED legacy artefak OpenVPN/provenance UDP Custom/BadVPN, tanpa menghapus blocker lain.
 
-**Riwayat review checkpoint20:** 168 metode (18 A/B baru), review read-only dan 49 kontrak tekstual JavaScript, bukan syntax check atau PASS. Checkpoint21 memperbaiki fixture menjadi 170; **pengguna melaporkan 170 PASS serta kandidat startup-only exit0**, tanpa inspeksi evidence privat oleh agen. Checkpoint22 mencatat baseline historis **184 metode: 170 lama + 14 baru pada OptionalReloadContracts**. Pengguna melaporkan **184 tes PASS pada `c8d01dd`**, bukan bukti run patch lokal ini. Fixture staged-budget checkpoint23 kini **194 metode total (184 baseline + 10 regresi), WRITTEN, belum dieksekusi**; hitungan statis bukan PASS. Regresi lama `Pure2ArmReport`/`HostBoundaryRegressions` dipertahankan; laporan PASS lama bukan run tes revisi reload. Tidak menjalankan Bash/Python/syntax check/Git/probe/VPS/layanan/installer, commit atau push dalam tugas dokumentasi ini; tidak mengklaim tree clean, USR2 berhasil atau fix produksi. Pemeriksaan berikut dari **akar checkout `nathaya-tunnel`**, oleh pengguna di lingkungan pengembangan yang sesuai (bukan probe):
+**Riwayat review checkpoint20:** 168 metode (18 A/B baru), review read-only dan 49 kontrak tekstual JavaScript, bukan syntax check atau PASS. Checkpoint21 memperbaiki fixture menjadi 170; **pengguna melaporkan 170 PASS serta kandidat startup-only exit0**, tanpa inspeksi evidence privat oleh agen. Checkpoint22 mencatat baseline historis **184 metode: 170 lama + 14 baru pada OptionalReloadContracts**. Pengguna melaporkan **184 tes PASS pada `c8d01dd`**, bukan bukti run patch lokal ini. Fixture staged-budget checkpoint23 memiliki **194 metode total (184 baseline + 10 regresi), WRITTEN, belum dieksekusi**; pembanding CAP_KILL pada bagian berikut menambahkan regresi lagi. Hitungan statis bukan PASS. Regresi lama `Pure2ArmReport`/`HostBoundaryRegressions` dipertahankan; laporan PASS lama bukan run tes revisi reload. Tidak menjalankan Bash/Python/syntax check/Git/probe/VPS/layanan/installer, commit atau push dalam tugas dokumentasi ini; tidak mengklaim tree clean, USR2 berhasil atau fix produksi. Pemeriksaan berikut dari **akar checkout `nathaya-tunnel`**, oleh pengguna di lingkungan pengembangan yang sesuai (bukan probe):
 
 ```sh
 git diff --check
@@ -310,9 +310,9 @@ Referensi primer (semantik, bukan bukti binary/run host): [kernel no_new_privs](
 bash tools/diagnose-haproxy.sh --nnp-ab --reload-usr2
 ```
 
-Default `--nnp-ab` **tidak berubah**, tetap dua arm startup-only tanpa request/reload. Launcher memvalidasi tepat satu argumen mode atau tepat pasangan dua argumen di atas, lalu meneruskan `"$@"` yang sudah tervalidasi dan quoted ke Python; bukan arbitrary argument forwarding. `--reload-usr2` sendiri, urutan terbalik atau argumen tambahan ditolak (64). `--run`, `--cap-boundaries`, `--cap-matrix`, validator source/normal, hardening dan gate wajib lama tidak dilonggarkan.
+Default `--nnp-ab` **tidak berubah**, tetap dua arm startup-only tanpa request/reload. Launcher memvalidasi tepat satu argumen mode, pasangan dua argumen di atas, atau triple opt-in `--nnp-ab --reload-usr2 --compare-cap-kill` pada bagian berikut; lalu meneruskan `"$@"` yang sudah tervalidasi dan quoted ke Python; bukan arbitrary argument forwarding. `--reload-usr2` sendiri, urutan terbalik atau argumen tambahan ditolak (64). `--run`, `--cap-boundaries`, `--cap-matrix`, validator source/normal, hardening dan gate wajib lama tidak dilonggarkan.
 
-#### Scope, config dan capability yang sama
+#### Scope, config dan capability yang sama (tanpa `--compare-cap-kill`)
 
 - Tetap A=`nnp-yes` lalu B=`nnp-no`, **bukan arm ketiga**. B harus `observed-running` dengan identitas/credential startup tervalidasi **sebelum** reload; reload selesai **sebelum cleanup B**. Unit, executable, config, TLS, high loopback port dan endpoint abstract B tidak diganti. Tidak ada matriks tambahan, strace, health produksi menyeluruh atau penerapan perubahan produksi.
 - Hanya opt-in memakai `make_ab_config(..., reload_http=True, marker=nonce)`. `Controller.prepare_ab_assets()` membangun config **sekali sebelum A/B**, dipakai tidak berubah saat startup A, startup B dan reload B. Config default TCP-reject lama tetap utuh tanpa opsi: reject tidak dapat membuktikan positive request. Hanya config opt-in bersama memakai `timeout client 15s`, `timeout server 15s` dan `timeout http-request 15s` pada frontend abstract agar partial request bertahan selama finite hold; default client/server2s tetap byte-identik, `timeout connect 1s` dan controller I/O≤2s tidak diperbesar. Responder HTTP tetap pada frontend abstract milik probe di belakang backend `probe_local`, melalui bind TLS `127.0.0.1` high-port; tidak memakai layanan eksternal, admin socket atau arbitrary-target relay.
@@ -376,9 +376,57 @@ Artefak tambahan aktual di phase **`nnp-no/reload/`**: `report.json`; sample ste
 
 Exit **0** masih memerlukan finding startup sah, reload passed bila diminta, **dan** cleanup unit/TLS terkonfirmasi. Reload gagal **dengan cleanup sukses** → **exit2 walau startup `CANDIDATE-startup-only`** tetap kandidat; partial finding startup tetap bukan comparative proof atau fix lengkap. Cleanup unit **atau** TLS gagal pada default maupun opt-in → **`status=cleanup-unconfirmed`**, `startup_candidate=false`, `diagnostic_finding_completed=false`, `confirmed_startup_difference=false`: tidak ada kandidat walau evidence startup parsial tersimpan. Snapshot `startup_status`, `arms.startup`/raw `proc_samples` dan proof lokal `reload.status` tidak diubah. Pada opt-in, `cleanup={units_confirmed,tls_confirmed,status}` (status `unconfirmed` bila cleanup gagal) tetap outcome terpisah dari startup/reload, bersama `cleanup_confirmed`, `tls_cleanup_confirmed`, `interrupted`, `exitcode`. Interupsi **130**, termasuk cleanup gagal; baca flag cleanup, bukan mengubahnya menjadi sukses. Tidak ada fix complete atau production applied.
 
-Risiko NNP tetap sama: calon HAProxy-specific NNP=no **menghilangkan exec-gain barrier set-ID/filecap pada root master dan descendants yang belum self-set NNP**. Hardening lain/bounding tetap perlu tetapi bukan penggantinya. Tidak ada perubahan unit produksi/renderer/installer/updater/SSH/akun/trust policy dalam tugas ini; seluruh blocker full legacy tetap berlaku. Baseline184 dan PASS yang dilaporkan pengguna pada `c8d01dd` adalah bukti revisi lama; fixture saat ini **194 metode secara statis, WRITTEN, belum dieksekusi**. Dua regresi tambahan menolak timeout poll yang terlambat/error serta POLLIN yang baru teramati setelah deadline. 170 PASS lama juga bukan PASS revisi baru.
+Risiko NNP tetap sama: calon HAProxy-specific NNP=no **menghilangkan exec-gain barrier set-ID/filecap pada root master dan descendants yang belum self-set NNP**. Hardening lain/bounding tetap perlu tetapi bukan penggantinya. Tidak ada perubahan unit produksi/renderer/installer/updater/SSH/akun/trust policy dalam tugas ini; seluruh blocker full legacy tetap berlaku. Baseline184 dan PASS yang dilaporkan pengguna pada `c8d01dd` adalah bukti revisi lama; fixture checkpoint23 **194 metode secara statis, WRITTEN, belum dieksekusi** sebelum tambahan pembanding CAP_KILL. Dua regresi tambahan menolak timeout poll yang terlambat/error serta POLLIN yang baru teramati setelah deadline. 170 PASS lama juga bukan PASS revisi baru.
 
 Referensi primer dari review sebelumnya (tanpa network baru pada checkpoint23; semantik, bukan bukti run VPS): [HAProxy 2.8 §8.2.6 custom log format `%pid`, `http-request return`/`lf-string`](https://docs.haproxy.org/2.8/configuration.html#8.2.6), [Python 3.12 `os.pidfd_open`](https://docs.python.org/3.12/library/os.html#os.pidfd_open), [`signal.pidfd_send_signal`](https://docs.python.org/3.12/library/signal.html#signal.pidfd_send_signal), [`signal.setitimer`](https://docs.python.org/3.12/library/signal.html#signal.setitimer), [`signal.pthread_sigmask`](https://docs.python.org/3.12/library/signal.html#signal.pthread_sigmask). Python handlers berjalan di main thread; operasi C panjang dapat menunda handler, bukan jaminan hard cancellation.
+
+### Opt-in pembanding CAP_KILL — dua run NNP=no, staging saja
+
+Mode terpisah ini **tidak mengubah** `--nnp-ab` atau `--nnp-ab --reload-usr2` lama. Setelah review patch, syntax check dan tes offline benar-benar lulus, operator root staging Ubuntu24.04 amd64/systemd PID1 dapat memilih:
+
+```sh
+# Hanya staging; jangan jalankan probe nyata di Acode/Termux/proot/produksi.
+bash tools/diagnose-haproxy.sh --nnp-ab --reload-usr2 --compare-cap-kill
+```
+
+Triple flag harus persis dalam urutan tersebut; flag tunggal, kombinasi tidak lengkap/duplikat/urutan lain atau extra arguments ditolak64. Ini mengganti pasangan NNP=yes/no dengan **tepat dua run NNP=no**, bukan menambahkan dua run sesudah mode lama:
+
+| Run / phase | Unit dan master NNP | Capability master (Bnd/Prm/Eff) | Worker |
+| --- | --- | --- | --- |
+| A / `cap-kill-a` | no / 0 | Source CAPS3, mask `0x4c0` | Nonroot, I=P=E=A=0 |
+| B / `cap-kill-b` | no / 0 | CAPS3 + **hanya CAP_KILL**, mask `0x4e0` | Nonroot, I=P=E=A=0 |
+
+CAPS3 = CAP_SETGID, CAP_SETUID, CAP_NET_BIND_SERVICE. Source sudah mengandung CAP_KILL/CAPS4 → **refused `cap-kill-already-in-source` sebelum membuat aset/unit pembanding**; tidak mengurangi capability A atau mengubah source agar bisa dibandingkan. `self.caps` tetap source asli. B wajib membuktikan **CapEff=CapPrm=CapBnd=0x4e0** dari proses master aktual, bukan hanya requested property/bounding set. Master I=A=0, UID/GID root; worker UID/GID akun HAProxy, Bnd sesuai arm dan I/P/E/A nol sepanjang startup/reload. Worker boleh self-set NNP1; itu tidak melonggarkan kewajiban NNP0 pada master/unit.
+
+Config, executable metadata, marker, sertifikat/key, high-loopback port dan endpoint abstract dibangun sekali dan dipakai identik A/B. Seluruh timeout identik: per-run overall24s clipped `release_time+29s`, stage5/5/2/5/4s, transient RuntimeMax30s, config15s, controller network≤2s. Drain5s mulai **setelah semua client ditutup**, bukan dari USR2. Kedua run memakai engine reload yang sama: baseline TLS200 dari worker lama, partial request melintasi **satu master pidfd USR2 per run**, new-worker TLS200/credential proof, continuity HTTP200 dari worker lama, semua clients close, timely old-worker pidfd POLLIN **sebelum cleanup**, lalu fresh final TLS HTTP200 dari new PID dan final cohort/source check. **Tidak ada SIGUSR1 manual atau sinyal langsung ke worker**; pidfd worker hanya untuk observasi.
+
+A harus lulus penuh, atau memperlihatkan kegagalan yang terukur: new-worker/continuity valid, semua client tutup, dan semua worker lama **terbukti masih hidup saat deadline drain**. Kasus kedua tetap `reload.status=failed`, old-exit/final-request tetap unproven. Error poll, late POLLIN, bukti hilang, source/config drift atau cleanup A tidak terkonfirmasi menghentikan B; tidak dianggap pembanding valid. B hanya mulai sesudah cleanup A terkonfirmasi dan endpoint yang sama berhasil direservasi ulang; konflik ditolak, tidak memilih endpoint baru.
+
+**Report canonical setelah cleanup** tetap `nnp-ab.report.json`:
+
+- `arms.cap-kill-a` dan `arms.cap-kill-b`: startup, proc_samples, effective_NNP, cleanup_confirmed, serta objek `reload` masing-masing.
+- `arms.<phase>.reload.unit_cleanup`: timestamp stop/kill/finished, confirmed/outcome dan proof yang sudah ada sebelum cleanup. Cleanup stop/SIGKILL tidak boleh backfill graceful-exit atau TLS terakhir.
+- `reload.master_cap_kill_effective` dan `source_to_startup_delta` pada **masing-masing arm**: A false/[], B true/[CAP_KILL] hanya setelah proses aktual tervalidasi; unknown tetap unknown. Raw before/after cohort menyimpan kelima capability set. `capability_delta` tetap startup→reload dalam arm, bukan source→B.
+- `cap_kill_comparison`: `valid_runs`, `inventory`, `proven`, `finding`. Finding `A-old-worker-alive-at-deadline-B-passed` atau `both-reloads-passed` hanya bila semua gate terpenuhi. Ini hasil perbandingan staging, **bukan bukti sebab universal atau rekomendasi produksi**.
+- Top-level `reload` hanya alias arm terakhir dipilih, bukan pengganti dua hasil canonical. `<phase>/reload/report.json` adalah snapshot `pre-unit-cleanup`; canonical per-arm diperbarui `post-unit-cleanup`. Final unit/TLS cleanup tetap dilaporkan terpisah.
+
+**Exit0** memerlukan kedua run valid, inventory hanya memperbolehkan delta CAP_KILL yang diarahkan A→B, **B lulus semua syarat reload**, dan cleanup unit/TLS terkonfirmasi. A boleh tetap gagal drain pada kondisi terukur di atas; exit0 **tidak mengubah A menjadi PASS**. B gagal/unsupported/incomplete atau cleanup unconfirmed → exit2; interupsi130 termasuk cleanup gagal. `startup_candidate=false`, `confirmed_startup_difference=false`, `complete=false`, `production_applied=false`, dan wrapper ExecReload tetap untested. Penambahan CAP_KILL hanya pada unit probe B; original/current production audit serta same-arm gate/live tetap strict, tanpa waiver capability umum.
+
+Risiko NNP=no tetap ada; CAP_KILL juga memperluas otorisasi signal master terhadap UID lain, **bukan perubahan aman untuk produksi secara otomatis**. Unit produksi, renderer, installer, updater, akun, firewall dan seluruh blocker core/full tidak diubah. Bukti run terbaru yang dilaporkan pengguna (masterUID0, workerUID109, cap_kill_present=false; USR2/new TLS200/continuity/clients close berhasil, old worker masih hidup setelah5s) adalah konteks untuk eksperimen, bukan run agen atau diagnosis kausal.
+
+Tes baru `CapKillComparisonContracts` mencakup closed plans/alias, scope delta, source already-CAP_KILL, effective master/zero worker caps, lifecycle engine B, urutan cleanup A→B, final-TLS failure, CLI/final cleanup/interupsi dan kedua run lulus. **WRITTEN, belum dieksekusi** di workspace content tanpa exec. Validasi offline dari checkout yang terjangkau shell:
+
+```sh
+git status --short
+git diff HEAD
+git diff --check
+bash -n tools/diagnose-haproxy.sh
+python3 -I -B tests/diagnose_haproxy_test.py OptionalReloadContracts CapKillComparisonContracts
+python3 -I -B tests/diagnose_haproxy_test.py Pure2ArmReport HostBoundaryRegressions
+python3 -I -B tests/diagnose_haproxy_test.py
+```
+
+Belum ada hasil PASS atau pembanding VPS dari agen. Di staging periksa effective master B, capability worker nol, old-exit sebelum cleanup dan final TLS200; inspeksi dua `reload.unit_cleanup`, bukan hanya exit code atau new-worker200.
 
 ### Audit properti systemd 255 dan watchdog
 

@@ -320,6 +320,8 @@ def assert_launcher_contract(case, shell):
         r'1:--help:\s*\)(?P<help>.*?)\s*;;\s*'
         r'1:--run:\s*\|\s*1:--cap-boundaries:\s*\|\s*1:--cap-matrix:\s*\|\s*'
         r'1:--nnp-ab:\s*\|\s*2:--nnp-ab:--reload-usr2\s*\)\s*;;\s*'
+        r'3:--nnp-ab:--reload-usr2\s*\)\s*\[\[\s*"\$3"\s*==\s*--compare-cap-kill\s*\]\]'
+        r'\s*\|\|\s*return\s+64\s*;;\s*'
         r'\*\s*\)(?P<default>.*?)\s*;;\s*'
         r'esac\s+(?P<dispatch>.*?)\s*\Z', flat, re.S)
     case.assertIsNotNone(structure, 'Complete one-flag/exact two-flag allowlist before dispatch')
@@ -3995,7 +3997,7 @@ class Pure2ArmReport(Offline):
         return plans, profiles
 
     def tasks(self, c, phase):
-        mask = sum(1 << self.D.CAP_BITS[k] for k in c.caps)
+        mask = sum(1 << self.D.CAP_BITS[k] for k in c.ab_caps(phase))
         master = self.D._status(CaptureContracts.status_bytes(self).decode())
         master.update(CapBnd=mask, CapPrm=mask, CapEff=mask, NoNewPrivs=int(phase == 'nnp-yes'))
         worker = dict(master, Pid=102, PPid=101, Uid=(c.uid,) * 4, Gid=(c.gid,) * 4,
@@ -4724,10 +4726,12 @@ class OptionalReloadContracts(Offline):
 
     def ab_pair(self, c):
         plans = [self.D.nnp_ab_plan(c.directory, c.nonce, c.caps, phase,
-                                  reload_usr2=c.reload_report['requested'])
-                 for phase in ('nnp-yes', 'nnp-no')]
+                                  reload_usr2=c.reload_report['requested'],
+                                  compare_cap_kill=c.compare_cap_kill)
+                 for phase in c.ab_phases()]
         profiles = [dict(self.probe(c, plan),
                          NoNewPrivileges=plan['properties']['NoNewPrivileges'],
+                         CapabilityBoundingSet=plan['properties']['CapabilityBoundingSet'],
                          RuntimeMaxUSec=plan['properties']['RuntimeMaxSec'])
                     for plan in plans]
         return plans, profiles
@@ -4742,20 +4746,28 @@ class OptionalReloadContracts(Offline):
         return (b'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ' +
                 str(len(body)).encode() + b'\r\n\r\n' + body)
 
-    def reload_fixture(self, old=False, failure=None):
+    def reload_fixture(self, old=False, failure=None, compare_phase=None):
         c = self.ab_controller(old)
+        if compare_phase is not None:
+            c.compare_cap_kill = True
+            template = c.ab_report['arms']['nnp-no']
+            c.ab_report['arms'] = {p: copy.deepcopy(template) for p in self.D.CAP_KILL_PHASES}
         plans, profiles = self.ab_pair(c)
-        plan = plans[1]
+        index = c.ab_phases().index(compare_phase) if compare_phase is not None else 1
+        plan = plans[index]
+        phase = plan['phase']
         plan.update(created_at=0.5, release_time=1.0)
-        profile = dict(profiles[1], ActiveState='active', SubState='running',
+        profile = dict(profiles[index], ActiveState='active', SubState='running',
                        MainPID='101', ControlPID='0')
-        c.ab_plans = dict(zip(('nnp-yes', 'nnp-no'), plans))
-        c.ab_profiles = {'nnp-no': profile}
-        c.ab_report['arms']['nnp-no']['startup'] = 'observed-running'
+        c.ab_plans = dict(zip(c.ab_phases(), plans))
+        c.ab_profiles = {phase: profile}
+        c.ab_report['arms'][phase]['startup'] = 'observed-running'
         c.reload_report = self.D.reload_report(True)
         c.ab_report['reload'] = c.reload_report
+        if compare_phase is not None:
+            c.ab_report['arms'][phase]['reload'] = c.reload_report
         c.ab_assets = {'endpoints': (49173, ABSTRACT)}
-        rows = self.tasks(c, 'nnp-no')
+        rows = self.tasks(c, phase)
         for row, identity in zip(rows, ((101, 1234), (102, 1235))):
             row['identity'] = identity
         master, worker = rows
@@ -5734,7 +5746,7 @@ class OptionalReloadContracts(Offline):
 
     def cleanup_owned_b(self, c, plan, state, *, force_kill=False):
         """Run actual cleanup_one + timestamp helper, with unit-show data only."""
-        info = dict(c.ab_profiles['nnp-no'])
+        info = dict(c.ab_profiles[plan['phase']])
         state.now += 0.5  # Cleanup follows, never participates in exit verification.
         stopped, killed = [], []
         if plan['unit'] not in c.intents:
@@ -6209,6 +6221,318 @@ class OptionalReloadContracts(Offline):
         self.assertEqual(fresh.ab_report['issues'], ['fixture-preflight'])
         self.assertFalse(fresh.ab_report['production_applied'])
         self.assertEqual(fresh.reload_report, self.D.reload_report(False))
+
+
+class CapKillComparisonContracts(Offline):
+    """Synthetic comparison using the SAME guarded optional reload engine."""
+
+    ab_controller = OptionalReloadContracts.ab_controller
+    ab_pair = OptionalReloadContracts.ab_pair
+    tasks = Pure2ArmReport.tasks
+    response = staticmethod(OptionalReloadContracts.response)
+    reload_fixture = OptionalReloadContracts.reload_fixture
+    assert_reload_closed = OptionalReloadContracts.assert_reload_closed
+    cleanup_owned_b = OptionalReloadContracts.cleanup_owned_b
+
+    def controller(self, old=False):
+        c = Offline.controller(self, old)
+        c.reload_report = self.D.reload_report(True)
+        return c
+
+    def pair(self):
+        c = self.ab_controller(True)
+        c.compare_cap_kill = True
+        plans, profiles = self.ab_pair(c)
+        c.ab_plans = dict(zip(c.ab_phases(), plans))
+        return c, plans, profiles
+
+    def engine(self, phase, *, drain=False, final=None):
+        c, plan, state, sig, _, patchers = self.reload_fixture(old=True, compare_phase=phase)
+        state.tick, state.never_old, state.final_tls_failure = 0.0, drain, final
+        state.old_exit_delay = 0.05  # Model strictly post-close exit, not equal timestamps.
+        report = self.invoke(c.reload_usr2, plan, patchers=patchers)
+        sig.assert_called_once_with(700, signal.SIGUSR2, None, 0)
+        self.assert_reload_closed(state)
+        return c, plan, state, report
+
+    def test_closed_caps_plans_and_ownership_only_exact_new_names(self):
+        c, plans, profiles = self.pair()
+        original = copy.deepcopy((c.source, c.fragment, c.source_bytes, c.caps))
+        self.assertEqual(c.ab_phases(), ('cap-kill-a', 'cap-kill-b'))
+        self.assertEqual(plans[0]['argv'], plans[1]['argv'])
+        for index, (plan, profile) in enumerate(zip(plans, profiles)):
+            self.assertEqual(profile['NoNewPrivileges'], 'no')
+            self.assertEqual(profile['RuntimeMaxUSec'], '30s')
+            self.assertEqual(frozenset(profile['CapabilityBoundingSet'].split()), CAPS4 if index else CAPS3)
+            c.validate_nnp_ab(profile, plan)
+            self.assertTrue(self.D.owned_unit(profile, plan['unit'], c.nonce))
+            self.assertTrue(self.D._capture_unit(plan['unit'], c.nonce))
+            for key, value in (('CapabilityBoundingSet', 'CAP_KILL'), ('RuntimeMaxSec', '8s'),
+                               ('NoNewPrivileges', 'yes')):
+                forged = copy.deepcopy(plan)
+                forged['properties'][key] = value
+                forged['command'] = self.D.transient_command(forged['unit'], forged['properties'], forged['argv'])
+                with self.assertRaises(self.D.Unsupported):
+                    c.validate_nnp_ab(profile, forged)
+            for args in (['--property=CapabilityBoundingSet=' + profile['CapabilityBoundingSet']],
+                         ['--property', 'CapabilityBoundingSet=' + profile['CapabilityBoundingSet']],
+                         ['-p', 'CapabilityBoundingSet=' + profile['CapabilityBoundingSet']],
+                         ['-pCapabilityBoundingSet=' + profile['CapabilityBoundingSet']]):
+                forged = copy.deepcopy(plan)
+                boundary = forged['command'].index('--')
+                forged['command'][boundary:boundary] = args
+                with self.assertRaises(self.D.Unsupported):
+                    c.validate_nnp_ab(profile, forged)
+            for key, value in (('compare_cap_kill', True), ('caps', CAPS4), ('reload_usr2', True)):
+                with self.assertRaises(self.D.Unsupported):
+                    c.validate_nnp_ab(profile, dict(plan, **{key: value}))
+        for phase in ('cap-kill', 'cap-kill-A', 'cap-kill-b-extra', 'cap-kill-c', 'nnp-no-kill'):
+            unit = 'nathaya-haproxy-probe-' + c.nonce + '-' + phase + '.service'
+            self.assertFalse(self.D._capture_unit(unit, c.nonce))
+            self.assertFalse(self.D.owned_unit(profiles[0], unit, c.nonce))
+        for phase in ('nnp-yes', 'nnp-no'):
+            with self.assertRaises(self.D.Unsupported):
+                self.D.nnp_ab_plan(c.directory, c.nonce, c.caps, phase,
+                                   reload_usr2=True, compare_cap_kill=True)
+        for reload, compare, caps in ((False, True, CAPS3), (True, True, CAPS4),
+                                      (True, 1, CAPS3), (1, True, CAPS3), (True, False, CAPS3)):
+            with self.assertRaises(self.D.Unsupported):
+                self.D.nnp_ab_plan(c.directory, c.nonce, caps, 'cap-kill-b',
+                                   reload_usr2=reload, compare_cap_kill=compare)
+        c.compare_cap_kill = False
+        for plan, profile in zip(plans, profiles):
+            with self.assertRaises(self.D.Unsupported):
+                c.validate_nnp_ab(profile, plan)
+        self.assertEqual((c.source, c.fragment, c.source_bytes, c.caps), original)
+
+    def test_directed_registered_cap_exception_never_live_or_production_drift(self):
+        c, plans, (a, b) = self.pair()
+        before = copy.deepcopy((c.source, a, b))
+        kwargs = dict(fragment=c.fragment, original=c.source, original_fragment=c.fragment,
+                      original_bytes=c.source_bytes, current_bytes=c.source_bytes)
+        self.assertTrue(c.compare_nnp_ab(a, b, *plans)['ok'])
+        self.assertTrue(c.audit_compatibility(c.source, a, plan=plans[0], **kwargs)['ok'])
+        audit = c.audit_compatibility(c.source, b, plan=plans[1], **kwargs)
+        self.assertTrue(audit['ok'])
+        self.assertEqual([r['property'] for r in audit['properties']
+                          if r['classification'] == 'validated-cap-kill-ab-delta'], ['CapabilityBoundingSet'])
+        self.assertEqual(self.D.restriction_differences(a, b), ['CapabilityBoundingSet'])
+        for current in (dict(c.source, CapabilityBoundingSet=b['CapabilityBoundingSet']),
+                        dict(c.source, FutureSecurityKnob='drift')):
+            self.assertFalse(c.audit_compatibility(current, b, plan=plans[1], **kwargs)['ok'])
+        for plan, profile, other in ((plans[0], a, b), (plans[1], b, a)):
+            self.assertFalse(c.audit_compatibility(profile, other, plan=plan, probe_source=True)['ok'])
+            c.validate_nnp_ab(profile, plan)
+            with self.assertRaises(self.D.Unsupported):
+                c.validate_probe(profile, plan)
+        with self.assertRaises(self.D.Unsupported):
+            c.compare_nnp_ab(b, a, plans[1], plans[0])
+        c.ab_plans.pop('cap-kill-b')
+        self.assertFalse(c.audit_compatibility(c.source, b, plan=plans[1], **kwargs)['ok'])
+        with self.assertRaisesRegex(self.D.Unsupported, 'ab-plan-not-registered'):
+            c.compare_nnp_ab(a, b, *plans)
+        self.assertEqual((c.source, a, b), before)
+
+    def test_source_cap_kill_present_refuses_before_assets_or_arms(self):
+        c = self.controller(False)
+        assets, phase = Mock(), Mock()
+        with self.assertRaisesRegex(self.D.Unsupported, 'cap-kill-already-in-source'):
+            self.invoke(c.run_nnp_ab, reload_usr2=True, compare_cap_kill=True, patchers=(
+                patch.object(c, 'prepare'), patch.object(c, 'prepare_ab_assets', assets),
+                patch.object(c, 'run_phase', phase)))
+        assets.assert_not_called()
+        phase.assert_not_called()
+        self.assertEqual(c.caps, CAPS4)
+        self.assertFalse(c.ab_report['cap_kill_comparison']['proven'])
+
+    def test_effective_permitted_master_and_every_worker_mask_and_nnp_required(self):
+        c, plans, _ = self.pair()
+        c.uid, c.gid = 200, 201
+        for plan in plans:
+            phase = plan['phase']
+            rows = self.tasks(c, phase)
+            c.reload_capture_complete = True
+            c.reload_cohort(rows, {'MainPID': '101'}, phase)
+            for index in (0, 1):
+                for key in ('CapInh', 'CapPrm', 'CapEff', 'CapBnd', 'CapAmb', 'NoNewPrivs'):
+                    bad = copy.deepcopy(rows)
+                    if index == 1 and key == 'NoNewPrivs':
+                        bad[index]['status'][key] = 2  # Workers may self-set NNP=1.
+                    else:
+                        bad[index]['status'][key] ^= 1 << 5 if key.startswith('Cap') else 1
+                    with self.subTest(phase=phase, index=index, key=key), self.assertRaises(self.D.Unsupported):
+                        c.reload_cohort(bad, {'MainPID': '101'}, phase)
+            protected = copy.deepcopy(rows)
+            protected[1]['status']['NoNewPrivs'] = 1
+            c.reload_cohort(protected, {'MainPID': '101'}, phase)
+            if phase == 'cap-kill-b':
+                bad = copy.deepcopy(rows)
+                # Bounding addition alone, with E/P still CAPS3, is NOT proof.
+                for key in ('CapEff', 'CapPrm'):
+                    bad[0]['status'][key] &= ~(1 << 5)
+                with self.assertRaises(self.D.Unsupported):
+                    c.reload_cohort(bad, {'MainPID': '101'}, phase)
+
+    def test_b_real_engine_requires_grace_and_final_tls_despite_cap_kill(self):
+        for drain, final in ((False, None), (True, None), (False, 'timeout'), (False, 'missing-http')):
+            c, plan, state, report = self.engine('cap-kill-b', drain=drain, final=final)
+            self.assertEqual(report['status'], 'passed' if not drain and final is None else 'failed')
+            self.assertTrue(report['master_cap_kill_effective'])
+            self.assertEqual(report['source_to_startup_delta'], ['CAP_KILL'])
+            self.assertEqual(report['new_request']['status'], 200)
+            self.assertEqual(report['continuity_request']['status'], 200)
+            self.assertEqual(state.reports[0]['snapshot_phase'], 'pre-unit-cleanup')
+            self.assertTrue(state.reports[0]['master_cap_kill_effective'])
+            self.assertEqual(state.reports[0]['source_to_startup_delta'], ['CAP_KILL'])
+            self.assertIsNone(state.reports[0]['unit_cleanup']['confirmed'])
+            clean, _, _, _ = self.cleanup_owned_b(c, plan, state)
+            self.assertTrue(clean)
+            self.assertEqual(report['snapshot_phase'], 'post-unit-cleanup')
+            self.assertTrue(report['unit_cleanup']['confirmed'])
+            self.assertEqual(report['old_workers_exited'], not drain)
+            if drain:
+                self.assertIsNone(report['old_worker_exit_proof'])
+                self.assertIsNone(report['final_request'])
+            elif final is None:
+                self.assertEqual(report['final_request']['status'], 200)
+                self.assertLess(report['clients_closed_at'], report['old_workers_exited_at'])
+                self.assertLess(report['old_workers_exited_at'], report['unit_cleanup']['requested_at'])
+                self.assertTrue(report['unit_cleanup']['old_exit_verified_before_cleanup'])
+            else:
+                self.assertIsNone(report['final_request'])
+            self.assertEqual(c.caps, CAPS3)
+
+    def scheduler(self, *, clean=True, b_final=None, a_late_exit=False, a_drain=True):
+        templates = {}
+        for phase in self.D.CAP_KILL_PHASES:
+            _, _, _, report = self.engine(phase, drain=a_drain and phase == 'cap-kill-a',
+                                          final=b_final if phase == 'cap-kill-b' else None)
+            templates[phase] = copy.deepcopy(report)
+        if a_late_exit:
+            templates['cap-kill-a']['old_worker_timeout_observations'][0]['alive_at_deadline'] = None
+        c = self.controller(True)
+        c.uid, c.gid = 200, 201
+        events = []
+        c.ab_assets = {'endpoints': (49173, ABSTRACT)}
+        def gate(plan):
+            profile = dict(self.probe(c, plan), NoNewPrivileges='no', RuntimeMaxUSec='30s',
+                           CapabilityBoundingSet=plan['properties']['CapabilityBoundingSet'])
+            c.validate_nnp_ab(profile, plan)
+            plan['release_time'] = 100.0
+            return profile
+        def observe(plan):
+            c.ab_identity(self.tasks(c, plan['phase']), {'MainPID': '101'}, plan['phase'])
+            return 'observed-running'
+        def reload(plan):
+            events.append('reload:' + plan['phase'])
+            c.reload_report.update(copy.deepcopy(templates[plan['phase']]))
+        def cleanup(unit):
+            phase = next(p for p, plan in c.ab_plans.items() if plan['unit'] == unit)
+            events.append('cleanup:' + phase)
+            c._reload_unit_cleanup(unit, 'stop', c.ab_profiles[phase])
+            c._reload_unit_cleanup(unit, 'finished', {'LoadState': 'not-found'}, clean)
+            return clean
+        patchers = (patch.object(c, 'prepare'), patch.object(c, 'prepare_ab_assets'),
+            patch.object(c, 'verify_ab_assets'), patch.object(c, 'gate', side_effect=gate),
+            patch.object(c, 'observe', side_effect=observe), patch.object(c, 'reload_usr2', side_effect=reload),
+            patch.object(c, 'cleanup_one', side_effect=cleanup), patch.object(c, 'reserve'),
+            patch.object(c, 'read_boundaries', return_value=[]), patch.object(Path, 'mkdir'),
+            patch.object(self.D, '_no_lock'), patch.object(time, 'monotonic', return_value=100.0),
+            patch.object(c, 'show', return_value={'LoadState': 'not-found'}),
+            patch.object(c, 'command', return_value=(0, b'', b'')))
+        return c, events, patchers
+
+    def test_scheduler_a_failed_reload_cleanup_then_b_separate_comparison_not_candidate(self):
+        c, events, patchers = self.scheduler()
+        before = copy.deepcopy((c.source, c.fragment, c.source_bytes, c.caps))
+        self.assertEqual(self.invoke(c.run_nnp_ab, reload_usr2=True, compare_cap_kill=True, patchers=patchers), 0)
+        self.assertEqual(events, ['reload:cap-kill-a', 'cleanup:cap-kill-a',
+                                  'reload:cap-kill-b', 'cleanup:cap-kill-b'])
+        a, b = (c.ab_report['arms'][p]['reload'] for p in self.D.CAP_KILL_PHASES)
+        self.assertEqual((a['status'], b['status']), ('failed', 'passed'))
+        self.assertNotEqual(a['unit_cleanup']['old_exit_proof_status'], 'PROVEN-before-cleanup')
+        self.assertTrue(all(c.ab_report['cap_kill_comparison']['valid_runs'].values()))
+        self.assertTrue(c.ab_report['cap_kill_comparison']['proven'])
+        self.assertEqual(c.ab_report['actual_master_NNP'], {'A': [0], 'B': [0]})
+        self.assertTrue(c.ab_report['reload_usr2_tested'])
+        self.assertFalse(c.ab_report['startup_candidate'])
+        self.assertFalse(c.ab_report['confirmed_startup_difference'])
+        self.assertFalse(c.ab_report['complete'])
+        self.assertFalse(c.ab_report['production_applied'])
+        self.assertFalse(a['unit_reload_wrapper_tested'])
+        self.assertFalse(b['unit_reload_wrapper_tested'])
+        self.assertEqual((c.source, c.fragment, c.source_bytes, c.caps), before)
+        self.assertFalse(c.intents)
+
+    def test_scheduler_cleanup_or_unproved_a_stops_b_and_b_final_failure_is_exit2(self):
+        for clean, late in ((False, False), (True, True)):
+            c, events, patchers = self.scheduler(clean=clean, a_late_exit=late)
+            with self.assertRaises(self.D.Unsupported):
+                self.invoke(c.run_nnp_ab, reload_usr2=True, compare_cap_kill=True, patchers=patchers)
+            self.assertEqual(events, ['reload:cap-kill-a', 'cleanup:cap-kill-a'])
+            self.assertIs(c.reload_report, c.ab_report['arms']['cap-kill-a']['reload'])
+            self.assertFalse(c.ab_report['cap_kill_comparison']['proven'])
+        c, events, patchers = self.scheduler(b_final='missing-http')
+        self.assertEqual(self.invoke(c.run_nnp_ab, reload_usr2=True, compare_cap_kill=True, patchers=patchers), 2)
+        self.assertIn('cleanup:cap-kill-b', events)
+        self.assertFalse(c.ab_report['cap_kill_comparison']['proven'])
+        self.assertTrue(c.ab_report['reload_usr2_tested'])
+        c, _, patchers = self.scheduler(a_drain=False)
+        commands = Mock(side_effect=[(0, b'', b''), (1, b'', b'')])
+        with self.assertRaisesRegex(self.D.Unsupported, 'transient-create-unavailable'):
+            self.invoke(c.run_nnp_ab, reload_usr2=True, compare_cap_kill=True,
+                        patchers=patchers + (patch.object(c, 'command', commands),))
+        self.assertTrue(c.ab_report['reload_required'])
+        self.assertEqual(c.reload_report['status'], 'not-run-startup-unverified')
+        self.assertEqual(c.ab_report['arms']['cap-kill-a']['reload']['status'], 'passed')
+
+    def test_comparison_both_pass_is_not_a_cap_kill_causal_finding(self):
+        c, events, patchers = self.scheduler(a_drain=False)
+        rc = self.invoke(c.run_nnp_ab, reload_usr2=True, compare_cap_kill=True, patchers=patchers)
+        self.assertEqual(rc, 0)
+        self.assertEqual(c.ab_report['cap_kill_comparison']['finding'], 'both-reloads-passed')
+        self.assertTrue(c.ab_report['cap_kill_comparison']['proven'])
+        self.assertTrue(all(c.ab_report['arms'][p]['reload']['status'] == 'passed'
+                            for p in self.D.CAP_KILL_PHASES))
+        self.assertTrue(all(c.ab_report['arms'][p]['reload']['unit_cleanup']
+                            ['old_exit_verified_before_cleanup'] for p in self.D.CAP_KILL_PHASES))
+        self.assertEqual(events, ['reload:cap-kill-a', 'cleanup:cap-kill-a',
+                                  'reload:cap-kill-b', 'cleanup:cap-kill-b'])
+        self.assertFalse(c.ab_report['confirmed_startup_difference'])
+        self.assertFalse(c.ab_report['production_applied'])
+
+    def test_cli_exact_combination_canonical_per_arm_cleanup_and_interrupt130(self):
+        factory = Mock()
+        for args in (['--compare-cap-kill'], ['--nnp-ab', '--compare-cap-kill'],
+                     ['--reload-usr2', '--compare-cap-kill'],
+                     ['--nnp-ab', '--compare-cap-kill', '--reload-usr2'],
+                     ['--run', '--reload-usr2', '--compare-cap-kill'],
+                     ['--cap-matrix', '--reload-usr2', '--compare-cap-kill'],
+                     ['--nnp-ab', '--reload-usr2', '--compare-cap-kill', 'extra']):
+            self.assertEqual(self.invoke(self.D.main, args, patchers=(
+                patch.object(self.D, 'Controller', factory), patch.object(sys, 'stderr', io.StringIO()))), 64)
+        factory.assert_not_called()
+        for units, tls, interrupted in ((True, True, False), (False, True, False),
+                                        (True, False, False), (False, False, True)):
+            c, _, patchers = self.scheduler()
+            self.invoke(c.run_nnp_ab, reload_usr2=True, compare_cap_kill=True, patchers=patchers)
+            c.run_nnp_ab = Mock(return_value=0, side_effect=KeyboardInterrupt if interrupted else None)
+            c.cleanup, c.cleanup_ab_keys = Mock(return_value=units), Mock(return_value=tls)
+            rc, out, err = self.main_with(c, ['--nnp-ab', '--reload-usr2', '--compare-cap-kill'])
+            self.assertEqual((rc, err), (130 if interrupted else 0 if units and tls else 2, ''))
+            c.run_nnp_ab.assert_called_once_with(reload_usr2=True, compare_cap_kill=True)
+            report = next(call.args[1] for call in c.record.call_args_list if call.args[0] == 'nnp-ab.report.json')
+            for phase in self.D.CAP_KILL_PHASES:
+                reload = report['arms'][phase]['reload']
+                self.assertTrue(reload['unit_cleanup']['confirmed'])
+                self.assertIn('arms.' + phase + '.reload.unit_cleanup', reload['cleanup_evidence'])
+            self.assertEqual(report['arms']['cap-kill-a']['reload']['status'], 'failed')
+            self.assertEqual(report['cleanup_confirmed'], units)
+            self.assertEqual(report['tls_cleanup_confirmed'], tls)
+            self.assertEqual(report['cap_kill_comparison']['proven'], units and tls and not interrupted)
+            self.assertIn('unit wrapper untested', out)
+            self.assertFalse(report['complete'])
+            self.assertFalse(report['production_applied'])
 
 
 class HostBoundaryRegressions(unittest.TestCase):
