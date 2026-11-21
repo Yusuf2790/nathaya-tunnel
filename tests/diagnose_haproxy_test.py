@@ -4979,6 +4979,7 @@ class OptionalReloadContracts(Offline):
                 if state.sent and failure == 'old-pid':
                     self.pid = 102
                 self.request, self.buffer = b'', b''
+                self.eof_after_response = False
             def do_handshake(self):
                 if failure == 'timeout' or (state.final_tls_failure == 'timeout' and
                         c.reload_report['current_stage'] == 'final_verification'):
@@ -4997,6 +4998,10 @@ class OptionalReloadContracts(Offline):
                     pid = 103 if failure == 'continuity' and state.sent and self.pid == 102 else self.pid
                     self.buffer += outer.response(pid)
                     self.request = b''
+                    if ((failure == 'terminal-close' and state.sent)
+                            or (failure == 'baseline-close' and not state.sent)):
+                        self.buffer = self.buffer.replace(b'Content-Type:', b'Connection: close\r\nContent-Type:', 1)
+                        self.eof_after_response = True
                     if failure == 'protocol' and state.sent:
                         self.buffer = self.buffer.replace(b'200 OK', b'500 NO')
                 return len(data)
@@ -5004,6 +5009,8 @@ class OptionalReloadContracts(Offline):
                 if state.final_tls_failure == 'missing-http' and c.reload_report['current_stage'] == 'final_verification':
                     return b''
                 if not self.buffer:
+                    if self.eof_after_response:
+                        return b''
                     raise ssl.SSLWantReadError()
                 block, self.buffer = self.buffer[:size], self.buffer[size:]
                 return block
@@ -5309,6 +5316,29 @@ class OptionalReloadContracts(Offline):
             self.assertNotIn('PUBLIC-CERT-FIXTURE', str(c.record.call_args_list))
             self.assert_reload_closed(state)
 
+    def test_reload_terminal_responses_can_close_but_baseline_must_remain_open(self):
+        for mode in ('terminal-close', 'baseline-close'):
+            with self.subTest(mode=mode):
+                c, plan, state, sig, _, patchers = self.reload_fixture(
+                    old=True, failure=mode, compare_phase='cap-kill-b')
+                state.old_exit_delay = 0.05
+                report = self.invoke(c.reload_usr2, plan, patchers=patchers)
+                self.assert_reload_closed(state)
+                if mode == 'baseline-close':
+                    sig.assert_not_called()
+                    self.assertEqual(report['issues'], ['reload-http-connection-close'])
+                    self.assertIsNone(report['baseline_request'])
+                    continue
+                self.assertEqual(report['status'], 'passed', report['issues'])
+                sig.assert_called_once_with(700, signal.SIGUSR2, None, 0)
+                self.assertEqual(report['continuity_request']['pid'], 102)
+                self.assertEqual(report['final_request']['pid'], 103)
+                self.assertTrue(report['continuity_request']['marker_verified'])
+                self.assertTrue(report['final_request']['marker_verified'])
+                self.assertTrue(report['master_cap_kill_effective'])
+                self.assertTrue(report['old_workers_exited'])
+                self.assertLess(report['clients_closed_at'], report['old_workers_exited_at'])
+
     def test_reload_refusals_before_signal_never_attempt_delivery(self):
         for failure in ('source', 'source-bytes', 'policy', 'assets', 'lock', 'identity',
                         'credentials', 'coverage-before', 'pin'):
@@ -5606,21 +5636,30 @@ class OptionalReloadContracts(Offline):
         good = self.response()
         bad_responses = [good.replace(b'200 OK', b'201 OK'), good.replace(b'HTTP/1.1', b'HTTP/1.0'),
             good.replace(b'Content-Length:', b'Transfer-Encoding:'), good + b'extra',
+            good.replace(b'Content-Type: text/plain', b'Content-Type: text/html'),
             good.replace(NONCE.encode(), b'b' * 32), good.replace(b'pid=102', b'pid=0'),
-            good.replace(b'Content-Type: text/plain', b'Connection: close\r\nContent-Type: text/plain'),
             b'x' * 8193, good[:-1], good.replace(b'Content-Length:', b'Content-Length: 999\r\nX:')]
-        for raw in [good] + bad_responses:
-            sock = Mock()
-            sock.recv.side_effect = [raw, ssl.SSLWantReadError()] if raw == good else [raw, b'']
-            sock.pending.return_value = 0
-            def io_call(sock, operation, size):
-                self.assertLessEqual(size, 8193)
-                return operation(size)
-            if raw == good:
-                self.assertEqual(self.D._reload_response(sock, io_call, NONCE)['pid'], 102)
-            else:
+        def io_call(sock, operation, size):
+            self.assertLessEqual(size, 8193)
+            return operation(size)
+        sock = Mock()
+        sock.pending.return_value = 0
+        for allow_close in (False, True):
+            sock.recv.side_effect = [good, ssl.SSLWantReadError()]
+            self.assertEqual(self.D._reload_response(sock, io_call, NONCE, allow_close=allow_close)['pid'], 102)
+            for raw in bad_responses:
+                sock.recv.side_effect = [raw, b'']
                 with self.assertRaises(self.D.Unsupported):
-                    self.D._reload_response(sock, io_call, NONCE)
+                    self.D._reload_response(sock, io_call, NONCE, allow_close=allow_close)
+            sock.recv.side_effect = [good, b'x']
+            with self.assertRaisesRegex(self.D.Unsupported, 'reload-http-extra-or-eof'):
+                self.D._reload_response(sock, io_call, NONCE, allow_close=allow_close)
+        for eof in (b'', ssl.SSLZeroReturnError()):
+            sock.recv.side_effect = [good, eof]
+            self.assertEqual(self.D._reload_response(sock, io_call, NONCE, allow_close=True)['pid'], 102)
+            sock.recv.side_effect = [good, eof]
+            with self.assertRaisesRegex(self.D.Unsupported, 'reload-http-extra-or-eof'):
+                self.D._reload_response(sock, io_call, NONCE)
 
     def test_reload_phase_dispatches_only_requested_verified_existing_b(self):
         for phase in ('nnp-yes', 'nnp-no'):

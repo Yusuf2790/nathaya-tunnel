@@ -614,7 +614,7 @@ def reload_report(requested):
         coverage=[], pidfd_binding_verified=False, issues=[])
 
 
-def _reload_response(sock, io, marker):
+def _reload_response(sock, io, marker, *, allow_close=False):
     """Read one bounded HTTP/1.1 response; never persist payload or headers."""
     data = b''
     while b'\r\n\r\n' not in data:
@@ -637,9 +637,10 @@ def _reload_response(sock, io, marker):
         headers[name] = value
     length = headers.get(b'content-length', b'')
     if (not re.fullmatch(rb'[0-9]{1,3}', length) or not 1 <= int(length) <= 128
-            or b'transfer-encoding' in headers or headers.get(b'content-type') != b'text/plain'
-            or b'close' in [t.strip().lower() for t in headers.get(b'connection', b'').split(b',')]):
-        raise Unsupported('reload-http-framing-or-close')
+            or b'transfer-encoding' in headers or headers.get(b'content-type') != b'text/plain'):
+        raise Unsupported('reload-http-framing')
+    if not allow_close and b'close' in {t.strip().lower() for t in headers.get(b'connection', b'').split(b',')}:
+        raise Unsupported('reload-http-connection-close')
     size = int(length)
     while len(body) < size:
         block = io(sock, sock.recv, size - len(body))
@@ -650,10 +651,12 @@ def _reload_response(sock, io, marker):
     if len(body) != size or not match or sock.pending():
         raise Unsupported('reload-http-body-or-extra')
     try:
-        sock.recv(1)  # Nonblocking: reject buffered extras/EOF, never pretend an idle hold.
+        extra = sock.recv(1)  # Nonblocking: reject trailing bytes even on final responses.
     except (ssl.SSLWantReadError, BlockingIOError):
-        pass
-    else:
+        extra = None
+    except ssl.SSLZeroReturnError:
+        extra = b''
+    if extra or (extra == b'' and not allow_close):
         raise Unsupported('reload-http-extra-or-eof')
     return {'status': 200, 'pid': int(match[1]), 'body_bytes': size, 'marker_verified': True}
 
@@ -2654,7 +2657,7 @@ class Controller:
             left()
             return master, workers
 
-        def fresh():
+        def fresh(*, keep_open=False):
             nonlocal network_end
             left()
             network_end = min(deadline, time.monotonic() + 2.0)
@@ -2685,7 +2688,7 @@ class Controller:
             if hashlib.sha256(tls.getpeercert(binary_form=True)).hexdigest() != pin:
                 raise Unsupported('reload-leaf-pin')
             send(tls, b'GET / HTTP/1.1\r\nHost: localhost\r\n\r\n')
-            response = _reload_response(tls, io, self.nonce)
+            response = _reload_response(tls, io, self.nonce, allow_close=not keep_open)
             left()
             network_end = min(overall, deadline)
             return tls, response
@@ -2772,7 +2775,7 @@ class Controller:
             if self.compare_cap_kill:
                 report['master_cap_kill_effective'] = bool(master['status']['CapEff'] & (1 << CAP_BITS['CAP_KILL']))
                 report['source_to_startup_delta'] = sorted(set(report['startup_caps']) - set(report['source_caps']))
-            held, response = fresh()
+            held, response = fresh(keep_open=True)
             report['baseline_request'] = response
             if not serves(response, old):
                 raise Unsupported('reload-baseline-not-old-worker')
@@ -2829,7 +2832,9 @@ class Controller:
                 raise Unsupported('reload-held-old-worker-exited-before-continuity')
             send(held, b'\r\n')
             network_end = min(deadline, time.monotonic() + 2.0)
-            response = _reload_response(held, io, self.nonce)
+            # This is the last request on the held connection. The stopping
+            # worker may close it after delivering the complete response.
+            response = _reload_response(held, io, self.nonce, allow_close=True)
             network_end = deadline
             report['continuity_request'] = response
             if not serves(response, old):
