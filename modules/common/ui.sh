@@ -176,7 +176,7 @@ draw_menu_item() {
     elif [[ "$key" == x ]]; then
         color="$RED"
     fi
-    printf '  %b%-4s%b  %b%s%b\n' "$color" "[$key]" "$RESET" "$WHITE" "$label" "$RESET"
+    printf '  %b%-4s%b  %b%s%b\n' "$color" "[$key]" "$RESET" "${3-$WHITE}" "$label" "$RESET"
 }
 
 draw_submenu_navigation() {
@@ -214,7 +214,7 @@ draw_menu_choices() {
 
     if (( width < 2 * (column_width + 8) || ${#keys[@]} < 6 )); then
         for index in "${!keys[@]}"; do
-            draw_menu_item "${keys[index]}" "${labels[index]}"
+            draw_menu_item "${keys[index]}" "${labels[index]}" ''
         done
         return
     fi
@@ -223,7 +223,7 @@ draw_menu_choices() {
     for ((index = 0; index < half; index++)); do
         printf '  %b%-4s%b  %-*s' "$ORANGE" "[${keys[index]}]" "$RESET" "$column_width" "${labels[index]}"
         if (( index + half < ${#keys[@]} )); then
-            draw_menu_item "${keys[index + half]}" "${labels[index + half]}"
+            draw_menu_item "${keys[index + half]}" "${labels[index + half]}" ''
         else
             printf '\n'
         fi
