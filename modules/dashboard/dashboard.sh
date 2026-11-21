@@ -5,44 +5,48 @@
 source "$NATHAYA_BASE/modules/common/ui.sh"
 source "$NATHAYA_BASE/modules/common/functions.sh"
 
-_service_row() {
-    local name1="$1"
-    local state1="$2"
-    local name2="$3"
-    local state2="$4"
-    local visible_len
+draw_service_status() {
+    local width="$1" index state badge_width bot_index
+    local left_width=$(( (width - 2) / 2 )) inline_bots=0
+    local -a names=(SSH XRAY DROPBEAR NGINX OPENVPN)
+    local -a units=(ssh xray dropbear nginx openvpn)
+    local -a bots=("Bot Akses VPS" "Bot Notifikasi")
+    local -a bot_states=("${TELEGRAM_MANAGEMENT_STATUS:-OFF}" "$(notification_bot_status)")
 
-    printf '%b│%b %-8s : ' "$CYAN" "$RESET" "$name1"
-    status_badge "$state1"
-
-    if [[ "$state1" == "ON" ]]; then
-        visible_len=4
-    else
-        visible_len=5
+    # Sisakan ruang untuk nama dan lencana bot. Di panel sempit,
+    # lencana bot tampil di bawah nama, tetap di kolom kanan.
+    if (( width >= 40 )); then
+        inline_bots=1
+        (( left_width > width - 25 )) && left_width=$((width - 25))
     fi
 
-    printf '%*s│ ' "$((20 - 13 - visible_len))" ''
-    printf '%-8s : ' "$name2"
-    status_badge "$state2"
     printf '\n'
-}
+    draw_section_title "SERVICE & BOT STATUS" "$width"
+    for index in "${!names[@]}"; do
+        state=$(get_service_status "${units[index]}")
+        badge_width=5
+        [[ "$state" == ON ]] && badge_width=4
+        printf ' %-8s ' "${names[index]}"
+        status_badge "$state"
+        printf '%*s %b│%b' "$((left_width - 10 - badge_width))" '' "$CYAN" "$RESET"
 
-draw_service_status() {
-    local width="$1"
-    # SERVICE STATUS
-    printf '\n'
-    draw_section_title "SERVICE STATUS" "$width"
-
-    _service_row "SSH" "$(get_service_status ssh)" "XRAY" "$(get_service_status xray)"
-    _service_row "DROPBEAR" "$(get_service_status dropbear)" \
-        "NGINX" "$(get_service_status nginx)"
-
-    printf '%b│%b OPENVPN  : ' "$CYAN" "$RESET"
-    status_badge "$(get_service_status openvpn)"
-    printf '\n'
-
-    draw_box_bottom "$width" "$CYAN"
-
+        if (( inline_bots )); then
+            if (( index < ${#bots[@]} )); then
+                printf ' %-14s : ' "${bots[index]}"
+                status_badge "${bot_states[index]}"
+            fi
+        elif (( index < 2 * ${#bots[@]} )); then
+            bot_index=$((index / 2))
+            if (( index % 2 == 0 )); then
+                printf ' %s' "${bots[bot_index]}"
+            else
+                printf ' '
+                status_badge "${bot_states[bot_index]}"
+            fi
+        fi
+        printf '\n'
+    done
+    draw_box_bottom "$width"
 }
 
 draw_dashboard_info() {
@@ -77,15 +81,6 @@ draw_dashboard_info() {
     printf '%b│%b DOMAIN    : %s\n' "$CYAN" "$RESET" "${DOMAIN:-Belum disetting}"
 
     draw_box_bottom "$width" "$CYAN"
-
-    printf '\n'
-    draw_section_title "TELEGRAM STATUS" "$width"
-    printf '  Bot Akses VPS  : '
-    status_badge "${TELEGRAM_MANAGEMENT_STATUS:-OFF}"
-    printf '\n  Bot Notifikasi : '
-    status_badge "$(notification_bot_status)"
-    printf '\n'
-    draw_box_bottom "$width"
 
     draw_service_status "$width"
 

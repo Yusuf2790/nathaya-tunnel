@@ -125,26 +125,44 @@ def print_rx_tx(rx, tx):
     print(f"  RX : {rx}\n  TX : {tx}")
 
 
+def period_rows(label, period, counters):
+    rx, tx = map(units, counters) if counters is not None else ("belum dicatat",) * 2
+    return (f"{label} :", period, f"RX : {rx}", f"TX : {tx}")
+
+
+def print_periods(daily, monthly, width):
+    separator = "  " + "─" * max(0, width - 2)
+    for left, right in (
+        (daily, monthly),
+        (("Harian :",) + daily[1:], ("Bulanan :",) + monthly[1:]),
+    ):
+        left_width = max(map(len, left))
+        if 2 + left_width + 3 + max(map(len, right)) <= width:
+            for day_line, month_line in zip(left, right):
+                print(f"  {day_line:<{left_width}} │ {month_line}")
+            print(separator)
+            return
+
+    # Pertahankan label dan angka utuh jika terminal terlalu sempit.
+    for rows in (daily, monthly):
+        for line in rows:
+            print(f"  {line}")
+        print(separator)
+
+
 def report(previous=None, width=None):
     current = sample()
     state = load()
     totals = project(state, current)
     now = datetime.fromtimestamp(current["time"])
     terminal_width = get_terminal_size(fallback=(width or 50, 24)).columns
-    separator = "  " + "─" * max(0, min(width or 64, terminal_width) - 2)
+    panel_width = min(width or 64, terminal_width)
 
     date_label = f"{DAYS_ID[now.weekday()]}, {now:%d:%m:%Y}"
-    for key, label, period in (
-        ("day", "Monitoring Harian", date_label),
-        ("month", "Monitoring Bulanan", MONTHS_ID[now.month - 1]),
-    ):
-        print(f"  {label} :\n  {period}")
-        if state:
-            _, (rx, tx) = totals[key]
-            print_rx_tx(units(rx), units(tx))
-        else:
-            print_rx_tx("belum dicatat", "belum dicatat")
-        print(separator)
+    daily = period_rows("Monitoring Harian", date_label, totals["day"][1] if state else None)
+    monthly = period_rows("Monitoring Bulanan", MONTHS_ID[now.month - 1],
+                          totals["month"][1] if state else None)
+    print_periods(daily, monthly, panel_width)
 
     print("  Trafik Realtime :")
     if previous and previous["identity"] == current["identity"]:
