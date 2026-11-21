@@ -44,7 +44,12 @@ set_domain_vps() {
     printf "  Masukkan domain VPS.\n"
     printf "  Contoh: id1.nathaya.web.id\n\n"
 
-    read -r -p "  Domain baru: " domain
+    draw_submenu_navigation
+    read -r -p "  Domain baru: " domain || return "$DASHBOARD_EXIT"
+    case "${domain,,}" in
+        z) return 0 ;;
+        x|exit|keluar) return "$DASHBOARD_EXIT" ;;
+    esac
 
     domain="${domain,,}"
     domain="${domain%.}"
@@ -56,8 +61,8 @@ set_domain_vps() {
        [[ "$domain" == *..* ]] ||
        [[ "$domain" =~ (^|[.])-|-(\.|$) ]]; then
         printf "\n  Domain tidak valid. Periksa kembali.\n"
-        pause_return
-        return 1
+        wait_submenu_navigation
+        return
     fi
 
     printf "\n  Memeriksa domain...\n"
@@ -65,8 +70,8 @@ set_domain_vps() {
     if ! vps_ip=$(get_vps_ipv4); then
         printf "\n  Tidak dapat memeriksa koneksi VPS.\n"
         printf "  Silakan coba lagi nanti.\n"
-        pause_return
-        return 1
+        wait_submenu_navigation
+        return
     fi
 
     dns_cf=$(get_domain_a_records "$domain" "1.1.1.1")
@@ -83,19 +88,22 @@ set_domain_vps() {
     if (( valid_cf != 1 || valid_google != 1 )); then
         printf "\n  Domain belum terhubung ke VPS.\n"
         printf "  Periksa pengaturan DNS domain, lalu coba lagi.\n"
-        pause_return
-        return 1
+        wait_submenu_navigation
+        return
     fi
 
     printf "\n  Domain berhasil diverifikasi!\n"
-    read -r -p "  Simpan domain ini? [y/N]: " confirm
+    draw_submenu_navigation
+    read -r -p "  Simpan domain ini? [y/N atau z/x]: " confirm || return "$DASHBOARD_EXIT"
 
     case "${confirm,,}" in
         y|ya) ;;
+        z) return 0 ;;
+        x|exit|keluar) return "$DASHBOARD_EXIT" ;;
         *)
             printf "\n  Perubahan dibatalkan.\n"
-            pause_return
-            return 0
+            wait_submenu_navigation
+            return
             ;;
     esac
 
@@ -106,8 +114,8 @@ set_domain_vps() {
     local tmp
     tmp=$(mktemp "${CONFIG_FILE}.XXXXXX") || {
         printf "\n  Gagal menyimpan konfigurasi.\n"
-        pause_return
-        return 1
+        wait_submenu_navigation
+        return
     }
 
     if [[ -f "$CONFIG_FILE" ]]; then
@@ -119,5 +127,5 @@ set_domain_vps() {
     mv "$tmp" "$CONFIG_FILE"
 
     printf "\n  Domain berhasil disimpan!\n"
-    pause_return
+    wait_submenu_navigation
 }

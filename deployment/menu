@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+
+if (( EUID != 0 )); then
+    printf 'Jalankan menu sebagai root.\n' >&2
+    exit 1
+fi
+
+exec /bin/bash /opt/nathaya/menu.sh "$@"

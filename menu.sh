@@ -6,11 +6,11 @@
 # ==========================================
 
 NATHAYA_BASE="${NATHAYA_BASE:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}"
-CONFIG_FILE="/etc/nathaya-tunnel/config.conf"
 
 source "$NATHAYA_BASE/modules/common/ui.sh"
 source "$NATHAYA_BASE/modules/common/functions.sh"
 source "$NATHAYA_BASE/modules/dashboard/dashboard.sh"
+source "$NATHAYA_BASE/modules/dashboard/traffic.sh"
 source "$NATHAYA_BASE/modules/menu/main.sh"
 source "$NATHAYA_BASE/modules/menu/ssh.sh"
 source "$NATHAYA_BASE/modules/menu/domain.sh"
@@ -18,164 +18,79 @@ source "$NATHAYA_BASE/modules/menu/set_domain.sh"
 
 # ---------- Informasi versi ----------
 SCRIPT_VERSION="1.0.0"
+# Status internal untuk meneruskan Keluar hingga loop dashboard.
+DASHBOARD_EXIT=10
 
-if [[ -f "$CONFIG_FILE" ]]; then
-    source "$CONFIG_FILE"
-fi
-
-# ---------- Pesan fitur sementara ----------
 feature_not_ready() {
-    clear
+    clear_screen
     local width
     width=$(get_width)
-
-    draw_nathaya_header
-    draw_section_title "INFORMATION" "$width"
-
-    printf "  ${WHITE}Fitur ini belum tersedia.${RESET}\n"
-    printf "  ${WHITE}Modul akan dibuat pada tahap berikutnya.${RESET}\n"
-
-    draw_box_bottom "$width" "$CYAN" "$RESET"
-    pause_return
+    draw_nathaya_header "$width"
+    draw_section_title "${1:-INFORMASI}" "$width"
+    printf '  Modul belum tersedia\n'
+    wait_submenu_navigation "$width"
 }
 
-# ---------- Dashboard ----------
 dashboard_loop() {
+    local choice status
     while true; do
-        clear
+        clear_screen
         draw_dashboard_info
-
-        read -r choice
-
+        read -r -p "  Pilih menu [1-8 atau x]: " choice || return 0
         case "${choice,,}" in
-            menu)
-                main_menu_loop
-                ;;
-            x|exit|keluar)
-                exit 0
-                ;;
-            *)
-                printf "\\nPilihan tidak dikenal.\\n"
-                sleep 1
-                ;;
+            1) show_ssh_menu ;;
+            2) feature_not_ready VMESS ;;
+            3) feature_not_ready VLESS ;;
+            4) feature_not_ready TROJAN ;;
+            5) feature_not_ready "BOT AKSES VPS" ;;
+            6) show_notification_bot ;;
+            7) feature_not_ready "SET BANNER" ;;
+            8) features_menu_loop ;;
+            x|exit|keluar) return 0 ;;
+            *) printf '\n  Pilihan tidak valid.\n'; sleep 1 ;;
         esac
+        status=$?
+        if (( status == DASHBOARD_EXIT )); then return 0; fi
     done
 }
 
-# ---------- Menu utama ----------
-main_menu_loop() {
+features_menu_loop() {
+    local choice status
     while true; do
-        show_main_menu
-        read -r -p "  Pilih menu: " choice
-
+        show_features_menu
+        read -r -p "  Pilih menu Features: " choice || return "$DASHBOARD_EXIT"
         case "${choice,,}" in
-            1)
-                ssh_menu_loop
+            1) show_live_traffic ;;
+            2)
+                clear_screen
+                draw_service_status "$(get_width)"
+                wait_submenu_navigation
                 ;;
-            2|3|4|5|6|7|8|9)
-                feature_not_ready
-                ;;
-            10)
-                domain_menu_loop
-                ;;
-            z)
-                return
-                ;;
-            x|exit|keluar)
-                exit 0
-                ;;
-            *)
-                printf "\n  Pilihan tidak valid.\n"
-                sleep 1
-                ;;
+            3) domain_menu_loop ;;
+            z) return 0 ;;
+            x|exit|keluar) return "$DASHBOARD_EXIT" ;;
+            *) printf '\n  Pilihan tidak valid.\n'; sleep 1 ;;
         esac
-    done
-}
-
-# ---------- Submenu SSH ----------
-ssh_menu_loop() {
-    while true; do
-        show_ssh_menu
-        read -r -p "  Pilih menu SSH: " choice
-
-        case "${choice,,}" in
-            1)
-                source "$NATHAYA_BASE/modules/ssh/create.sh"
-                create_ssh_account
-                ;;
-                2)
-                source "$NATHAYA_BASE/modules/ssh/delete.sh"
-                delete_ssh_account
-                ;;
-                3)
-                source "$NATHAYA_BASE/modules/ssh/renew.sh"
-                renew_ssh_account
-                ;;
-                4)
-                source "$NATHAYA_BASE/modules/ssh/trial.sh"
-                create_trial_account
-                ;;
-                5)
-                    source "$NATHAYA_BASE/modules/ssh/login.sh"
-                    check_ssh_user_login
-                    ;;
-                6)
-                    source "$NATHAYA_BASE/modules/ssh/list-member.sh"
-                    list_ssh_members
-                    ;;
-                7)
-                    source "$NATHAYA_BASE/modules/ssh/list-expired.sh"
-                    list_expired_ssh_users
-                    ;;
-                8)
-                    source "$NATHAYA_BASE/modules/ssh/lock.sh"
-                    lock_ssh_account
-                    ;;
-                9)
-                    source "$NATHAYA_BASE/modules/ssh/unlock.sh"
-                    unlock_ssh_account
-                    ;;
-                10)
-                    feature_not_ready
-                    ;;
-            z)
-                return
-                ;;
-            x|exit|keluar)
-                exit 0
-                ;;
-            *)
-                printf "\n  Pilihan tidak valid.\n"
-                sleep 1
-                ;;
-        esac
+        status=$?
+        if (( status == DASHBOARD_EXIT )); then return "$DASHBOARD_EXIT"; fi
     done
 }
 
 # ---------- Submenu Domain ----------
 domain_menu_loop() {
+    local choice status
     while true; do
         show_domain_menu
-        read -r -p "  Pilih menu Domain: " choice
-
+        read -r -p "  Pilih menu Domain: " choice || return "$DASHBOARD_EXIT"
         case "${choice,,}" in
-            1)
-                set_domain_vps
-                ;;
-            2)
-                feature_not_ready
-                ;;
-            z)
-                return
-                ;;
-            x|exit|keluar)
-                exit 0
-                ;;
-            *)
-                printf "\n  Pilihan tidak valid.\n"
-                sleep 1
-                ;;
+            1) set_domain_vps ;;
+            2) feature_not_ready ;;
+            z) return 0 ;;
+            x|exit|keluar) return "$DASHBOARD_EXIT" ;;
+            *) printf '\n  Pilihan tidak valid.\n'; sleep 1 ;;
         esac
+        status=$?
+        if (( status == DASHBOARD_EXIT )); then return "$DASHBOARD_EXIT"; fi
     done
 }
 

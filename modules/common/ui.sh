@@ -55,7 +55,7 @@ repeat_char() {
 
 center_text() {
     local text="$1"
-    local width="$2"
+    local width="${2:-$(get_width)}"
     local padding
 
     padding=$(( (width - ${#text}) / 2 ))
@@ -89,7 +89,7 @@ draw_box_bottom() {
 # Judul bagian dengan lebar total konsisten.
 draw_section_title() {
     local title="$1"
-    local width="$2"
+    local width="${2:-$(get_width)}"
     local color="${3:-$CYAN}"
     local title_len=${#title}
     local remaining left right
@@ -156,4 +156,71 @@ draw_nathaya_header() {
     printf '%b│%b\n' "$CYAN" "$RESET"
 
     draw_box_bottom "$width" "$CYAN"
+}
+
+draw_menu_item() {
+    local key="$1" label="$2" color="$GREEN"
+    if [[ "$key" =~ ^[0-9]+$ ]]; then
+        color="$ORANGE"
+    elif [[ "$key" == x ]]; then
+        color="$RED"
+    fi
+    printf '  %b%-4s%b  %b%s%b\n' "$color" "[$key]" "$RESET" "$WHITE" "$label" "$RESET"
+}
+
+draw_submenu_navigation() {
+    draw_menu_item z "Kembali"
+    draw_menu_item x "Keluar"
+}
+
+wait_submenu_navigation() {
+    local width="${1:-}" choice
+    draw_submenu_navigation
+    if [[ -n "$width" ]]; then draw_box_bottom "$width"; fi
+    while read -r -p "  Pilih [z/x]: " choice; do
+        case "${choice,,}" in
+            z) return 0 ;;
+            x|exit|keluar) return "$DASHBOARD_EXIT" ;;
+            *) printf '  Pilihan tidak valid.\n' ;;
+        esac
+    done
+    return "$DASHBOARD_EXIT"
+}
+
+draw_menu_choices() {
+    local width="$1"
+    shift
+    local -a keys=() labels=()
+    local column_width=0 index size half
+
+    while (( $# )); do
+        keys+=("$1")
+        labels+=("$2")
+        size=${#2}
+        (( size > column_width )) && column_width=$size
+        shift 2
+    done
+
+    if (( width < 2 * (column_width + 8) || ${#keys[@]} < 6 )); then
+        for index in "${!keys[@]}"; do
+            draw_menu_item "${keys[index]}" "${labels[index]}"
+        done
+        return
+    fi
+
+    half=$(( (${#keys[@]} + 1) / 2 ))
+    for ((index = 0; index < half; index++)); do
+        printf '  %b%-4s%b  %-*s' "$ORANGE" "[${keys[index]}]" "$RESET" "$column_width" "${labels[index]}"
+        if (( index + half < ${#keys[@]} )); then
+            draw_menu_item "${keys[index + half]}" "${labels[index + half]}"
+        else
+            printf '\n'
+        fi
+    done
+}
+
+clear_screen() {
+    if [[ -t 1 && -n "${TERM:-}" && "$TERM" != dumb ]]; then
+        clear
+    fi
 }

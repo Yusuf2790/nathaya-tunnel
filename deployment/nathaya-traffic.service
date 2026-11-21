@@ -1,0 +1,9 @@
+[Unit]
+Description=Nathaya Tunnel uplink traffic collector
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/nathaya/modules/dashboard/traffic.py collect
+StateDirectory=nathaya-tunnel
+StateDirectoryMode=0750

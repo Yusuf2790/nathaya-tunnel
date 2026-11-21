@@ -27,6 +27,24 @@ _service_row() {
     printf '\n'
 }
 
+draw_service_status() {
+    local width="$1"
+    # SERVICE STATUS
+    printf '\n'
+    draw_section_title "SERVICE STATUS" "$width"
+
+    _service_row "SSH" "$(get_service_status ssh)" "XRAY" "$(get_service_status xray)"
+    _service_row "DROPBEAR" "$(get_service_status dropbear)" \
+        "NGINX" "$(get_service_status nginx)"
+
+    printf '%b│%b OPENVPN  : ' "$CYAN" "$RESET"
+    status_badge "$(get_service_status openvpn)"
+    printf '\n'
+
+    draw_box_bottom "$width" "$CYAN"
+
+}
+
 draw_dashboard_info() {
     refresh_system_info
 
@@ -60,42 +78,27 @@ draw_dashboard_info() {
 
     draw_box_bottom "$width" "$CYAN"
 
-    # TELEGRAM STATUS
     printf '\n'
     draw_section_title "TELEGRAM STATUS" "$width"
-
-    printf '%b│%b Notification Bot : ' "$CYAN" "$RESET"
-    status_badge "${TELEGRAM_NOTIFICATION_STATUS:-OFF}"
-    printf ' │ Management Bot : '
+    printf '  Bot Akses VPS  : '
     status_badge "${TELEGRAM_MANAGEMENT_STATUS:-OFF}"
+    printf '\n  Bot Notifikasi : '
+    status_badge "$(notification_bot_status)"
     printf '\n'
+    draw_box_bottom "$width"
 
-    draw_box_bottom "$width" "$CYAN"
-
-    # SERVICE STATUS
-    printf '\n'
-    draw_section_title "SERVICE STATUS" "$width"
-
-    _service_row "SSH" "$SSH_STATUS" "XRAY" "$XRAY_STATUS"
-    _service_row "DROPBEAR" "$(get_service_status dropbear)" \
-        "NGINX" "$(get_service_status nginx)"
-
-    printf '%b│%b OPENVPN  : ' "$CYAN" "$RESET"
-    status_badge "$(get_service_status openvpn)"
-    printf '\n'
-
-    draw_box_bottom "$width" "$CYAN"
+    draw_service_status "$width"
 
     # ACCOUNT TOTAL
     printf '\n'
     draw_section_title "ACCOUNT TOTAL" "$width"
 
-    printf '%b│%b SSH : %b%s%b │ VMESS : %b0%b │ VLESS : %b0%b │ TROJAN : %b0%b\n' \
-        "$CYAN" "$RESET" "$ORANGE" "$SSH_TOTAL" "$RESET" \
-        "$ORANGE" "$RESET" "$ORANGE" "$RESET" \
-        "$ORANGE" "$RESET"
+    printf '  SSH: %s   VMESS: 0   VLESS: 0   TROJAN: 0\n' "$SSH_TOTAL"
+    draw_box_bottom "$width"
 
-    draw_box_bottom "$width" "$CYAN"
+    draw_traffic_summary "$width"
+    printf '\n'
+    show_main_menu
 
     # FOOTER
     printf '\n'
@@ -104,6 +107,9 @@ draw_dashboard_info() {
     printf '%b│%b Script Version : %s\n' \
         "$CYAN" "$RESET" "${SCRIPT_VERSION:-1.0.0}"
 
+    printf '%b│%b Client Name    : %s\n' "$CYAN" "$RESET" "${CLIENT_NAME:--}"
+    printf '%b│%b Order by       : %s\n' "$CYAN" "$RESET" "${ORDER_BY:--}"
+
     printf '%b│%b Developer      : %b%s%b\n' \
         "$CYAN" "$RESET" "$ORANGE" \
         "${SCRIPT_DEVELOPER:-Nathaya Tunnel}" "$RESET"
@@ -111,5 +117,25 @@ draw_dashboard_info() {
     draw_box_bottom "$width" "$CYAN"
 
     printf '\n'
-    printf 'Ketik "menu" untuk membuka panel, atau "x" untuk keluar: '
+}
+
+notification_bot_status() {
+    if [[ "${TELEGRAM_STATUS:-OFF}" == ON && -n "${TELEGRAM_BOT_TOKEN:-}" &&
+          "${TELEGRAM_ADMIN_ID:-}" =~ ^-?[0-9]+$ ]]; then
+        printf ON
+    else
+        printf OFF
+    fi
+}
+
+show_notification_bot() {
+    clear_screen
+    local width
+    width=$(get_width)
+    draw_nathaya_header "$width"
+    draw_section_title "BOT NOTIFIKASI" "$width"
+    printf '  Status konfigurasi: '
+    status_badge "$(notification_bot_status)"
+    printf '\n'
+    wait_submenu_navigation "$width"
 }
