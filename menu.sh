@@ -20,6 +20,20 @@ source "$NATHAYA_BASE/modules/menu/set_domain.sh"
 SCRIPT_VERSION="1.0.0"
 # Status internal untuk meneruskan Keluar hingga loop dashboard.
 DASHBOARD_EXIT=10
+DASHBOARD_MONITOR_PID=
+
+finish_dashboard() {
+    # Abaikan SIGINT tambahan saat membereskan monitor dan tampilkan pesan sekali.
+    trap '' INT
+    if [[ -n "$DASHBOARD_MONITOR_PID" ]]; then
+        kill -TERM "$DASHBOARD_MONITOR_PID" 2>/dev/null || true
+        wait "$DASHBOARD_MONITOR_PID" 2>/dev/null || true
+    fi
+    if [[ -t 0 && -t 1 ]]; then
+        printf '\n%bKetik "menu" untuk kembali ke menu%b\n' "$WHITE" "$RESET"
+    fi
+    exit 0
+}
 
 feature_not_ready() {
     clear_screen
@@ -95,4 +109,8 @@ domain_menu_loop() {
 }
 
 # ---------- Jalankan aplikasi ----------
+# Monitor latar harus tetap di grup foreground agar bisa membaca TTY.
+set +m
+trap finish_dashboard INT
 dashboard_loop
+finish_dashboard

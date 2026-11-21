@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import select
 from shutil import get_terminal_size
+import signal
 import subprocess
 import sys
 from tempfile import NamedTemporaryFile
@@ -196,6 +197,11 @@ def wait_live_navigation():
     return None
 
 
+def stop_live_monitor(signum, _frame):
+    # Keluar lewat Python agar subprocess yang sedang dipakai ikut dibereskan.
+    raise SystemExit(128 + signum)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", choices=("collect", "show", "live"))
@@ -207,6 +213,9 @@ def main():
         collect()
         return
 
+    if mode == "live":
+        signal.signal(signal.SIGTERM, stop_live_monitor)
+
     previous = sample()
     time.sleep(1)
     while True:
@@ -215,7 +224,7 @@ def main():
         previous = report(previous, args.width, args.divider_column)
         if mode == "show":
             return
-        print("\n  [z]  Kembali\n  [x]  Keluar\n  z/x: tekan Enter\n  Ctrl+C untuk kembali", flush=True)
+        print("\n  [z]  Kembali\n  [x]  Keluar\n  z/x: tekan Enter\n  Ctrl+C untuk keluar ke shell", flush=True)
         status = wait_live_navigation()
         if status is not None:
             return status
@@ -225,6 +234,6 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except KeyboardInterrupt:
-        pass
+        raise SystemExit(130)
     except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
         raise SystemExit(str(error))
