@@ -35,7 +35,7 @@ Pure public interfaces:
   Controller.audit_compatibility(...) -> private aggregate dict (pure, no IO)
   make_config(port, abstract_name) -> str (legacy NO_TLS)
   make_ab_config(port, abstract_name, private_pem, reload_http=False, marker=None) -> str
-  nnp_ab_plan(directory, nonce, caps, phase) -> closed A/B plan
+  nnp_ab_plan(directory, nonce, caps, phase, reload_usr2=False) -> closed A/B plan
   Controller.validate_nnp_ab(probe, plan) -> None (pure exact-plan proof)
   Controller.compare_nnp_ab(a, b, a_plan, b_plan) -> private raw inventory
   Controller.run_nnp_ab(reload_usr2=False) -> diagnostic exit code; nnp-ab.report.json
@@ -91,6 +91,10 @@ SYSCALLS = (
 )
 IDENTITY_CALLS = frozenset(('getuid', 'geteuid', 'getresuid', 'setuid',
                             'setreuid', 'setresuid', 'setfsuid'))
+RELOAD_OVERALL_SECONDS = 24.0
+RELOAD_RELEASE_LIMIT_SECONDS = 29.0
+RELOAD_STAGES = (('preparation', 5.0), ('new_worker', 5.0), ('continuity', 2.0),
+                 ('old_worker_exit', 5.0), ('final_verification', 4.0))
 
 
 class Unsupported(ValueError):
@@ -565,8 +569,10 @@ def make_ab_config(port, abstract_name, private_pem, reload_http=False, marker=N
     if reload_http:
         # %pid is HAProxy's log-format PID variable (NOT proc.pid):
         # https://docs.haproxy.org/2.8/configuration.html#8.2.6
+        config = config.replace('    timeout client 2s\n    timeout server 2s\n',
+                                '    timeout client 15s\n    timeout server 15s\n')
         config = config.replace('    tcp-request content reject\n',
-            '    mode http\n    option http-keep-alive\n'
+            '    mode http\n    option http-keep-alive\n    timeout http-request 15s\n'
             '    http-request return status 200 content-type text/plain lf-string '
             f'"nathaya-reload:{marker} pid=%pid"\n')
     return config.replace(f'bind 127.0.0.1:{port}\n',
@@ -583,8 +589,22 @@ def reload_report(requested):
         reload_caps_observation='unavailable',
         before_master=None, old_cohort=[], new_cohort=[], effective_NNP=None,
         baseline_request=None, new_request=None, continuity_request=None, final_request=None,
-        clients_closed=True, old_workers_exited=False, old_worker_exit_proof=None, budget_seconds=3.0,
-        release_time=None, deadline=None, deadline_enforcement='not-armed', deadline_signal_unblocked=None,
+        clients_closed=True, old_workers_exited=False, old_worker_exit_proof=None,
+        budget_seconds=RELOAD_OVERALL_SECONDS, overall_budget_seconds=RELOAD_OVERALL_SECONDS,
+        entry_at=None, overall_deadline=None, deadline=None, deadline_alias='overall_deadline',
+        current_stage=None, expired_stage=None, deadline_scope=None, finished_at=None,
+        elapsed=None, elapsed_after_release=None, verification_finished_at=None,
+        stages={name: dict(budget_seconds=budget, start_at=None, deadline=None, end_at=None,
+                           elapsed=None, status=None) for name, budget in RELOAD_STAGES},
+        timeline=[], signal_attempted_at=None, signal_sent_at=None, new_worker_first_seen_at=None,
+        new_worker_served_at=None, continuity_complete_at=None, clients_closed_at=None,
+        old_workers_exited_at=None, final_request_at=None, old_worker_timeout_observations=None,
+        unit_cleanup=dict(requested_at=None, first_stop_at=None, first_kill_at=None, finished_at=None,
+                          confirmed=None, outcome=None, old_exit_verified_before_cleanup=None,
+                          old_exit_proof_before_cleanup=None, old_exit_proof_status=None,
+                          old_exit_verification_status=None),
+        release_time=None, deadline_enforcement='not-armed', deadline_signal_unblocked=None,
+        cleanup_evidence='nnp-ab.report.json:reload.unit_cleanup (canonical after unit cleanup)',
         coverage=[], pidfd_binding_verified=False, issues=[])
 
 
@@ -632,9 +652,9 @@ def _reload_response(sock, io, marker):
     return {'status': 200, 'pid': int(match[1]), 'body_bytes': size, 'marker_verified': True}
 
 
-def nnp_ab_plan(directory, nonce, caps, phase):
+def nnp_ab_plan(directory, nonce, caps, phase, reload_usr2=False):
     """Closed two-arm plan; all non-NNP security properties are identical."""
-    if (phase not in ('nnp-yes', 'nnp-no') or not isinstance(nonce, str)
+    if (type(reload_usr2) is not bool or phase not in ('nnp-yes', 'nnp-no') or not isinstance(nonce, str)
             or not re.fullmatch(r'[0-9a-f]{32}', nonce) or not re.fullmatch(
                 r'/run/nathaya-haproxy-probe\.[A-Za-z0-9_-]+', str(directory))):
         raise Unsupported('ab-plan')
@@ -648,6 +668,8 @@ def nnp_ab_plan(directory, nonce, caps, phase):
                   'Description': 'Nathaya HAProxy probe ' + nonce + ' ' + phase,
                   'ExecStartPre': ' '.join(pre),
                   'StandardOutput': 'append:' + str(output), 'StandardError': 'append:' + str(output)}
+    if reload_usr2:
+        properties['RuntimeMaxSec'] = '30s'  # Identical opt-in runtime in BOTH arms.
     return dict(phase=phase, unit=unit, argv=argv, pre=pre, go=go, output=output,
                 properties=properties, command=transient_command(unit, properties, argv))
 
@@ -1471,7 +1493,8 @@ class Controller:
             self.verify_ab_assets()
             (self.directory / phase).mkdir(mode=0o700)
             self.save(phase + '/combined.log', b'')
-            plan = nnp_ab_plan(self.directory, self.nonce, self.caps, phase)
+            plan = nnp_ab_plan(self.directory, self.nonce, self.caps, phase,
+                               reload_usr2=self.reload_report['requested'])
             self.ab_plans[phase] = plan
             return plan
         if phase not in ('plain', 'trace'):
@@ -1623,7 +1646,15 @@ class Controller:
             errors.append('probe-command-plan:ExecStartPre')
         _raise_unsupported(errors)
 
-    def _validate_probe_policy(self, probe, plan, expected_nnp='yes'):
+    def _validate_probe_policy(self, probe, plan, expected_nnp='yes', expected_runtime='8s'):
+        if expected_runtime not in ('8s', '30s'):
+            raise Unsupported('ab-runtime-scope')
+        if expected_runtime == '30s':
+            expected = self._validated_nnp_ab_plan(plan)
+            if (self.reload_report['requested'] is not True
+                    or expected['properties']['RuntimeMaxSec'] != '30s'
+                    or expected_nnp != expected['properties']['NoNewPrivileges']):
+                raise Unsupported('ab-runtime-scope')
         if expected_nnp != 'yes' and not (expected_nnp == 'no' and plan.get('phase') == 'nnp-no'):
             raise Unsupported('ab-policy-scope')
         errors = []
@@ -1637,7 +1668,7 @@ class Controller:
             'Id': unit, 'LoadState': 'loaded', 'DropInPaths': '', 'NeedDaemonReload': 'no',
             'Slice': 'system.slice', 'ControlGroup': '/system.slice/' + unit,
             'Transient': 'yes', 'User': 'root', 'Group': 'root', 'Type': 'simple',
-            'Restart': 'no', 'RuntimeMaxUSec': '8s', 'TimeoutStartUSec': '5s',
+            'Restart': 'no', 'RuntimeMaxUSec': expected_runtime, 'TimeoutStartUSec': '5s',
             'TimeoutStopUSec': '2s', 'TimeoutAbortUSec': '2s', 'CanReload': 'no',
             'KillMode': 'control-group', 'SendSIGKILL': 'yes',
             'StandardOutput': 'append', 'StandardError': 'append',
@@ -1696,11 +1727,12 @@ class Controller:
         collect_unsupported(errors, self.control_empty_exec_fields, probe, plan)
         _raise_unsupported(errors)
 
-    def validate_nnp_ab(self, probe, plan):
-        """Only this exact closed plan may request an effective NNP=no."""
-        if not isinstance(probe, dict) or not isinstance(plan, dict):
-            raise Unsupported('ab-snapshot-or-plan-format')
-        expected = nnp_ab_plan(self.directory, self.nonce, self.caps, plan.get('phase'))
+    def _validated_nnp_ab_plan(self, plan):
+        # Controller request, never an untrusted plan flag/runtime, selects the plan.
+        if not isinstance(plan, dict):
+            raise Unsupported('ab-plan')
+        expected = nnp_ab_plan(self.directory, self.nonce, self.caps, plan.get('phase'),
+                               reload_usr2=self.reload_report['requested'])
         if (set(plan) - {'created_at', 'release_time'} != set(expected) or
                 any(plan.get(k) != v for k, v in expected.items()) or
                 ('created_at' in plan and (type(plan['created_at']) not in (int, float)
@@ -1709,9 +1741,17 @@ class Controller:
                     or not 0 < plan['release_time'] < float('inf')
                     or 'created_at' not in plan or plan['release_time'] < plan['created_at']))):
             raise Unsupported('ab-plan')
+        return expected
+
+    def validate_nnp_ab(self, probe, plan):
+        """Only this exact closed plan may request an effective NNP=no."""
+        if not isinstance(probe, dict) or not isinstance(plan, dict):
+            raise Unsupported('ab-snapshot-or-plan-format')
+        expected = self._validated_nnp_ab_plan(plan)
         errors = []
         collect_unsupported(errors, self._validate_probe_policy, probe, plan,
-                            expected_nnp=expected['properties']['NoNewPrivileges'])
+                            expected_nnp=expected['properties']['NoNewPrivileges'],
+                            expected_runtime=expected['properties']['RuntimeMaxSec'])
         if _capset(probe.get('CapabilityBoundingSet')) != self.caps:
             errors.append('ab-bounding')
         _require(probe, {'RestartUSec': '3s'})
@@ -1952,10 +1992,12 @@ class Controller:
             fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC |
                          (os.O_NONBLOCK if reload_evidence else 0), dir_fd=directory)
             try:
+                budget()
                 data = bytearray()
                 while len(data) <= limit:
                     budget()
                     block = os.read(fd, min(4096, limit + 1 - len(data)))
+                    budget()
                     if not block:
                         return bytes(data)
                     data.extend(block)
@@ -1964,10 +2006,13 @@ class Controller:
                 os.close(fd)
 
         def executable(directory):
+            budget()
             try:
-                return os.readlink('exe', dir_fd=directory), None
+                result = os.readlink('exe', dir_fd=directory), None
             except OSError as exc:
-                return None, exc.errno
+                result = None, exc.errno
+            budget()
+            return result
 
         try:
             raw = bounded('/sys/fs/cgroup' + cg + '/cgroup.procs', 4096)
@@ -2024,7 +2069,9 @@ class Controller:
                 else:
                     staged['exe'] = (link + '\n').encode('utf-8')
                 for name, data in staged.items():
+                    budget()
                     self.save(prefix + '.' + name, data)
+                    budget()
                 if link is not None:
                     captures.append({'exe': link, 'status': parsed,
                                      **({'identity': identity} if reload_evidence else {})})
@@ -2191,39 +2238,101 @@ class Controller:
         })
         return result
 
+    def _reload_unit_cleanup(self, unit, kind, info, confirmed=None, interrupted=False):
+        """Private temporal evidence for registered opt-in B only, NEVER exit proof."""
+        report = self.reload_report
+        plan = self.ab_plans.get('nnp-no')
+        if (report['requested'] is not True or not isinstance(plan, dict)
+                or unit not in self.intents or unit != plan.get('unit')):
+            return
+        try:
+            expected = self._validated_nnp_ab_plan(plan)
+        except Unsupported:
+            return
+        if unit != expected['unit']:
+            return
+        cleanup = report['unit_cleanup']
+        owned = owned_unit(info, unit, self.nonce)
+        if not owned and not (kind == 'finished' and
+                (cleanup['requested_at'] is not None or
+                 info.get('LoadState') == 'not-found' and
+                 owned_unit(self.ab_profiles.get('nnp-no', {}), unit, self.nonce))):
+            return
+        now = time.monotonic()
+        if cleanup['requested_at'] is None:
+            # Snapshot only pre-existing verification; no pidfds survive reload finally.
+            close_at, exit_at = report['clients_closed_at'], report['old_workers_exited_at']
+            proven = bool(report['old_workers_exited'] and report['old_worker_exit_proof']
+                          and close_at is not None and exit_at is not None
+                          and close_at < exit_at < now)
+            cleanup.update(requested_at=now, old_exit_verified_before_cleanup=proven,
+                old_exit_proof_before_cleanup=report['old_worker_exit_proof'],
+                old_exit_proof_status='PROVEN-before-cleanup' if proven else 'NOT-PROVEN-before-cleanup',
+                old_exit_verification_status=report['stages']['old_worker_exit']['status'])
+        if kind in ('stop', 'sigkill'):
+            field = 'first_stop_at' if kind == 'stop' else 'first_kill_at'
+            if cleanup[field] is None:
+                cleanup[field] = now  # Intent immediately BEFORE actual unit command.
+                if len(report['timeline']) < 64:
+                    report['timeline'].append(dict(label='unit-cleanup-' + kind, at=now,
+                        elapsed=now - report['entry_at'] if report['entry_at'] is not None else None,
+                        elapsed_after_release=now - report['release_time']
+                            if type(report['release_time']) is float else None))
+        elif kind == 'finished':
+            cleanup.update(finished_at=now, confirmed=confirmed,
+                outcome='interrupted-unconfirmed' if interrupted else
+                        'unit-stop-confirmed' if confirmed and cleanup['old_exit_verified_before_cleanup'] else
+                        'unit-stop-confirmed-not-graceful-exit-proof' if confirmed else 'unit-stop-unconfirmed')
+            if len(report['timeline']) < 64:
+                report['timeline'].append(dict(label='unit-cleanup-finished', at=now,
+                    elapsed=now - report['entry_at'] if report['entry_at'] is not None else None,
+                    elapsed_after_release=now - report['release_time']
+                        if type(report['release_time']) is float else None))
+
     def cleanup_one(self, unit):
         """Bounded unit-only cleanup. Never signal a PID or a production unit."""
+        confirmed, interrupted, info = False, False, {}
         try:
             info = self.show(unit, absent=True)
             if info.get('LoadState') == 'not-found':
-                # After interruption/timeout a create request might still be
-                # pending on DBus. Absence is NOT confirmation in that case.
-                return unit in self.creation_confirmed
+                # Pending DBus creation is NOT confirmed absence.
+                confirmed = unit in self.creation_confirmed
+                return confirmed
             if not owned_unit(info, unit, self.nonce):
                 return False
             self.creation_confirmed.add(unit)
+            self._reload_unit_cleanup(unit, 'stop', info)
             self.command(['/usr/bin/systemctl', 'stop', '--no-block', unit])
             deadline = time.monotonic() + 2.0
             while time.monotonic() < deadline:
                 info = self.show(unit, absent=True, timeout=max(0.01, deadline - time.monotonic()))
                 if info.get('LoadState') == 'not-found':
-                    return True
+                    confirmed = True
+                    return confirmed
                 if not owned_unit(info, unit, self.nonce):
                     return False
                 if info.get('ActiveState') in ('inactive', 'failed') and info.get('ControlGroup') == '':
-                    return True
+                    confirmed = True
+                    return confirmed
                 time.sleep(0.1)
             # Revalidate immediately before sending a unit-scoped SIGKILL.
             info = self.show(unit)
             if not owned_unit(info, unit, self.nonce):
                 return False
+            self._reload_unit_cleanup(unit, 'sigkill', info)
             self.command(['/usr/bin/systemctl', 'kill', '--kill-who=all', '--signal=SIGKILL', unit])
             info = self.show(unit, absent=True)
-            return (info.get('LoadState') == 'not-found' or
-                    (owned_unit(info, unit, self.nonce) and
-                     info.get('ActiveState') in ('inactive', 'failed') and info.get('ControlGroup') == ''))
+            confirmed = (info.get('LoadState') == 'not-found' or
+                         (owned_unit(info, unit, self.nonce) and
+                          info.get('ActiveState') in ('inactive', 'failed') and info.get('ControlGroup') == ''))
+            return confirmed
+        except KeyboardInterrupt:
+            interrupted = True
+            raise
         except (OSError, ValueError, subprocess.SubprocessError):
             return False
+        finally:
+            self._reload_unit_cleanup(unit, 'finished', info, confirmed, interrupted)
 
     def run_phase(self, phase):
         _no_lock()
@@ -2286,35 +2395,131 @@ class Controller:
     def reload_usr2(self, plan):
         """One signal, existing verified B only; all client/pidfds close before cleanup."""
         report, clients, pidfds = self.reload_report, [], []
-        report.update(status='in-progress', release_time=plan.get('release_time'))
-        deadline, network_end = time.monotonic(), float('inf')
+        entry = time.monotonic()
+        report.update(status='in-progress', release_time=plan.get('release_time'), entry_at=entry)
+        overall = entry + RELOAD_OVERALL_SECONDS
+        deadline, network_end = overall, float('inf')
         base, count = 'nnp-no/reload', 0
         master_before, old = None, []
         previous_alarm_handler = None
         alarm_handler_installed, alarm_timer_owned, in_cleanup = False, False, False
 
+        def event(label, at=None):
+            at = time.monotonic() if at is None else at
+            if len(report['timeline']) < 64:
+                release = report['release_time']
+                report['timeline'].append(dict(label=label, at=at, elapsed=at - entry,
+                    elapsed_after_release=at - release if type(release) is float else None))
+            return at
+
+        def mark(field, label):
+            if report[field] is None:
+                report[field] = event(label)
+
+        def poll_state(fd):
+            poller = select.poll()
+            poller.register(fd, select.POLLIN)
+            events = poller.poll(0)
+            flags = 0
+            for _, value in events:
+                flags |= value
+            return dict(poll_flags=flags, exited=bool(flags & select.POLLIN),
+                        poll_error=bool(flags & (select.POLLERR | select.POLLNVAL)),
+                        unexpected=bool(flags and not flags & select.POLLIN))
+
+        def expire(now=None, alarm=False):
+            now = time.monotonic() if now is None else now
+            stage = report['current_stage']
+            total = now >= overall or alarm and now < deadline
+            report['deadline_scope'] = 'overall' if total else 'stage'
+            report['expired_stage'] = (stage if stage and now >= deadline
+                and report['stages'][stage]['status'] == 'in-progress' else None)
+            if (stage == 'old_worker_exit' and report['old_worker_exit_proof'] is None
+                    and report['old_worker_timeout_observations'] is None):
+                # These are actual timeout-time polls, NOT timely exit proof.
+                # Late POLLIN cannot establish whether exit preceded the deadline.
+                rows = []
+                report['old_worker_timeout_observations'] = rows
+                for row, fd in zip(old, pidfds[1:]):
+                    poll_started_at = time.monotonic()
+                    try:
+                        state = poll_state(fd)
+                    except OSError:
+                        state = dict(poll_flags=None, exited=None, poll_error=True, unexpected=None)
+                    sampled_at = time.monotonic()
+                    exited = None if state['poll_error'] or state['unexpected'] else state['exited']
+                    alive = None if exited is None else not exited
+                    closed_at = report['clients_closed_at']
+                    rows.append(dict(identity=row['identity'], poll_started_at=poll_started_at,
+                        sampled_at=sampled_at, clients_closed_at=closed_at,
+                        drain_elapsed_since_clients_closed=sampled_at - closed_at
+                            if closed_at is not None else None,
+                        stage_deadline=deadline, overall_deadline=overall,
+                        poll_flags=state['poll_flags'], poll_error=state['poll_error'],
+                        unexpected=state['unexpected'], exited_when_sampled=exited,
+                        alive_when_sampled=alive,
+                        # A bound pidfd cannot resurrect: late alive proves earlier
+                        # alive, but late exit (or any poll error) says nothing.
+                        alive_at_deadline=True if alive is True
+                            and poll_started_at >= min(overall, deadline) else None))
+            label = 'total' if total else (stage or 'preparation').replace('_', '-')
+            raise Unsupported('reload-' + label + '-deadline-inconclusive')
+
         def reload_alarm(_signum, _frame):
-            # A queued alarm must not interrupt teardown or resource closing.
+            # One overall timer only; queued ALRM must not interrupt teardown.
             if not in_cleanup:
-                raise Unsupported('reload-deadline-inconclusive')
+                expire(alarm=True)
 
         def left():
-            remaining = deadline - time.monotonic()
+            now = time.monotonic()
+            remaining = min(overall, deadline) - now
             if remaining <= 0:
-                raise Unsupported('reload-deadline-inconclusive')
+                expire(now)
             return remaining
+
+        def start_stage(name, start=None):
+            nonlocal deadline, network_end
+            now = time.monotonic()
+            if now >= overall and start is None:
+                expire(now)
+            # The previous stage already passed its completion check. Do not
+            # retroactively turn a timely exit proof into a drain deadline.
+            start = now if start is None else start
+            stage = report['stages'][name]
+            deadline = min(overall, start + stage['budget_seconds'])
+            network_end = deadline
+            report['current_stage'] = name
+            stage.update(start_at=start, deadline=deadline, status='in-progress')
+            event(name + '-started', start)
+            left()
+
+        def complete_stage(end=None):
+            left()
+            now = time.monotonic()
+            if now >= min(overall, deadline):
+                expire(now)
+            end = now if end is None else end
+            name = report['current_stage']
+            stage = report['stages'][name]
+            stage.update(end_at=end, elapsed=end - stage['start_at'], status='success')
+            event(name + '-success', end)
 
         def pause():
             time.sleep(min(0.025, left()))
+            left()
 
         def io(sock, operation, *args):
             end = min(deadline, network_end, time.monotonic() + 2.0)  # Never enlarge the 2s network timeout.
             while True:
+                left()
                 if time.monotonic() >= end:
                     raise Unsupported('reload-network-timeout-inconclusive')
-                left()
                 try:
-                    return operation(*args)
+                    result = operation(*args)
+                    left()
+                    if time.monotonic() >= end:
+                        raise Unsupported('reload-network-timeout-inconclusive')
+                    return result
                 except (ssl.SSLWantReadError, ssl.SSLWantWriteError, BlockingIOError) as exc:
                     writing = (isinstance(exc, ssl.SSLWantWriteError) or
                                isinstance(exc, BlockingIOError) and operation.__name__ == 'send')
@@ -2330,28 +2535,34 @@ class Controller:
 
         def closed(fd):
             left()
-            poller = select.poll()
-            poller.register(fd, select.POLLIN)
-            events = poller.poll(0)
-            if any(flags & (select.POLLERR | select.POLLNVAL) for _, flags in events):
+            state = poll_state(fd)
+            left()
+            if state['poll_error']:
                 raise Unsupported('reload-pidfd-poll-unavailable')
-            if events and not any(flags & select.POLLIN for _, flags in events):
+            if state['unexpected']:
                 raise Unsupported('reload-pidfd-unexpected-event')
-            return bool(events)
+            return state['exited']
 
         def snapshot(label, source=False):
             nonlocal count
             left()
             stem = base + '/%03d-' % count + label
             count += 1
-            live = self.show(plan['unit'], timeout=min(0.25, left()))
+            try:
+                live = self.show(plan['unit'], timeout=min(0.25, left()))
+            finally:
+                left()
             self.validate_nnp_ab(live, plan)
             _require(live, {'ActiveState': 'active', 'SubState': 'running'})
             audit = self.audit_compatibility(self.ab_profiles['nnp-no'], live, plan=plan, probe_source=True)
             self.record(stem + '.unit.json', audit)
             _raise_unsupported(audit['issues'])
             self.reload_capture_complete = False
-            captures = self.capture(plan['unit'], stem, reload_evidence=True, deadline=deadline)
+            try:
+                captures = self.capture(plan['unit'], stem, reload_evidence=True,
+                                        deadline=min(overall, deadline))
+            finally:
+                left()
             report['coverage'].append({'artifact': stem + '.json', 'complete': self.reload_capture_complete})
             master, workers = self.reload_cohort(captures, live)
             if master_before is not None and (master['identity'] != master_before['identity']
@@ -2362,7 +2573,10 @@ class Controller:
                 raw, metadata = _read_private_source(FRAGMENT, 65536)
                 left()
                 fragment = validate_fragment(raw.decode('utf-8', 'strict'))
-                current = self.show(MAIN, timeout=min(0.25, left()))
+                try:
+                    current = self.show(MAIN, timeout=min(0.25, left()))
+                finally:
+                    left()
                 audit = self.audit_compatibility(current, live, fragment=fragment, plan=plan,
                     original=self.source, original_fragment=self.fragment,
                     original_bytes=self.source_bytes, current_bytes=raw)
@@ -2385,14 +2599,18 @@ class Controller:
             raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             clients.append(raw)
             raw.setblocking(False)
+            left()
             code = raw.connect_ex(('127.0.0.1', self.ab_assets['endpoints'][0]))
+            left()
             if code not in (0, errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EALREADY, errno.EINTR):
                 raise Unsupported('reload-loopback-connect-unavailable')
             end = network_end
             while code:
+                left()
                 if time.monotonic() >= end:
                     raise Unsupported('reload-connect-timeout-inconclusive')
                 _, ready, _ = select.select([], [raw], [], min(0.025, left(), max(0, end - time.monotonic())))
+                left()
                 if ready:
                     if raw.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR):
                         raise Unsupported('reload-loopback-connect-unavailable')
@@ -2405,7 +2623,8 @@ class Controller:
                 raise Unsupported('reload-leaf-pin')
             send(tls, b'GET / HTTP/1.1\r\nHost: localhost\r\n\r\n')
             response = _reload_response(tls, io, self.nonce)
-            network_end = deadline
+            left()
+            network_end = min(overall, deadline)
             return tls, response
 
         def ids(rows):
@@ -2419,8 +2638,11 @@ class Controller:
                 raise Unsupported('reload-signal-already-attempted')
             if type(plan.get('release_time')) is not float or not 0 < plan['release_time'] < float('inf'):
                 raise Unsupported('reload-release-time-unavailable')
-            deadline = min(time.monotonic() + 3.0, plan['release_time'] + 7.0)
-            report['deadline'] = deadline
+            overall = min(entry + RELOAD_OVERALL_SECONDS,
+                          plan['release_time'] + RELOAD_RELEASE_LIMIT_SECONDS)
+            deadline = overall
+            report.update(deadline=overall, overall_deadline=overall)
+            start_stage('preparation', entry)
             if (plan['phase'] != 'nnp-no' or self.ab_plans.get('nnp-no') is not plan
                     or self.ab_report['arms']['nnp-no']['startup'] != 'observed-running'
                     or not report['requested']):
@@ -2429,7 +2651,8 @@ class Controller:
                 raise Unsupported('reload-linux-pidfd-unavailable')
             # Fresh Linux/root CLI only (preflight); signal.signal also refuses
             # non-main-thread use. Never borrow or overwrite an existing timer.
-            # RuntimeMaxSec=8s independently bounds the service, not this controller.
+            # Opt-in A/B RuntimeMaxSec=30s independently bounds the service.
+            # This controller cannot bound kernel D-state or noninterruptible C waits.
             try:
                 if sys.platform != 'linux' or not all(hasattr(signal, name) for name in (
                         'SIGALRM', 'ITIMER_REAL', 'getitimer', 'setitimer', 'getsignal', 'signal',
@@ -2447,7 +2670,10 @@ class Controller:
                 alarm_handler_installed = True
                 signal.signal(signal.SIGALRM, reload_alarm)
                 alarm_timer_owned = True
-                signal.setitimer(signal.ITIMER_REAL, left(), 0.0)  # Once, never renewed per I/O.
+                left()
+                signal.setitimer(signal.ITIMER_REAL, max(0.000001, overall - time.monotonic()), 0.0)
+                # One overall alarm; stage transitions/polls NEVER renew it.
+                left()
             except Unsupported:
                 raise
             except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
@@ -2482,11 +2708,11 @@ class Controller:
             report['baseline_request'] = response
             if not serves(response, old):
                 raise Unsupported('reload-baseline-not-old-worker')
-            # Busy across reload, NOT idle keepalive (HAProxy may close idle clients).
-            send(held, b'GET / HTTP/1.1\r\nHost: localhost\r\n')
             for row in [master] + old:
+                left()
                 fd = os.pidfd_open(row['identity'][0], 0)
                 pidfds.append(fd)
+                left()
             master_before = master
             again, workers = snapshot('bound', source=True)
             if again != master or workers != old or any(closed(fd) for fd in pidfds):
@@ -2494,30 +2720,42 @@ class Controller:
             report['pidfd_binding_verified'] = True
             # Last complete identity/unit/source/config/TLS/executable/lock checks
             # are above; no numeric-PID signal, arbitrary target or unit hook.
-            left()
+            # Busy across reload, NOT idle keepalive. Delay partial headers until
+            # the last complete binding verification to minimize its open window.
+            send(held, b'GET / HTTP/1.1\r\nHost: localhost\r\n')
+            complete_stage()
+            start_stage('new_worker')  # Immediately before the sole USR2 attempt.
             report.update(signal_attempted=True, signal_sent=None)
+            mark('signal_attempted_at', 'signal-attempted')
             self.ab_report['reload_usr2_tested'] = True
+            left()
             try:
                 signal.pidfd_send_signal(pidfds[0], signal.SIGUSR2, None, 0)
             except OSError:
                 report['signal_sent'] = False
                 raise
             report['signal_sent'] = True
+            mark('signal_sent_at', 'signal-sent')
+            left()
             while True:
                 _, workers = snapshot('generation')
                 new = [r for r in workers if r['identity'] not in ids(old)]
                 if new:
+                    mark('new_worker_first_seen_at', 'new-worker-first-seen')
                     tls, response = fresh()
                     tls.close()
                     if serves(response, new):
+                        mark('new_worker_served_at', 'new-worker-served')
                         _, confirmed = snapshot('new-confirmed')
                         if not ids(new) <= ids(confirmed):
                             raise Unsupported('reload-new-cohort-changed')
                         report.update(new_cohort=new, new_request=response)
+                        complete_stage()
                         break
                     if not serves(response, old):
                         raise Unsupported('reload-fresh-unanchored-worker')
                 pause()  # Only read-only inventory/request retries, NEVER signal retry.
+            start_stage('continuity')
             held_index = next(i for i, r in enumerate(old) if r['identity'][0] == report['baseline_request']['pid'])
             if closed(pidfds[held_index + 1]):
                 raise Unsupported('reload-held-old-worker-exited-before-continuity')
@@ -2528,38 +2766,71 @@ class Controller:
             report['continuity_request'] = response
             if not serves(response, old):
                 raise Unsupported('reload-continuity-not-old-worker')
+            left()
+            mark('continuity_complete_at', 'old-connection-continuity-complete')
             for client in clients:
+                left()
                 client.close()
+                left()
             report['clients_closed'] = True
-            while not all(closed(fd) for fd in pidfds[1:]):
+            mark('clients_closed_at', 'all-clients-closed-before-drain')
+            complete_stage(end=report['clients_closed_at'])
+            # Anchor the drain budget to actual closure, never a later fresh clock.
+            start_stage('old_worker_exit', start=report['clients_closed_at'])
+            while True:
+                exited = [closed(fd) for fd in pidfds[1:]]
+                if exited and all(exited):
+                    complete_stage()
+                    report.update(old_workers_exited=True,
+                                  old_worker_exit_proof='pidfd-POLLIN-after-client-close')
+                    report['old_workers_exited_at'] = event('old-workers-pidfd-POLLIN',
+                        report['stages']['old_worker_exit']['end_at'])
+                    break
                 pause()  # POLLIN proves exit even for a zombie; absence is not death.
-            report.update(old_workers_exited=True, old_worker_exit_proof='pidfd-POLLIN-after-client-close')
+            start_stage('final_verification')
             _, workers = snapshot('drained', source=True)
             if ids(workers) != ids(new) or ids(workers) & ids(old):
                 raise Unsupported('reload-post-drain-cohort')
             tls, response = fresh()
             report['clients_closed'] = False
             tls.close()
+            left()
             report['final_request'] = response
+            mark('final_request_at', 'final-TLS-request')
             if not serves(response, workers):
                 raise Unsupported('reload-final-not-new-worker')
             final_master, final_workers = snapshot('final', source=True)
             if ids(final_workers) != ids(new):
                 raise Unsupported('reload-final-cohort-changed')
-            report.update(status='passed', after_master=final_master, final_cohort=final_workers,
+            report.update(after_master=final_master, final_cohort=final_workers,
                 reload_mask=final_master['status']['CapBnd'], reload_caps_observation='verified-after-drain',
                 reload_caps=sorted(c for c, bit in CAP_BITS.items() if final_master['status']['CapBnd'] & (1 << bit)),
                 cap_kill_present=bool(final_master['status']['CapBnd'] & (1 << CAP_BITS['CAP_KILL'])),
                 effective_NNP={'unit': 'no', 'master': final_master['status']['NoNewPrivs'],
                                'workers': [r['status']['NoNewPrivs'] for r in final_workers]})
             report['capability_delta'] = sorted(set(report['startup_caps']) ^ set(report['reload_caps']))
+            complete_stage()  # Final bookkeeping is also inside the verification bounds.
+            report['verification_finished_at'] = event('verification-finished',
+                report['stages']['final_verification']['end_at'])
+            report['status'] = 'passed'
         except KeyboardInterrupt:
             report['status'] = 'interrupted'
             raise
         except Unsupported as exc:
+            # Reclassify a blocking operation's failure if it consumed the stage.
+            if report['deadline_scope'] is None:
+                try:
+                    left()
+                except Unsupported as expired:
+                    exc = expired
             report.update(status='failed' if report['signal_sent'] else 'unavailable', issues=list(exc.labels))
         except (OSError, ValueError, subprocess.SubprocessError):
-            report.update(status='unavailable', issues=['reload-inspection-or-io-unavailable'])
+            issues = ['reload-inspection-or-io-unavailable']
+            try:
+                left()
+            except Unsupported as expired:
+                issues = list(expired.labels)
+            report.update(status='unavailable', issues=issues)
         finally:
             in_cleanup = True
             blocked, deferred_interrupt = None, False
@@ -2570,6 +2841,17 @@ class Controller:
                 deferred_interrupt = True
             except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
                 report['issues'].append('reload-cleanup-signal-mask-unavailable')
+            finished = time.monotonic()
+            if report['verification_finished_at'] is None:
+                report['verification_finished_at'] = finished
+                event('verification-finished-without-pass', finished)
+            for name, stage in report['stages'].items():
+                if stage['start_at'] is None:
+                    stage['status'] = 'missing'  # No fabricated start/end/elapsed.
+                elif stage['status'] == 'in-progress':
+                    stage.update(end_at=finished, elapsed=finished - stage['start_at'],
+                        status='interrupted' if report['status'] == 'interrupted' else
+                               'deadline' if report['deadline_scope'] else 'failure')
             # Only a successful disable confirms our timer is disarmed. If it
             # fails, leave reload_alarm installed: in_cleanup ignores late ALRM,
             # whereas restoring a previous SIG_DFL could terminate the controller.
@@ -2595,6 +2877,8 @@ class Controller:
                 except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
                     report['clients_closed'] = False
                     report['issues'].append('reload-client-close-unconfirmed')
+            if clients and report['clients_closed'] and report['clients_closed_at'] is None:
+                mark('clients_closed_at', 'all-clients-closed-in-finally')
             for fd in pidfds:
                 try:
                     os.close(fd)
@@ -2612,8 +2896,10 @@ class Controller:
                     report['issues'].append('reload-cleanup-signal-mask-restore-unconfirmed')
             if report['issues'] and report['status'] == 'passed':
                 report['status'] = 'unavailable'
+            finished = time.monotonic()
+            report.update(finished_at=finished, elapsed=finished - entry)
             if type(report['release_time']) is float:
-                report['elapsed_after_release'] = time.monotonic() - report['release_time']
+                report['elapsed_after_release'] = finished - report['release_time']
             try:
                 self.record(base + '/report.json', report)
             except (OSError, ValueError):
@@ -3342,7 +3628,7 @@ def main(argv=None):
         except (OSError, ValueError, subprocess.SubprocessError):
             clean = False
         if not clean:
-            print('cleanup: unconfirmed; inspect private evidence (RuntimeMaxSec=8s was requested)')
+            print('cleanup: unconfirmed; inspect private evidence for requested RuntimeMaxSec')
             if not interrupted:
                 exitcode = 2
         if nnp_ab:

@@ -4709,8 +4709,29 @@ class OptionalReloadContracts(Offline):
     """Real reload engine; synthetic TLS/HTTP, cohorts and integer-only pidfds."""
 
     # Share fixture builders, not a TestCase subclass (no inherited test copies).
-    ab_controller = Pure2ArmReport.ab_controller
-    ab_pair = Pure2ArmReport.ab_pair
+    def controller(self, old=False):
+        c = super().controller(old)
+        c.reload_report = self.D.reload_report(True)
+        return c
+
+    def ab_controller(self, old=False):
+        c = Pure2ArmReport.ab_controller(self, old)
+        # The real initializer defaults to startup-only. Select opt-in BEFORE
+        # building either plan; do not repair or relax an untrusted runtime.
+        c.reload_report = self.D.reload_report(True)
+        c.ab_report['reload'] = c.reload_report
+        return c
+
+    def ab_pair(self, c):
+        plans = [self.D.nnp_ab_plan(c.directory, c.nonce, c.caps, phase,
+                                  reload_usr2=c.reload_report['requested'])
+                 for phase in ('nnp-yes', 'nnp-no')]
+        profiles = [dict(self.probe(c, plan),
+                         NoNewPrivileges=plan['properties']['NoNewPrivileges'],
+                         RuntimeMaxUSec=plan['properties']['RuntimeMaxSec'])
+                    for plan in plans]
+        return plans, profiles
+
     tasks = Pure2ArmReport.tasks
     sequence = Pure2ArmReport.sequence
     tls_memory = Pure2ArmReport.tls_memory
@@ -4747,7 +4768,19 @@ class OptionalReloadContracts(Offline):
         state = SimpleNamespace(now=4.0, sent=False, stage='', clients=[], fds={},
                                 opened=[], closed=[], events=[], timeouts=[], failure=failure,
                                 external_timer=(0.0, 0.0), installed_alarm=None, timer_owned=False,
-                                mask_api_available=True, mask_restore_error=OSError, reports=[])
+                                mask_api_available=True, mask_restore_error=OSError, reports=[],
+                                tick=0.001, preparation_delay=0.0, preparation_delayed=False,
+                                new_worker_delay=0.0, old_exit_delay=0.0, never_old=False,
+                                timeout_poll_result=None, old_poll_overrun=False,
+                                final_tls_failure=None, final_show_delay=0.0,
+                                signal_at=None, all_closed_at=None,
+                                old_poll_exit_at=None, partial_at=None, certificate_at=None,
+                                capture_deadlines=[], arm_remaining=None)
+
+        def effective_deadline():
+            report = c.reload_report
+            stage = report['stages'][report['current_stage']]
+            return min(report['overall_deadline'], stage['deadline'])
         outer = self
 
         def previous_alarm(_signum, _frame):
@@ -4792,7 +4825,8 @@ class OptionalReloadContracts(Offline):
                 state.timer_owned = False
             else:
                 outer.assertGreater(delay, 0.0)
-                outer.assertAlmostEqual(delay, c.reload_report['deadline'] - state.now)
+                state.arm_remaining = c.reload_report['overall_deadline'] - state.now
+                outer.assertAlmostEqual(delay, state.arm_remaining)
                 outer.assertIsNotNone(state.installed_alarm)
                 state.timer_owned = True
             return (0.0, 0.0)
@@ -4840,18 +4874,22 @@ class OptionalReloadContracts(Offline):
                 raise self.D.Unsupported('fixture-assets')
 
         def clock():
-            state.now += 0.001
+            state.now += state.tick
             return state.now
 
         def showing(unit, *, timeout):
             guarded_io('show')
             outer.assertGreater(timeout, 0)
             outer.assertLessEqual(timeout, 0.25)
-            outer.assertLessEqual(timeout, c.reload_report['deadline'] - state.now + 0.002)
+            outer.assertLessEqual(timeout, effective_deadline() - state.now + 0.002)
             state.timeouts.append(timeout)
             if unit == MAIN:
                 return dict(c.source, FutureSecurityKnob='drift') if failure == 'source' else dict(c.source)
             outer.assertEqual(unit, plan['unit'])
+            if c.reload_report['current_stage'] == 'final_verification' and state.final_show_delay:
+                state.now += state.final_show_delay
+                state.final_show_delay = 0.0
+                state.installed_alarm(signal.SIGALRM, None)  # Synthetic delivery only.
             drift = failure == 'policy' or failure == 'policy-after' and state.sent
             return dict(profile, SystemCallFilter='@mount') if drift else dict(profile)
 
@@ -4859,7 +4897,8 @@ class OptionalReloadContracts(Offline):
             guarded_io('capture')
             outer.assertEqual(unit, plan['unit'])
             outer.assertIs(reload_evidence, True)
-            outer.assertEqual(deadline, c.reload_report['deadline'])
+            outer.assertEqual(deadline, effective_deadline())
+            state.capture_deadlines.append((c.reload_report['current_stage'], deadline))
             state.stage = sample
             state.events.append(('capture', sample))
             c.reload_capture_complete = not (
@@ -4872,7 +4911,7 @@ class OptionalReloadContracts(Offline):
                 bad = copy.deepcopy(worker)
                 bad['status']['Uid'] = (0,) * 4
                 return [master, bad]
-            if not state.sent:
+            if not state.sent or state.now - state.signal_at < state.new_worker_delay:
                 return copy.deepcopy(rows)
             if sample.endswith(('-drained', '-final')) or failure == 'reused-pid':
                 return copy.deepcopy([master, new])
@@ -4888,6 +4927,10 @@ class OptionalReloadContracts(Offline):
                 raw = c.source_bytes + (b'\n' if drift else b'')
                 return raw, {'uid': 0, 'gid': 0, 'mode': '0o600'}
             outer.assertEqual(Path(path), c.directory / 'nnp-ab/private.crt')
+            state.certificate_at = state.now
+            if not state.preparation_delayed:
+                state.now += state.preparation_delay
+                state.preparation_delayed = True
             return b'PUBLIC-CERT-FIXTURE', {}
 
         class Raw:
@@ -4902,6 +4945,8 @@ class OptionalReloadContracts(Offline):
             def close(self):
                 self.closed = True
                 state.events.append(('client-close', 'raw'))
+                if state.sent and state.all_closed_at is None and all(c.closed for c in state.clients):
+                    state.all_closed_at = state.now
 
         class TLS(Raw):
             def __init__(self):
@@ -4913,13 +4958,19 @@ class OptionalReloadContracts(Offline):
                     self.pid = 102
                 self.request, self.buffer = b'', b''
             def do_handshake(self):
-                if failure == 'timeout':
+                if failure == 'timeout' or (state.final_tls_failure == 'timeout' and
+                        c.reload_report['current_stage'] == 'final_verification'):
                     raise ssl.SSLWantReadError()
             def getpeercert(self, *, binary_form):
                 outer.assertIs(binary_form, True)
                 return b'BAD-PIN' if failure == 'pin' else b'PUBLIC-DER'
             def send(self, data):
                 self.request += data
+                if self.request == b'GET / HTTP/1.1\r\nHost: localhost\r\n':
+                    outer.assertTrue(c.reload_report['pidfd_binding_verified'])
+                    outer.assertFalse(state.sent)
+                    state.partial_at = state.now
+                    state.events.append(('held-partial', state.now))
                 if self.request.endswith(b'\r\n\r\n'):
                     pid = 103 if failure == 'continuity' and state.sent and self.pid == 102 else self.pid
                     self.buffer += outer.response(pid)
@@ -4928,6 +4979,8 @@ class OptionalReloadContracts(Offline):
                         self.buffer = self.buffer.replace(b'200 OK', b'500 NO')
                 return len(data)
             def recv(self, size):
+                if state.final_tls_failure == 'missing-http' and c.reload_report['current_stage'] == 'final_verification':
+                    return b''
                 if not self.buffer:
                     raise ssl.SSLWantReadError()
                 block, self.buffer = self.buffer[:size], self.buffer[size:]
@@ -4956,6 +5009,7 @@ class OptionalReloadContracts(Offline):
             outer.assertTrue(c.reload_report['pidfd_binding_verified'])
             outer.assertTrue(state.stage.endswith('-bound'))
             state.sent = True
+            state.signal_at = state.now
             state.events.append(('signal', fd))
             if failure == 'signal':
                 raise OSError(errno.EPERM, 'PRIVATE-SIGNAL-DETAIL')
@@ -4977,7 +5031,25 @@ class OptionalReloadContracts(Offline):
                     return [(self.fd, select.POLLIN)]
                 if drained:
                     outer.assertTrue(c.reload_report['clients_closed'])
+                    outer.assertEqual(c.reload_report['current_stage'], 'old_worker_exit')
+                    if c.reload_report['old_worker_timeout_observations'] is not None:
+                        result = state.timeout_poll_result
+                        if result == 'oserror':
+                            raise OSError(errno.EIO, 'PUBLIC-FIXTURE-POLL-FAILURE')
+                        if result is not None:
+                            return [(self.fd, result)] if result else []
+                    elif state.old_poll_overrun:
+                        # The poll starts within budget, but its POLLIN result
+                        # becomes observable only after the effective deadline.
+                        state.old_poll_overrun = False
+                        state.now = effective_deadline() + 0.01
+                        state.old_poll_exit_at = state.now
+                        return [(self.fd, select.POLLIN)]
+                    if state.never_old or state.now - state.all_closed_at < state.old_exit_delay:
+                        return []
                     flag = {'pollerr': select.POLLERR, 'pollnval': select.POLLNVAL}.get(failure, select.POLLIN)
+                    if flag == select.POLLIN:
+                        state.old_poll_exit_at = state.now
                     return [(self.fd, flag)]
                 return []
 
@@ -5011,8 +5083,9 @@ class OptionalReloadContracts(Offline):
         def selecting(readers, writers, errors, timeout):
             outer.assertGreaterEqual(timeout, 0)
             outer.assertLessEqual(timeout, 2.0)
-            outer.assertLessEqual(timeout, c.reload_report['deadline'] - state.now + 0.002)
+            outer.assertLessEqual(timeout, effective_deadline() - state.now + 0.002)
             state.timeouts.append(timeout)
+            state.now += timeout  # In-memory wait, including zero-tick network retries.
             return [], [], []
 
         def recording(name, value):
@@ -5130,7 +5203,12 @@ class OptionalReloadContracts(Offline):
             self.assertIsNone(report['capability_delta'])
             self.assertFalse(report['unit_reload_wrapper_tested'])
             self.assertFalse(report['signal_sent'])
-            self.assertEqual(report['budget_seconds'], 3.0)
+            self.assertEqual(report['budget_seconds'], 24.0)
+            self.assertEqual(report['overall_budget_seconds'], 24.0)
+            self.assertEqual(report['deadline_alias'], 'overall_deadline')
+            self.assertEqual({k: v['budget_seconds'] for k, v in report['stages'].items()},
+                             dict(preparation=5.0, new_worker=5.0, continuity=2.0,
+                                  old_worker_exit=5.0, final_verification=4.0))
             self.assertEqual(report['deadline_enforcement'], 'not-armed')
 
     def test_optional_responder_preserves_default_bytes_and_is_backend_only(self):
@@ -5148,6 +5226,16 @@ class OptionalReloadContracts(Offline):
         self.assertNotIn('http-request return', local[0])
         self.assertIn('http-request return status 200', local[1])
         self.assertEqual(config.count(ABSTRACT), 2)
+        for directive in ('timeout client 15s', 'timeout server 15s', 'timeout http-request 15s'):
+            self.assertEqual(config.count(directive), 1)
+        self.assertIn('timeout connect 1s', config)
+        self.assertIn('timeout connect 1s', legacy)
+        self.assertIn('timeout client 2s', legacy)
+        self.assertIn('timeout server 2s', legacy)
+        self.assertNotIn('timeout http-request', legacy)
+        self.assertNotIn('15s', legacy)
+        self.assertIn('timeout http-request 15s', local[1])
+        self.assertNotIn('timeout http-request', local[0])
         for option, marker in ((1, NONCE), (None, NONCE), (True, None), (True, 'A' * 32),
                                (True, NONCE + '\ninject')):
             with self.assertRaises(self.D.Unsupported):
@@ -5173,7 +5261,7 @@ class OptionalReloadContracts(Offline):
             self.assertIs(report['deadline_signal_unblocked'], True)
             self.assertEqual(report['deadline_enforcement'],
                 'SIGALRM wall-clock for interruptible controller work; kernel uninterruptible waits not guaranteed')
-            self.assertEqual(plan['properties']['RuntimeMaxSec'], '8s')
+            self.assertEqual(plan['properties']['RuntimeMaxSec'], '30s')
             self.assertTrue(report['signal_sent'])
             sig.assert_called_once_with(700, signal.SIGUSR2, None, 0)
             context.load_verify_locations.assert_called_once_with(cafile=str(c.directory / 'nnp-ab/private.crt'))
@@ -5260,9 +5348,14 @@ class OptionalReloadContracts(Offline):
             c, plan, state, sig, _, patchers = self.reload_fixture(failure=failure)
             report = self.invoke(c.reload_usr2, plan, patchers=patchers)
             self.assertNotEqual(report['status'], 'passed')
-            self.assertLessEqual(report['deadline'], 7.01)
-            self.assertLessEqual(report['deadline'], plan['release_time'] + 7.0)
-            self.assertLess(state.now, report['deadline'] + 0.1)
+            self.assertEqual(report['deadline'], min(report['entry_at'] + 24.0,
+                                                    plan['release_time'] + 29.0))
+            self.assertEqual(report['deadline'], report['overall_deadline'])
+            stage = 'new_worker' if failure == 'same-identity' else 'preparation'
+            self.assertEqual(report['current_stage'], stage)
+            self.assertLess(state.now, report['stages'][stage]['deadline'] + 0.1)
+            self.assertEqual(report['expired_stage'], stage if failure == 'same-identity' else None)
+            self.assertEqual(report['deadline_scope'], 'stage' if failure == 'same-identity' else None)
             self.assertTrue(any('timeout' in issue or 'deadline' in issue for issue in report['issues']))
             self.assertEqual(sig.call_count, int(failure == 'same-identity'))
             self.assert_reload_closed(state)
@@ -5292,7 +5385,9 @@ class OptionalReloadContracts(Offline):
                     self.assertIsNone(report['effective_NNP'])
                 self.assertIn('kernel uninterruptible waits not guaranteed', report['deadline_enforcement'])
                 if failure.endswith('-alarm'):
-                    self.assertEqual(report['issues'], ['reload-deadline-inconclusive'])
+                    self.assertEqual(report['issues'], ['reload-total-deadline-inconclusive'])
+                    self.assertEqual(report['deadline_scope'], 'overall')
+                    self.assertEqual(report['expired_stage'], 'preparation')
                     self.assertGreater(state.now, report['deadline'])
                     self.assertLess(state.now, report['deadline'] + 0.1)
                 else:
@@ -5521,6 +5616,8 @@ class OptionalReloadContracts(Offline):
                 self.assertTrue(any(str(event).startswith('cleanup:') for event in events))
                 if helper.called:
                     self.assertIs(helper.call_args.args[0], c.ab_plans['nnp-no'])
+                self.assertTrue(all(value is None for value in c.reload_report['unit_cleanup'].values()),
+                                'Mock cleanup_one does not invoke the real timestamp helper')
         for failure in ('wrong-arm', 'startup', 'not-requested', 'copied-plan'):
             c, plan, state, sig, _, patchers = self.reload_fixture()
             if failure == 'wrong-arm':
@@ -5615,6 +5712,503 @@ class OptionalReloadContracts(Offline):
             self.assertFalse(c.ab_report['complete'])
             self.assertFalse(c.ab_report['production_applied'])
             self.assertIs(c.ab_report['reload_required'], not passed)
+            self.assertTrue(all(value is None for value in c.reload_report['unit_cleanup'].values()))
+
+    def assert_reload_timeline(self, report):
+        timeline = report['timeline']
+        times = [row['at'] for row in timeline]
+        self.assertEqual(times, sorted(times))
+        self.assertEqual(len(times), len({row['label'] for row in timeline}))
+        for row in timeline:
+            self.assertAlmostEqual(row['elapsed'], row['at'] - report['entry_at'])
+            self.assertAlmostEqual(row['elapsed_after_release'], row['at'] - report['release_time'])
+        for name, stage in report['stages'].items():
+            if stage['start_at'] is None:
+                self.assertEqual(stage['status'], 'missing', name)
+                for key in ('deadline', 'end_at', 'elapsed'):
+                    self.assertIsNone(stage[key], (name, key))
+            else:
+                self.assertEqual(stage['deadline'], min(report['overall_deadline'],
+                                 stage['start_at'] + stage['budget_seconds']))
+                self.assertAlmostEqual(stage['elapsed'], stage['end_at'] - stage['start_at'])
+
+    def cleanup_owned_b(self, c, plan, state, *, force_kill=False):
+        """Run actual cleanup_one + timestamp helper, with unit-show data only."""
+        info = dict(c.ab_profiles['nnp-no'])
+        state.now += 0.5  # Cleanup follows, never participates in exit verification.
+        stopped, killed = [], []
+        if plan['unit'] not in c.intents:
+            c.intents.append(plan['unit'])
+        c.creation_confirmed.add(plan['unit'])
+
+        def showing(unit, **kwargs):
+            self.assertEqual(unit, plan['unit'])
+            return ({'LoadState': 'not-found'} if killed or stopped and not force_kill
+                    else dict(info))
+
+        def command(argv):
+            cleanup = c.reload_report['unit_cleanup']
+            self.assertIsNotNone(cleanup['requested_at'])
+            if argv[1] == 'stop':
+                self.assertEqual(argv, ['/usr/bin/systemctl', 'stop', '--no-block', plan['unit']])
+                self.assertEqual(cleanup['first_stop_at'], state.now)
+                stopped.append(state.now)
+            else:
+                self.assertEqual(argv, ['/usr/bin/systemctl', 'kill', '--kill-who=all',
+                                        '--signal=SIGKILL', plan['unit']])
+                self.assertEqual(cleanup['first_kill_at'], state.now)
+                killed.append(state.now)
+            # Simulated service termination must never fabricate pidfd POLLIN.
+            state.cleanup_terminated_old = True
+            return 0, b'', b''
+
+        helper = Mock(wraps=c._reload_unit_cleanup)
+        result = self.invoke(c.cleanup_one, plan['unit'], patchers=(
+            patch.object(c, 'show', side_effect=showing), patch.object(c, 'command', side_effect=command),
+            patch.object(c, '_reload_unit_cleanup', helper),
+            patch.object(time, 'monotonic', side_effect=lambda: state.now),
+            patch.object(time, 'sleep', side_effect=lambda delay: setattr(state, 'now', state.now + delay))))
+        return result, helper, stopped, killed
+
+    def test_reload_delayed_old_exit_has_own_stage_after_all_clients_close(self):
+        # c8d01dd's sent/bound/new TLS-200 observation was NOT a pass: the
+        # former shared 3s expired, and unit cleanup alone terminated the old
+        # worker. This is NEW synthetic coverage, not a reclassification/VPS run.
+        for preparation in (0.0, 3.5):
+            c, plan, state, sig, _, patchers = self.reload_fixture(old=True)
+            state.tick = 0.0
+            state.preparation_delay = preparation
+            state.new_worker_delay, state.old_exit_delay = 2.0, 3.5
+            report = self.invoke(c.reload_usr2, plan, patchers=patchers)
+            self.assertEqual(report['status'], 'passed')
+            sig.assert_called_once_with(700, signal.SIGUSR2, None, 0)
+            self.assertGreater(report['elapsed'], 3.0)
+            self.assertEqual(report['overall_deadline'], report['entry_at'] + 24.0)
+            self.assertEqual(report['deadline'], report['overall_deadline'])
+            self.assertEqual(report['stages']['new_worker']['start_at'], state.signal_at)
+            self.assertEqual(report['signal_attempted_at'], state.signal_at)
+            self.assertGreaterEqual(state.signal_at - state.certificate_at, preparation)
+            self.assertEqual(report['stages']['new_worker']['deadline'], state.signal_at + 5.0)
+            self.assertGreaterEqual(report['stages']['new_worker']['elapsed'], 2.0)
+            self.assertLess(report['stages']['new_worker']['elapsed'], 2.1)
+            self.assertEqual(report['stages']['old_worker_exit']['start_at'], state.all_closed_at)
+            self.assertEqual(report['clients_closed_at'], state.all_closed_at)
+            self.assertGreaterEqual(report['old_workers_exited_at'] - state.all_closed_at, 3.5)
+            self.assertLess(report['stages']['old_worker_exit']['elapsed'], 3.6)
+            self.assertTrue(report['old_workers_exited'])
+            self.assertEqual(report['old_worker_exit_proof'], 'pidfd-POLLIN-after-client-close')
+            self.assertEqual(state.old_poll_exit_at, report['old_workers_exited_at'])
+            for key in ('new_request', 'continuity_request', 'final_request'):
+                self.assertEqual(report[key]['status'], 200)
+                self.assertTrue(report[key]['marker_verified'])
+            self.assertEqual(report['final_request']['pid'], 103)
+            self.assertTrue(all(stage['status'] == 'success' for stage in report['stages'].values()))
+            self.assertIsNone(report['expired_stage'])
+            self.assertIsNone(report['deadline_scope'])
+            events = [event[0] for event in state.events]
+            bound = next(i for i, event in enumerate(state.events)
+                         if event[0] == 'capture' and event[1].endswith('-bound'))
+            self.assertLess(bound, events.index('held-partial'))
+            self.assertLessEqual(state.partial_at, state.signal_at)
+            self.assertLess(events.index('held-partial'), events.index('signal'))
+            for stage, deadline in state.capture_deadlines:
+                self.assertEqual(deadline, report['stages'][stage]['deadline'])
+            self.assertEqual(state.arm_remaining, 24.0)
+            self.assertEqual(state.signal_fakes['setitimer'].call_args_list[0].args,
+                             (signal.ITIMER_REAL, 24.0, 0.0))
+            self.assert_reload_timeline(report)
+            self.assert_reload_closed(state)
+
+    def test_reload_old_exit_deadline_remains_failed_after_confirmed_unit_cleanup(self):
+        for never in (False, True):
+            c, plan, state, sig, _, patchers = self.reload_fixture(old=True)
+            state.tick, state.new_worker_delay = 0.0, 2.0
+            state.never_old, state.old_exit_delay = never, 6.0
+            report = self.invoke(c.reload_usr2, plan, patchers=patchers)
+            self.assertEqual(report['status'], 'failed')
+            self.assertEqual(report['issues'], ['reload-old-worker-exit-deadline-inconclusive'])
+            self.assertEqual(report['expired_stage'], 'old_worker_exit')
+            self.assertEqual(report['deadline_scope'], 'stage')
+            self.assertTrue(report['pidfd_binding_verified'])
+            self.assertTrue(report['signal_sent'])
+            sig.assert_called_once()
+            self.assertEqual(report['new_request']['status'], 200)
+            self.assertTrue(report['new_request']['marker_verified'])
+            stage = report['stages']['old_worker_exit']
+            self.assertEqual(stage['start_at'], state.all_closed_at)
+            self.assertEqual(stage['status'], 'deadline')
+            self.assertGreaterEqual(stage['elapsed'], 5.0)
+            self.assertLess(stage['elapsed'], 5.1)
+            observations = report['old_worker_timeout_observations']
+            self.assertEqual(len(observations), 1)
+            observation = observations[0]
+            self.assertEqual(observation['identity'], (102, 1235))
+            self.assertEqual(observation['poll_flags'], 0)
+            self.assertFalse(observation['poll_error'])
+            self.assertFalse(observation['unexpected'])
+            self.assertFalse(observation['exited_when_sampled'])
+            self.assertTrue(observation['alive_when_sampled'])
+            self.assertIs(observation['alive_at_deadline'], True)
+            self.assertEqual(observation['clients_closed_at'], report['clients_closed_at'])
+            self.assertEqual(observation['stage_deadline'], stage['deadline'])
+            self.assertEqual(observation['overall_deadline'], report['overall_deadline'])
+            self.assertGreaterEqual(observation['poll_started_at'], stage['deadline'])
+            self.assertGreaterEqual(observation['sampled_at'], observation['poll_started_at'])
+            self.assertAlmostEqual(observation['drain_elapsed_since_clients_closed'],
+                                   observation['sampled_at'] - report['clients_closed_at'])
+            self.assertFalse(report['old_workers_exited'])
+            self.assertIsNone(report['old_worker_exit_proof'])
+            self.assertIsNone(report['old_workers_exited_at'])
+            self.assertIsNone(report['final_request'])
+            self.assertIsNone(report['stages']['final_verification']['start_at'])
+            self.assertTrue(all(value is None for value in report['unit_cleanup'].values()))
+            self.assert_reload_timeline(report)
+            self.assert_reload_closed(state)
+            verified = copy.deepcopy((report['status'], report['old_workers_exited'],
+                                      report['old_worker_exit_proof'], report['final_request']))
+            clean, helper, stops, kills = self.cleanup_owned_b(c, plan, state, force_kill=never)
+            self.assertTrue(clean)
+            self.assertTrue(state.cleanup_terminated_old)
+            self.assertEqual([call.args[1] for call in helper.call_args_list],
+                             ['stop', 'sigkill', 'finished'] if never else ['stop', 'finished'])
+            self.assertEqual(len(stops), 1)
+            self.assertEqual(len(kills), int(never))
+            self.assertEqual((report['status'], report['old_workers_exited'],
+                              report['old_worker_exit_proof'], report['final_request']), verified)
+            cleanup = report['unit_cleanup']
+            self.assertTrue(cleanup['confirmed'])
+            self.assertFalse(cleanup['old_exit_verified_before_cleanup'])
+            self.assertEqual(cleanup['old_exit_proof_status'], 'NOT-PROVEN-before-cleanup')
+            self.assertEqual(cleanup['old_exit_verification_status'], 'deadline')
+            self.assertEqual(cleanup['outcome'], 'unit-stop-confirmed-not-graceful-exit-proof')
+            self.assertIsNone(cleanup['old_exit_proof_before_cleanup'])
+            self.assertTrue(c.ab_report['reload_required'])
+            self.assertIs(c.ab_report['reload'], report)
+            self.assertEqual(report['cleanup_evidence'],
+                'nnp-ab.report.json:reload.unit_cleanup (canonical after unit cleanup)')
+            # Engine report is pre-unit-cleanup; canonical outer report owns it.
+            self.assertIsNone(state.reports[0]['unit_cleanup']['requested_at'])
+            self.assert_reload_timeline(report)
+
+    def test_reload_timeout_poll_observations_never_manufacture_timely_exit(self):
+        for result in (0, select.POLLIN, select.POLLERR, select.POLLNVAL,
+                       select.POLLHUP, select.POLLIN | select.POLLERR, 'oserror'):
+            with self.subTest(timeout_poll_result=result):
+                c, plan, state, sig, _, patchers = self.reload_fixture()
+                state.tick, state.never_old = 0.0, True
+                state.timeout_poll_result = result
+                report = self.invoke(c.reload_usr2, plan, patchers=patchers)
+                self.assertEqual(report['status'], 'failed')
+                self.assertEqual(report['issues'], ['reload-old-worker-exit-deadline-inconclusive'])
+                sig.assert_called_once()
+                observation, = report['old_worker_timeout_observations']
+                self.assertGreaterEqual(observation['poll_started_at'],
+                                        report['stages']['old_worker_exit']['deadline'])
+                self.assertGreaterEqual(observation['sampled_at'], observation['poll_started_at'])
+                self.assertEqual(observation['poll_flags'], None if result == 'oserror' else result)
+                if result == 0:
+                    self.assertIs(observation['exited_when_sampled'], False)
+                    self.assertIs(observation['alive_when_sampled'], True)
+                    self.assertIs(observation['alive_at_deadline'], True)
+                elif result == select.POLLIN:
+                    self.assertIs(observation['exited_when_sampled'], True)
+                    self.assertIs(observation['alive_when_sampled'], False)
+                    self.assertIsNone(observation['alive_at_deadline'])
+                else:
+                    self.assertIsNone(observation['exited_when_sampled'])
+                    self.assertIsNone(observation['alive_when_sampled'])
+                    self.assertIsNone(observation['alive_at_deadline'])
+                    self.assertTrue(observation['poll_error'] or observation['unexpected'])
+                self.assertFalse(report['old_workers_exited'])
+                self.assertIsNone(report['old_worker_exit_proof'])
+                self.assertIsNone(report['old_workers_exited_at'])
+                self.assertIsNone(report['final_request'])
+                self.assertTrue(c.ab_report['reload_required'])
+                self.assert_reload_timeline(report)
+                self.assert_reload_closed(state)
+                clean, _, _, _ = self.cleanup_owned_b(c, plan, state)
+                self.assertTrue(clean)
+                self.assertFalse(report['old_workers_exited'])
+                self.assertIsNone(report['old_worker_exit_proof'])
+                self.assertEqual(report['status'], 'failed')
+                self.assertEqual(report['unit_cleanup']['outcome'],
+                                 'unit-stop-confirmed-not-graceful-exit-proof')
+
+    def test_reload_pollin_observed_after_deadline_is_not_exit_proof(self):
+        c, plan, state, sig, _, patchers = self.reload_fixture()
+        state.tick, state.old_poll_overrun = 0.0, True
+        state.timeout_poll_result = select.POLLIN
+        report = self.invoke(c.reload_usr2, plan, patchers=patchers)
+        sig.assert_called_once()
+        self.assertEqual(report['status'], 'failed')
+        self.assertEqual(report['issues'], ['reload-old-worker-exit-deadline-inconclusive'])
+        self.assertGreater(state.old_poll_exit_at, report['stages']['old_worker_exit']['deadline'])
+        observation, = report['old_worker_timeout_observations']
+        self.assertIs(observation['exited_when_sampled'], True)
+        self.assertIsNone(observation['alive_at_deadline'])
+        self.assertFalse(report['old_workers_exited'])
+        self.assertIsNone(report['old_worker_exit_proof'])
+        self.assertIsNone(report['old_workers_exited_at'])
+        self.assertIsNone(report['final_request'])
+        self.assertEqual(report['stages']['final_verification']['status'], 'missing')
+        self.assertTrue(c.ab_report['reload_required'])
+        self.assert_reload_timeline(report)
+        self.assert_reload_closed(state)
+
+    def test_reload_delayed_old_exit_still_requires_fresh_final_tls_and_http(self):
+        for failure in ('timeout', 'missing-http'):
+            c, plan, state, sig, _, patchers = self.reload_fixture()
+            state.tick, state.new_worker_delay, state.old_exit_delay = 0.0, 2.0, 3.5
+            state.final_tls_failure = failure
+            report = self.invoke(c.reload_usr2, plan, patchers=patchers)
+            self.assertNotEqual(report['status'], 'passed')
+            sig.assert_called_once()
+            self.assertTrue(report['old_workers_exited'])
+            self.assertIsNotNone(report['old_worker_exit_proof'])
+            self.assertEqual(report['new_request']['status'], 200)
+            self.assertEqual(report['stages']['new_worker']['status'], 'success')
+            self.assertEqual(report['stages']['old_worker_exit']['status'], 'success')
+            self.assertEqual(report['stages']['final_verification']['status'], 'failure')
+            self.assertIsNone(report['final_request'])
+            self.assertIsNone(report['final_request_at'])
+            if failure == 'timeout':
+                final = report['stages']['final_verification']
+                self.assertGreaterEqual(final['elapsed'], 2.0)
+                self.assertLess(final['elapsed'], 2.1)
+                self.assertEqual(report['issues'], ['reload-network-timeout-inconclusive'])
+            else:
+                self.assertEqual(report['issues'], ['reload-http-eof'])
+            self.assertTrue(c.ab_report['reload_required'])
+            self.assert_reload_timeline(report)
+            self.assert_reload_closed(state)
+
+    def test_reload_new_worker_deadline_never_starts_old_drain(self):
+        c, plan, state, sig, _, patchers = self.reload_fixture()
+        state.tick, state.new_worker_delay = 0.0, float('inf')
+        report = self.invoke(c.reload_usr2, plan, patchers=patchers)
+        self.assertEqual(report['status'], 'failed')
+        self.assertEqual(report['issues'], ['reload-new-worker-deadline-inconclusive'])
+        self.assertEqual(report['expired_stage'], 'new_worker')
+        self.assertEqual(report['deadline_scope'], 'stage')
+        self.assertTrue(report['signal_sent'])
+        sig.assert_called_once()
+        self.assertGreaterEqual(report['stages']['new_worker']['elapsed'], 5.0)
+        self.assertLess(report['stages']['new_worker']['elapsed'], 5.1)
+        for name in ('continuity', 'old_worker_exit', 'final_verification'):
+            self.assertEqual(report['stages'][name]['status'], 'missing')
+            self.assertIsNone(report['stages'][name]['start_at'])
+        self.assertIsNone(report['new_request'])
+        self.assertIsNone(report['old_worker_timeout_observations'])
+        self.assertIsNone(report['old_worker_exit_proof'])
+        self.assertFalse(report['old_workers_exited'])
+        self.assertIsNone(report['final_request'])
+        self.assertTrue(report['clients_closed'])
+        labels = [row['label'] for row in report['timeline']]
+        self.assertIn('all-clients-closed-in-finally', labels)
+        self.assertNotIn('old_worker_exit-started', labels)
+        self.assertEqual(state.signal_fakes['setitimer'].call_count, 2)
+        self.assert_reload_timeline(report)
+        self.assert_reload_closed(state)
+
+    def test_reload_fixed_overall_deadline_and_release_cap_survive_transitions(self):
+        for entry, expected_deadline, stalled in ((4.0, 28.0, False), (27.0, 30.0, False),
+                                                 (4.0, 28.0, True)):
+            c, plan, state, sig, _, patchers = self.reload_fixture()
+            state.now, state.tick = entry, 0.0
+            state.preparation_delay = 3.5 if entry == 4.0 else 0.0
+            state.new_worker_delay = 4.0 if entry == 4.0 else 1.0
+            state.old_exit_delay = 4.0
+            state.final_show_delay = 25.0 if stalled else 0.0
+            report = self.invoke(c.reload_usr2, plan, patchers=patchers)
+            self.assertEqual(report['entry_at'], entry)
+            self.assertEqual(report['overall_deadline'], expected_deadline)
+            self.assertEqual(report['deadline'], expected_deadline)
+            self.assertEqual(report['overall_deadline'], min(entry + 24.0, plan['release_time'] + 29.0))
+            self.assertEqual(state.arm_remaining, expected_deadline - entry)
+            self.assertEqual(state.signal_fakes['setitimer'].call_count, 2)
+            self.assertGreater(sum(stage == 'new_worker' for stage, _ in state.capture_deadlines), 2)
+            sig.assert_called_once()
+            if stalled:
+                # A late interruptible synchronous read is still bounded by the
+                # entry clock, not a new 24s allowance at the final transition.
+                self.assertEqual(report['status'], 'failed')
+                self.assertEqual(report['issues'], ['reload-total-deadline-inconclusive'])
+                self.assertEqual(report['deadline_scope'], 'overall')
+                self.assertEqual(report['expired_stage'], 'final_verification')
+                self.assertTrue(report['old_workers_exited'])
+                self.assertIsNone(report['final_request'])
+                self.assertGreater(report['elapsed'], 24.0)
+            elif entry == 4.0:
+                self.assertEqual(report['status'], 'passed')
+                self.assertGreater(report['elapsed'], 11.0)
+                self.assertIsNone(report['deadline_scope'])
+            else:
+                self.assertEqual(report['status'], 'failed')
+                self.assertEqual(report['issues'], ['reload-total-deadline-inconclusive'])
+                self.assertEqual(report['deadline_scope'], 'overall')
+                self.assertEqual(report['expired_stage'], 'old_worker_exit')
+                self.assertLess(report['stages']['old_worker_exit']['elapsed'], 2.1)
+                self.assertFalse(report['old_workers_exited'])
+                self.assertIsNone(report['final_request'])
+                self.assertLess(state.now, expected_deadline + 0.1)
+            self.assert_reload_timeline(report)
+            self.assert_reload_closed(state)
+
+    def test_reload_runtime_optin_exact_plans_reject_forgery_aliases_and_mixed_arms(self):
+        for old in (False, True):
+            c = Offline.controller(self, old)
+            before = copy.deepcopy((c.source, c.fragment, c.source_bytes, c.caps))
+            default = self.ab_pair(c)
+            self.assertFalse(c.reload_report['requested'])
+            for requested, runtime in ((False, '8s'), (True, '30s')):
+                c.reload_report = self.D.reload_report(requested)
+                plans, profiles = self.ab_pair(c)
+                self.assertEqual({p['properties']['RuntimeMaxSec'] for p in plans}, {runtime})
+                self.assertTrue(c.compare_nnp_ab(*profiles, *plans)['ok'])
+                for plan, profile in zip(plans, profiles):
+                    expected = self.D.restriction_properties(c.caps)
+                    expected.update(RuntimeMaxSec=runtime,
+                                    NoNewPrivileges=plan['properties']['NoNewPrivileges'])
+                    self.assertEqual({key: plan['properties'][key] for key in expected}, expected)
+                    self.assertEqual(frozenset(plan['properties']['CapabilityBoundingSet'].split()),
+                                     CAPS3 if old else CAPS4)
+                    c.validate_nnp_ab(profile, plan)
+                    c._validate_probe_policy(profile, plan,
+                        expected_nnp=plan['properties']['NoNewPrivileges'], expected_runtime=runtime)
+                    # A self-consistent opposite runtime still cannot select the
+                    # controller's expected plan; flags inside plans confer no authority.
+                    opposite = self.D.nnp_ab_plan(c.directory, c.nonce, c.caps, plan['phase'],
+                                                  reload_usr2=not requested)
+                    wrong = dict(profile, RuntimeMaxUSec=opposite['properties']['RuntimeMaxSec'])
+                    with self.assertRaisesRegex(self.D.Unsupported, '^ab-plan$'):
+                        c.validate_nnp_ab(wrong, opposite)
+                    variants = []
+                    for key in ('RuntimeMaxSec', 'RuntimeMaxUSec'):
+                        bad = copy.deepcopy(plan)
+                        bad['properties'][key] = '30s'
+                        bad['command'] = self.D.transient_command(bad['unit'], bad['properties'], bad['argv'])
+                        if bad != plan:
+                            variants.append(bad)
+                        for args in (['--property=' + key + '=' + runtime],
+                                     ['--property', key + '=' + runtime], ['-p', key + '=' + runtime],
+                                     ['-p' + key + '=' + runtime]):
+                            duplicate = copy.deepcopy(plan)
+                            boundary = duplicate['command'].index('--')
+                            duplicate['command'][boundary:boundary] = args
+                            variants.append(duplicate)
+                    variants.append(dict(plan, reload_usr2=requested))
+                    for bad in variants:
+                        with self.assertRaisesRegex(self.D.Unsupported, '^ab-plan$'):
+                            c.validate_nnp_ab(profile, bad)
+                    for key, value in (('User', 'haproxy'), ('Group', 'haproxy'),
+                                       ('CapabilityBoundingSet', 'CAP_KILL'), ('NoNewPrivileges', 'invalid')):
+                        with self.assertRaises(self.D.Unsupported):
+                            c.validate_nnp_ab(dict(profile, **{key: value}), plan)
+                with self.assertRaises(self.D.Unsupported):
+                    if requested:
+                        c.compare_nnp_ab(default[1][0], profiles[1], default[0][0], plans[1])
+                    else:
+                        c.compare_nnp_ab(profiles[0], dict(profiles[1], RuntimeMaxUSec='30s'), *plans)
+                with self.assertRaises(self.D.Unsupported):
+                    c._validate_probe_policy(profiles[1], plans[1], expected_nnp='no',
+                                             expected_runtime='8s' if requested else '30s')
+            for value in (None, 0, 1, 'true', [], {}):
+                with self.assertRaises(self.D.Unsupported):
+                    self.D.nnp_ab_plan(c.directory, c.nonce, c.caps, 'nnp-no', reload_usr2=value)
+            c.reload_report = self.D.reload_report(False)
+            for phase in ('plain', 'trace'):
+                self.assertEqual(self.plan(c, phase)['properties']['RuntimeMaxSec'], '8s')
+            for phase in ('cap-gated', 'cap-direct'):
+                self.assertEqual(self.D.control_plan(c.directory, c.nonce, c.caps, phase)['properties']['RuntimeMaxSec'], '8s')
+            self.assertEqual(CapabilityMatrixContracts.mx_plan(self, c)['properties']['RuntimeMaxSec'], '8s')
+            self.assertEqual((c.source, c.fragment, c.source_bytes, c.caps), before)
+            self.assertEqual(c.source['RuntimeMaxUSec'], 'infinity')
+            self.assertEqual(c.source['NoNewPrivileges'], 'yes')
+            self.assertEqual(c.source['User'], 'root')
+            self.assertEqual(c.source_bytes, rendered(old).encode())
+
+    def test_reload_unit_cleanup_records_actual_helper_only_after_exit_proof(self):
+        for force_kill in (False, True):
+            c, plan, state, _, _, patchers = self.reload_fixture()
+            state.tick, state.new_worker_delay, state.old_exit_delay = 0.0, 2.0, 3.5
+            report = self.invoke(c.reload_usr2, plan, patchers=patchers)
+            self.assertEqual(report['status'], 'passed')
+            self.assert_reload_closed(state)
+            clean, helper, stops, kills = self.cleanup_owned_b(c, plan, state, force_kill=force_kill)
+            self.assertTrue(clean)
+            cleanup = report['unit_cleanup']
+            self.assertLess(report['clients_closed_at'], report['old_workers_exited_at'])
+            self.assertLess(report['old_workers_exited_at'], cleanup['requested_at'])
+            self.assertEqual(cleanup['requested_at'], stops[0])
+            self.assertEqual(cleanup['first_stop_at'], stops[0])
+            self.assertEqual(cleanup['first_kill_at'], kills[0] if force_kill else None)
+            self.assertLessEqual(cleanup['first_kill_at'] or cleanup['first_stop_at'], cleanup['finished_at'])
+            self.assertTrue(cleanup['confirmed'])
+            self.assertTrue(cleanup['old_exit_verified_before_cleanup'])
+            self.assertEqual(cleanup['old_exit_proof_before_cleanup'], 'pidfd-POLLIN-after-client-close')
+            self.assertEqual(cleanup['old_exit_proof_status'], 'PROVEN-before-cleanup')
+            self.assertEqual(cleanup['old_exit_verification_status'], 'success')
+            self.assertEqual(cleanup['outcome'], 'unit-stop-confirmed')
+            self.assertEqual(report['status'], 'passed')
+            self.assertEqual(helper.call_count, 3 if force_kill else 2)
+            self.assertIsNone(state.reports[0]['unit_cleanup']['requested_at'])
+            self.assertIs(c.ab_report['reload'], report)
+            self.assert_reload_timeline(report)
+        # Existing sequence()/CLI cleanup_one mocks deliberately do NOT call
+        # the timestamp helper. Do not invent unit cleanup times from mock returns.
+        c, plan, state, _, _, patchers = self.reload_fixture()
+        report = self.invoke(c.reload_usr2, plan, patchers=patchers)
+        self.assertTrue(self.invoke(Mock(return_value=True), plan['unit']))
+        self.assertTrue(all(value is None for value in report['unit_cleanup'].values()))
+        self.assert_reload_closed(state)
+
+    def test_reload_cleanup_scope_and_default_preflight_reports_never_mutate_proof(self):
+        for reason in ('not-requested', 'no-intent', 'foreign', 'wrong-unit', 'forged-plan'):
+            c, plan, state, _, _, _ = self.reload_fixture()
+            info = dict(c.ab_profiles['nnp-no'])
+            c.intents.append(plan['unit'])
+            target = plan['unit']
+            if reason == 'not-requested':
+                c.reload_report['requested'] = False
+            elif reason == 'no-intent':
+                c.intents.clear()
+            elif reason == 'foreign':
+                info['Description'] = 'foreign'
+            elif reason == 'wrong-unit':
+                target = c.ab_plans['nnp-yes']['unit']
+            else:
+                c.ab_plans['nnp-no'] = dict(plan, command=['/bin/true'])
+            before = copy.deepcopy(c.reload_report)
+            self.invoke(c._reload_unit_cleanup, target, 'stop', info, patchers=(
+                patch.object(time, 'monotonic', return_value=10.0),))
+            self.assertEqual(c.reload_report, before)
+        c = Offline.controller(self)
+        default_reload = copy.deepcopy(c.reload_report)
+        for phase in ('plain', 'trace', 'cap-gated', 'cap-direct', 'mx00'):
+            plan = (self.plan(c, phase) if phase in ('plain', 'trace') else
+                    self.D.control_plan(c.directory, c.nonce, c.caps, phase) if phase.startswith('cap-') else
+                    CapabilityMatrixContracts.mx_plan(self, c))
+            info = self.probe(c, plan)
+            self.assertTrue(self.invoke(c.cleanup_one, plan['unit'], patchers=(
+                patch.object(c, 'show', side_effect=[info, {'LoadState': 'not-found'}]),
+                patch.object(c, 'command', return_value=(0, b'', b'')),
+                patch.object(time, 'monotonic', return_value=10.0))))
+            self.assertEqual(c.reload_report, default_reload)
+        fresh = self.D.Controller()
+        # Historical None-report preflight/cleanup crashes must not recur:
+        # current source initializes a safe default report before any preflight.
+        self.assertEqual(fresh.ab_report['status'], 'NOTSTARTED')
+        self.assertEqual(fresh.ab_report['arms'], {})
+        self.assertIsNone(fresh.ab_assets)
+        fresh.cleanup = Mock(return_value=True)
+        fresh.cleanup_ab_keys = Mock(return_value=True)
+        rc, _, err = self.main_with(fresh, ['--nnp-ab'], patchers=(
+            patch.object(fresh, 'prepare', side_effect=self.D.Unsupported('fixture-preflight')),))
+        self.assertEqual((rc, err), (2, ''))
+        self.assertEqual(fresh.ab_report['status'], 'NOTSTARTED')
+        self.assertEqual(fresh.ab_report['issues'], ['fixture-preflight'])
+        self.assertFalse(fresh.ab_report['production_applied'])
+        self.assertEqual(fresh.reload_report, self.D.reload_report(False))
 
 
 class HostBoundaryRegressions(unittest.TestCase):
