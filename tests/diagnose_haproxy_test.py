@@ -313,8 +313,11 @@ def assert_launcher_contract(case, shell):
     # The dispatch prefix intentionally EXCLUDES the heredoc opener.
     prefix = shell[:opener.start()]
     case.assertNotIn("<<'" + MARKER, prefix)
-    flat = re.sub(r'\\\n', '', prefix)
-    structure = re.search(
+    # Skip leading comments and blank lines before joining continuations.
+    # In Bash, a backslash at the end of a comment does not join the next line.
+    preamble = re.match(r'(?:[ \t]*(?:#[^\n]*)?\n)*[ \t]*', prefix)
+    flat = re.sub(r'\\\n', '', prefix[preamble.end():])
+    structure = re.fullmatch(
         r'nathaya_diagnose_haproxy_main\s*\(\s*\)\s*\{\s*'
         r'case\s+"\$#:\$\{1-\}:\$\{2-\}"\s+in\s*'
         r'1:--help:\s*\)(?P<help>.*?)\s*;;\s*'
@@ -325,11 +328,9 @@ def assert_launcher_contract(case, shell):
         r'\*\s*\)(?P<default>.*?)\s*;;\s*'
         r'esac\s+(?P<dispatch>.*?)\s*\Z', flat, re.S)
     case.assertIsNotNone(structure, 'Complete one-flag/exact two-flag allowlist before dispatch')
-    help_tokens = shlex.split(structure['help'], posix=False)
-    case.assertEqual(help_tokens[:2], ['builtin', 'printf'])
-    case.assertEqual(help_tokens[2], "'%s\\n'")
-    case.assertEqual(help_tokens[-2:], ['return', '0'])
-    case.assertTrue(all(re.fullmatch(r"'[^']*'", arg) for arg in help_tokens[2:-2]))
+    case.assertRegex(structure['help'],
+                     r"\A[ \t\n]*builtin[ \t]+printf[ \t]+'%s\\n'"
+                     r"(?:[ \t]+'[^']*')+[ \t]*\n[ \t\n]*return[ \t]+0[ \t\n]*\Z")
     case.assertRegex(structure['help'], r'--help\s+is\s+read-only')
     case.assertRegex(structure['default'],
                      r"^\s*builtin\s+printf\s+'%s\\n'\s+'[^']*'\s*>\s*&2\s*;\s*return\s+64\s*$")
@@ -337,7 +338,6 @@ def assert_launcher_contract(case, shell):
         'exec', '/usr/bin/env', '-i', 'PATH=/usr/sbin:/usr/bin:/sbin:/bin',
         'LANG=C', 'LC_ALL=C', '/usr/bin/python3', '-I', '-B', '-', '"$@"',
     ])
-    case.assertNotRegex(prefix, r'\b(?:source|systemctl|systemd-run|sudo|apt|curl|wget)\b')
     tail = shell[closer.end():]
     case.assertRegex(tail,
                      r'\}\s*if\s+\[\[\s*"\$\{BASH_SOURCE\[0\]\}"\s*==\s*"\$0"\s*\]\]\s*;\s*then\s+'
@@ -373,9 +373,11 @@ class ImportAndShellContracts(Offline):
                  .replace(' -i PATH=', '  -i\tPATH=')
                  .replace(' -I -B - "$@"', '\t-I  -B\t-  "$@"')
                  .replace("<<'" + MARKER + "'\n", "<<  '" + MARKER + "'  \n"),
+            SHELL.replace('--help is read-only',
+                          'source, systemctl and curl are command names. --help is read-only'),
         )
         for variant in variants:
-            self.assertNotEqual(variant, SHELL, 'Layout mutation must exercise the prefix')
+            self.assertNotEqual(variant, SHELL, 'Positive mutation must exercise the prefix')
             assert_launcher_contract(self, variant)
         for before, after in (('-i PATH=', 'PATH='), (' -I -B ', ' -B '),
                               ('- "$@"', '- $@'), ('- "$@"', '- "$1"'),
@@ -383,6 +385,14 @@ class ImportAndShellContracts(Offline):
                               ('|2:--nnp-ab:--reload-usr2)', ')'),
                               ('2:--nnp-ab:--reload-usr2)', '2:*:--reload-usr2)'),
                               ('case "$#:${1-}:${2-}"', 'case "${1-}:${2-}"'),
+                              ('\nnathaya_diagnose_haproxy_main() {',
+                               '\nsource ./unexpected.sh\nnathaya_diagnose_haproxy_main() {'),
+                              ('\nnathaya_diagnose_haproxy_main() {',
+                               '\n# Comment ending with a backslash ' + '\\\n'
+                               'source ./unexpected.sh\nnathaya_diagnose_haproxy_main() {'),
+                              ('\n            return 0\n', '\n            source ./unexpected.sh\n            return 0\n'),
+                              ('\n            return 0\n',
+                               "\n            'source' './unexpected.sh'\n            return 0\n"),
                               ('\n' + MARKER + '\n', '\n' + MARKER + ' \n'),
                               ('\n' + MARKER + '\n', '\n' + MARKER + '\t\n')):
             mutated = SHELL.replace(before, after)
