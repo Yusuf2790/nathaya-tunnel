@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import re
 import select
+from shutil import get_terminal_size
 import subprocess
 import sys
 from tempfile import NamedTemporaryFile
@@ -17,6 +18,10 @@ STATE_DIR = Path("/var/lib/nathaya-tunnel")
 STATE_FILE = STATE_DIR / "traffic.json"
 INTERFACE_FILE = Path("/etc/nathaya-tunnel/traffic-interface")
 SYS_NET = Path("/sys/class/net")
+
+DAYS_ID = ("Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu")
+MONTHS_ID = ("Januari", "Februari", "Maret", "April", "Mei", "Juni",
+             "Juli", "Agustus", "September", "Oktober", "November", "Desember")
 
 
 def sample():
@@ -116,26 +121,39 @@ def units(value):
         value /= 1024
 
 
-def report(previous=None):
+def print_rx_tx(rx, tx):
+    print(f"  RX : {rx}\n  TX : {tx}")
+
+
+def report(previous=None, width=None):
     current = sample()
     state = load()
     totals = project(state, current)
-    print(f"  Interface {current['interface']} | waktu VPS")
-    for key, label in (("day", "Harian"), ("month", "Bulanan")):
-        period, (rx, tx) = totals[key]
-        if not state:
-            print(f"  {label} {period} | belum dicatat")
-            continue
-        print(f"  {label} {period}")
-        print(f"    RX {units(rx)}  TX {units(tx)}")
+    now = datetime.fromtimestamp(current["time"])
+    terminal_width = get_terminal_size(fallback=(width or 50, 24)).columns
+    separator = "  " + "─" * max(0, min(width or 64, terminal_width) - 2)
 
+    date_label = f"{DAYS_ID[now.weekday()]}, {now:%d:%m:%Y}"
+    for key, label, period in (
+        ("day", "Monitoring Harian", date_label),
+        ("month", "Monitoring Bulanan", MONTHS_ID[now.month - 1]),
+    ):
+        print(f"  {label} :\n  {period}")
+        if state:
+            _, (rx, tx) = totals[key]
+            print_rx_tx(units(rx), units(tx))
+        else:
+            print_rx_tx("belum dicatat", "belum dicatat")
+        print(separator)
+
+    print("  Trafik Realtime :")
     if previous and previous["identity"] == current["identity"]:
         seconds = current["monotonic"] - previous["monotonic"]
         rx, tx = (value * 8 / (seconds * 1_000_000)
                   for value in delta(previous, current))
-        print(f"  Realtime  RX {rx:.2f} / TX {tx:.2f} Mbps")
+        print_rx_tx(f"{rx:.2f} Mbps", f"{tx:.2f} Mbps")
     else:
-        print("  Realtime  menunggu sampel")
+        print_rx_tx("menunggu sampel", "menunggu sampel")
     return current
 
 
@@ -161,7 +179,9 @@ def wait_live_navigation():
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", choices=("collect", "show", "live"))
-    mode = parser.parse_args().mode
+    parser.add_argument("--width", type=int, help="Lebar panel trafik")
+    args = parser.parse_args()
+    mode = args.mode
     if mode == "collect":
         collect()
         return
@@ -170,11 +190,11 @@ def main():
     time.sleep(1)
     while True:
         if mode == "live":
-            print("\033[H\033[JTRAFIK VPS | Ctrl+C untuk kembali\n", end="")
-        previous = report(previous)
+            print("\033[H\033[JMONITORING TRAFIK")
+        previous = report(previous, args.width)
         if mode == "show":
             return
-        print("\n  [z]  Kembali\n  [x]  Keluar\n  Ketik z atau x, lalu tekan Enter.", flush=True)
+        print("\n  [z]  Kembali\n  [x]  Keluar\n  z/x: tekan Enter\n  Ctrl+C untuk kembali", flush=True)
         status = wait_live_navigation()
         if status is not None:
             return status
