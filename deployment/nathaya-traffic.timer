@@ -1,0 +1,10 @@
+[Unit]
+Description=Sample Nathaya Tunnel traffic every 15 seconds
+
+[Timer]
+OnBootSec=2s
+OnUnitActiveSec=15s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

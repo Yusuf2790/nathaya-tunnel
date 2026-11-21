@@ -1,61 +1,141 @@
 #!/bin/bash
-# Nathaya dashboard; data comes only from the installed Alrescha services/databases.
+
+# NATHAYA_BASE diwarisi dari menu.sh.
+
+source "$NATHAYA_BASE/modules/common/ui.sh"
+source "$NATHAYA_BASE/modules/common/functions.sh"
+
+_service_row() {
+    local name1="$1"
+    local state1="$2"
+    local name2="$3"
+    local state2="$4"
+    local visible_len
+
+    printf '%b│%b %-8s : ' "$CYAN" "$RESET" "$name1"
+    status_badge "$state1"
+
+    if [[ "$state1" == "ON" ]]; then
+        visible_len=4
+    else
+        visible_len=5
+    fi
+
+    printf '%*s│ ' "$((20 - 13 - visible_len))" ''
+    printf '%-8s : ' "$name2"
+    status_badge "$state2"
+    printf '\n'
+}
+
+draw_service_status() {
+    local width="$1"
+    # SERVICE STATUS
+    printf '\n'
+    draw_section_title "SERVICE STATUS" "$width"
+
+    _service_row "SSH" "$(get_service_status ssh)" "XRAY" "$(get_service_status xray)"
+    _service_row "DROPBEAR" "$(get_service_status dropbear)" \
+        "NGINX" "$(get_service_status nginx)"
+
+    printf '%b│%b OPENVPN  : ' "$CYAN" "$RESET"
+    status_badge "$(get_service_status openvpn)"
+    printf '\n'
+
+    draw_box_bottom "$width" "$CYAN"
+
+}
 
 draw_dashboard_info() {
     refresh_system_info
+
     local width
     width=$(get_width)
+
+    # Header utama
     draw_nathaya_header "$width"
 
+    # SYSTEM INFORMATION
     printf '\n'
     draw_section_title "SYSTEM INFORMATION" "$width"
-    nathaya_field "$width" "OS" "$OS_NAME"
-    nathaya_field "$width" "HOSTNAME" "$HOST_NAME"
-    nathaya_field "$width" "CPU CORE" "$CPU_CORES Core"
-    nathaya_field "$width" "RAM" "$RAM_INFO"
-    nathaya_field "$width" "SWAP" "$SWAP_INFO"
-    nathaya_field "$width" "CITY" "$CITY"
-    nathaya_field "$width" "ISP" "$ISP"
-    nathaya_field "$width" "IP PUBLIK" "$PUBLIC_IP"
-    nathaya_field "$width" "DOMAIN" "${DOMAIN:-Belum disetting}"
-    draw_box_bottom "$width"
+
+    printf '%b│%b OS        : %s\n' "$CYAN" "$RESET" "$OS_NAME"
+    printf '%b│%b CPU CORE  : %s Core\n' "$CYAN" "$RESET" "$CPU_CORES"
+
+    local ram_used ram_total swap_used swap_total
+    ram_used=$(free -h | awk '/^Mem:/ {print $3}')
+    ram_total=$(free -h | awk '/^Mem:/ {print $2}')
+    swap_used=$(free -h | awk '/^Swap:/ {print $3}')
+    swap_total=$(free -h | awk '/^Swap:/ {print $2}')
+
+    printf '%b│%b RAM       : %s / %s\n' \
+        "$CYAN" "$RESET" "${ram_used:-?}" "${ram_total:-?}"
+    printf '%b│%b SWAP      : %s / %s\n' \
+        "$CYAN" "$RESET" "${swap_used:-?}" "${swap_total:-?}"
+    printf '%b│%b CITY      : %s\n' "$CYAN" "$RESET" "$CITY"
+    printf '%b│%b ISP       : %s\n' "$CYAN" "$RESET" "$ISP"
+    printf '%b│%b IP PUBLIK : %s\n' "$CYAN" "$RESET" "$PUBLIC_IP"
+    printf '%b│%b DOMAIN    : %s\n' "$CYAN" "$RESET" "${DOMAIN:-Belum disetting}"
+
+    draw_box_bottom "$width" "$CYAN"
 
     printf '\n'
     draw_section_title "TELEGRAM STATUS" "$width"
-    nathaya_status_row "$width" "Notification Bot" "$TELEGRAM_NOTIFICATION_STATUS"
-    nathaya_status_row "$width" "Management Bot" "$TELEGRAM_MANAGEMENT_STATUS"
-    draw_box_bottom "$width"
-
+    printf '  Bot Akses VPS  : '
+    status_badge "${TELEGRAM_MANAGEMENT_STATUS:-OFF}"
+    printf '\n  Bot Notifikasi : '
+    status_badge "$(notification_bot_status)"
     printf '\n'
-    draw_section_title "SERVICE STATUS" "$width"
-    nathaya_status_row "$width" "SSH" "$SSH_STATUS"
-    nathaya_status_row "$width" "SSH NATHAYA" "$(get_service_status nathaya-ssh)"
-    nathaya_status_row "$width" "XRAY" "$XRAY_STATUS"
-    nathaya_status_row "$width" "DROPBEAR" "$(get_service_status nathaya-dropbear)"
-    nathaya_status_row "$width" "NGINX" "$(get_service_status nginx)"
-    nathaya_status_row "$width" "OPENVPN TCP" "$(get_service_status nathaya-openvpn-tcp)"
-    nathaya_status_row "$width" "OPENVPN UDP" "$(get_service_status nathaya-openvpn-udp)"
-    nathaya_status_row "$width" "HAPROXY" "$(get_service_status haproxy)"
-    nathaya_status_row "$width" "WEBSOCKET" "$(get_service_status ws)"
-    nathaya_status_row "$width" "VMESS" "$(get_service_status vmess@config)"
-    nathaya_status_row "$width" "VLESS" "$(get_service_status vless@config)"
-    nathaya_status_row "$width" "TROJAN" "$(get_service_status trojan@config)"
-    nathaya_status_row "$width" "SHADOWSOCKS" "$(get_service_status shadowsocks@config)"
     draw_box_bottom "$width"
 
+    draw_service_status "$width"
+
+    # ACCOUNT TOTAL
     printf '\n'
     draw_section_title "ACCOUNT TOTAL" "$width"
-    nathaya_field "$width" "SSH" "$SSH_TOTAL"
-    nathaya_field "$width" "VMESS" "$VMESS_TOTAL"
-    nathaya_field "$width" "VLESS" "$VLESS_TOTAL"
-    nathaya_field "$width" "TROJAN" "$TROJAN_TOTAL"
-    nathaya_field "$width" "SSOCKS" "$SHADOWSOCKS_TOTAL"
+
+    printf '  SSH: %s   VMESS: 0   VLESS: 0   TROJAN: 0\n' "$SSH_TOTAL"
     draw_box_bottom "$width"
 
+    draw_traffic_summary "$width"
     printf '\n'
-    draw_box_top "$width"
-    nathaya_field "$width" "Script Version" "${SCRIPT_VERSION:-1.0.0}"
-    nathaya_field "$width" "Developer" "${SCRIPT_DEVELOPER:-Nathaya Tunnel}"
-    draw_box_bottom "$width"
-    printf '\nKetik "menu" untuk membuka panel, atau "x" untuk keluar: '
+    show_main_menu
+
+    # FOOTER
+    printf '\n'
+    draw_box_top "$width" "$CYAN"
+
+    printf '%b│%b Script Version : %s\n' \
+        "$CYAN" "$RESET" "${SCRIPT_VERSION:-1.0.0}"
+
+    printf '%b│%b Client Name    : %s\n' "$CYAN" "$RESET" "${CLIENT_NAME:--}"
+    printf '%b│%b Order by       : %s\n' "$CYAN" "$RESET" "${ORDER_BY:--}"
+
+    printf '%b│%b Developer      : %b%s%b\n' \
+        "$CYAN" "$RESET" "$ORANGE" \
+        "${SCRIPT_DEVELOPER:-Nathaya Tunnel}" "$RESET"
+
+    draw_box_bottom "$width" "$CYAN"
+
+    printf '\n'
+}
+
+notification_bot_status() {
+    if [[ "${TELEGRAM_STATUS:-OFF}" == ON && -n "${TELEGRAM_BOT_TOKEN:-}" &&
+          "${TELEGRAM_ADMIN_ID:-}" =~ ^-?[0-9]+$ ]]; then
+        printf ON
+    else
+        printf OFF
+    fi
+}
+
+show_notification_bot() {
+    clear_screen
+    local width
+    width=$(get_width)
+    draw_nathaya_header "$width"
+    draw_section_title "BOT NOTIFIKASI" "$width"
+    printf '  Status konfigurasi: '
+    status_badge "$(notification_bot_status)"
+    printf '\n'
+    wait_submenu_navigation "$width"
 }

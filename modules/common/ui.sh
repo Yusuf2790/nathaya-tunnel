@@ -55,7 +55,7 @@ repeat_char() {
 
 center_text() {
     local text="$1"
-    local width="$2"
+    local width="${2:-$(get_width)}"
     local padding
 
     padding=$(( (width - ${#text}) / 2 ))
@@ -89,7 +89,7 @@ draw_box_bottom() {
 # Judul bagian dengan lebar total konsisten.
 draw_section_title() {
     local title="$1"
-    local width="$2"
+    local width="${2:-$(get_width)}"
     local color="${3:-$CYAN}"
     local title_len=${#title}
     local remaining left right
@@ -158,54 +158,69 @@ draw_nathaya_header() {
     draw_box_bottom "$width" "$CYAN"
 }
 
-# Shared, bounded rows for dashboards and every protocol menu.
-# Fold untrusted system text as data; never interpret embedded terminal escapes.
-nathaya_plain_text() {
-    printf '%s' "$1" | LC_ALL=C tr -d '\000-\010\013-\037\177' | tr '\t\n\r' '   '
+draw_menu_item() {
+    local key="$1" label="$2" color="$GREEN"
+    if [[ "$key" =~ ^[0-9]+$ ]]; then
+        color="$ORANGE"
+    elif [[ "$key" == x ]]; then
+        color="$RED"
+    fi
+    printf '  %b%-4s%b  %b%s%b\n' "$color" "[$key]" "$RESET" "$WHITE" "$label" "$RESET"
 }
 
-nathaya_box_row() {
-    local width="$1" text line
-    text=$(nathaya_plain_text "$2")
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        printf '%b│%b %-*s %b│%b\n' "$CYAN" "$WHITE" "$((width - 4))" "$line" "$CYAN" "$RESET"
-    done < <(printf '%s\n' "$text" | fold -s -w "$((width - 4))")
+draw_submenu_navigation() {
+    draw_menu_item z "Kembali"
+    draw_menu_item x "Keluar"
 }
 
-nathaya_field() {
-    nathaya_box_row "$1" "$(printf '%-10s: %s' "$2" "$3")"
-}
-
-nathaya_status_row() {
-    local width="$1" label="$2" state="$3" color="$RED" text
-    [[ "$state" == ON ]] && color="$GREEN"
-    text=$(printf '%-18s: ● %s' "$label" "$state")
-    printf '%b│%b %-*s %b│%b\n' "$CYAN" "$color" "$((width - 4))" "$text" "$CYAN" "$RESET"
-}
-
-nathaya_menu_item() {
-    local width="$1" number="$2" label="$3" line first=1
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        if (( first )); then
-            printf '%b│ %b%2s. %b%-*s %b│%b\n' "$CYAN" "$ORANGE" "$number" "$WHITE" "$((width - 8))" "$line" "$CYAN" "$RESET"
-            first=0
-        else
-            printf '%b│     %b%-*s %b│%b\n' "$CYAN" "$WHITE" "$((width - 8))" "$line" "$CYAN" "$RESET"
-        fi
-    done < <(nathaya_plain_text "$label" | fold -s -w "$((width - 8))")
-}
-
-nathaya_show_menu() {
-    local title="$1" width index=1 label
-    shift
-    width=$(get_width)
-    [[ -t 1 ]] && clear
-    draw_nathaya_header "$width"
-    draw_section_title "$title" "$width"
-    for label in "$@"; do
-        nathaya_menu_item "$width" "$index" "$label"
-        ((index++))
+wait_submenu_navigation() {
+    local width="${1:-}" choice
+    draw_submenu_navigation
+    if [[ -n "$width" ]]; then draw_box_bottom "$width"; fi
+    while read -r -p "  Pilih [z/x]: " choice; do
+        case "${choice,,}" in
+            z) return 0 ;;
+            x|exit|keluar) return "$DASHBOARD_EXIT" ;;
+            *) printf '  Pilihan tidak valid.\n' ;;
+        esac
     done
-    draw_box_bottom "$width"
-    printf '  %bz.%b Kembali\n  %bx.%b Exit\n\n' "$ORANGE" "$RESET" "$ORANGE" "$RESET"
+    return "$DASHBOARD_EXIT"
+}
+
+draw_menu_choices() {
+    local width="$1"
+    shift
+    local -a keys=() labels=()
+    local column_width=0 index size half
+
+    while (( $# )); do
+        keys+=("$1")
+        labels+=("$2")
+        size=${#2}
+        (( size > column_width )) && column_width=$size
+        shift 2
+    done
+
+    if (( width < 2 * (column_width + 8) || ${#keys[@]} < 6 )); then
+        for index in "${!keys[@]}"; do
+            draw_menu_item "${keys[index]}" "${labels[index]}"
+        done
+        return
+    fi
+
+    half=$(( (${#keys[@]} + 1) / 2 ))
+    for ((index = 0; index < half; index++)); do
+        printf '  %b%-4s%b  %-*s' "$ORANGE" "[${keys[index]}]" "$RESET" "$column_width" "${labels[index]}"
+        if (( index + half < ${#keys[@]} )); then
+            draw_menu_item "${keys[index + half]}" "${labels[index + half]}"
+        else
+            printf '\n'
+        fi
+    done
+}
+
+clear_screen() {
+    if [[ -t 1 && -n "${TERM:-}" && "$TERM" != dumb ]]; then
+        clear
+    fi
 }
