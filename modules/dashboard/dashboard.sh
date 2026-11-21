@@ -89,6 +89,9 @@ draw_dashboard_info() {
 
     draw_service_status "$width"
 
+    printf '\n'
+    draw_traffic_summary "$width"
+
     # ACCOUNT TOTAL
     printf '\n'
     draw_section_title "ACCOUNT TOTAL" "$width"
@@ -96,7 +99,6 @@ draw_dashboard_info() {
     printf '  SSH: %s   VMESS: 0   VLESS: 0   TROJAN: 0\n' "$SSH_TOTAL"
     draw_box_bottom "$width"
 
-    draw_traffic_summary "$width"
     printf '\n'
     show_main_menu
 
