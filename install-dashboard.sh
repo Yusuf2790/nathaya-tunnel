@@ -3,11 +3,13 @@
 source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P) || exit 1
 service=nathaya-traffic.service
 timer=nathaya-traffic.timer
+ssh_service=nathaya-dropbear.service
 app_files=(
     menu.sh
     modules/common/{functions,telegram,ui}.sh
     modules/dashboard/{dashboard.sh,traffic.sh,traffic.py}
     modules/menu/{domain,main,set_domain,ssh}.sh
+    modules/ssh/backend.py
 )
 deploy_files=(deployment/menu deployment/nathaya-login.sh "deployment/$service" "deployment/$timer")
 local_uid=0
@@ -20,6 +22,8 @@ set_paths() {
     hook="$base/etc/profile.d/nathaya-login.sh"
     unit_dir="$base/etc/systemd/system"
     timer_link="$unit_dir/timers.target.wants/$timer"
+    ssh_link="$unit_dir/multi-user.target.wants/$ssh_service"
+    ssh_ports_file="$base/etc/nathaya-tunnel/ssh-ports.conf"
     os_release="$base/etc/os-release"
     systemd_runtime="$base/run/systemd/system"
     lock_file="$base/run/nathaya-install.lock"
@@ -30,12 +34,13 @@ set_paths() {
 
 usage() {
     cat <<'USAGE'
-Pemakaian: bash install-dashboard.sh [--check] [--enable-login-menu]
+Pemakaian: bash install-dashboard.sh [--check] [--enable-login-menu] [--enable-ssh]
   --help               Tampilkan bantuan ini.
   --check              Jalankan preflight saja; tidak menulis file, memakai APT,
                        mengunci installer, atau mengubah unit systemd.
   --enable-login-menu  Aktifkan menu otomatis pada login SSH root interaktif
                        untuk instalasi baru. Instal ulang mempertahankan pilihan lama.
+  --enable-ssh         Pasang/aktifkan Dropbear Nathaya yang terisolasi.
 USAGE
 }
 
@@ -83,7 +88,7 @@ validate_host() {
 
 validate_sources() {
     local f
-    for f in "${app_files[@]}" "${deploy_files[@]}"; do
+    for f in "${app_files[@]}" "${staged_deployment[@]}"; do
         [[ -f "$source_dir/$f" && ! -L "$source_dir/$f" && -r "$source_dir/$f" ]] ||
             die "file sumber hilang, bukan file biasa, atau tidak terbaca: $f"
     done
@@ -97,7 +102,7 @@ check_unit_conflicts() {
     local paths unit dir file fragment dropins
     paths=$(systemd-analyze --system unit-paths 2>/dev/null) && [[ -n "$paths" ]] ||
         die 'tidak dapat membaca jalur unit systemd'
-    for unit in "$service" "$timer"; do
+    for unit in "${managed_units[@]}"; do
         fragment=$(unit_property "$unit" FragmentPath) || die "tidak dapat membaca lokasi unit $unit"
         [[ -z "$fragment" || "$fragment" == "$unit_dir/$unit" ]] || conflict "$fragment"
         dropins=$(unit_property "$unit" DropInPaths) || die "tidak dapat memeriksa drop-in $unit"
@@ -112,6 +117,9 @@ check_unit_conflicts() {
         done <<< "$paths"
     done
 }
+
+# shellcheck source=deployment/ssh-installer.sh
+source "$source_dir/deployment/ssh-installer.sh" || exit 1
 
 check_conflicts() {
     local f dst existing=0 have_app_files=0
@@ -160,7 +168,9 @@ check_conflicts() {
         [[ -f "$lock_file" && ! -L "$lock_file" ]] && owned "$lock_file" || conflict "$lock_file"
     fi
     (( !have_app_files || existing )) || conflict "$target"
+    select_ssh_module
     check_unit_conflicts
+    if (( ssh_enabled )); then check_ssh_ports; fi
 
     login_enabled=0
     if exists "$hook" || (( !existing && request_login )); then login_enabled=1; fi
@@ -182,12 +192,13 @@ missing_dependencies() {
     command -v hostname >/dev/null || packages+=(hostname)
     command -v awk >/dev/null || packages+=(mawk)
     if ! command -v tput >/dev/null || ! command -v clear >/dev/null; then packages+=(ncurses-bin); fi
+    if (( ssh_enabled )); then ssh_dependencies; fi
     return 0
 }
 
 snapshot_states() {
     local n active enabled unit
-    for unit in "$service" "$timer"; do
+    for unit in "${managed_units[@]}"; do
         # Kolektor oneshot dapat sedang mengambil sampel. Tunggu sejenak, jangan merekam status transien.
         for (( n=0; n<20; n++ )); do
             active=$(unit_property "$unit" ActiveState) || die "tidak dapat membaca status $unit"
@@ -206,8 +217,9 @@ snapshot_states() {
 }
 
 stage_files() {
-    local f perm
-    for f in "${app_files[@]}" "${deploy_files[@]}"; do
+    local f perm unit
+    local -a verify_units=()
+    for f in "${app_files[@]}" "${staged_deployment[@]}"; do
         perm=0644
         case "$f" in menu.sh|deployment/menu) perm=0755 ;; esac
         install -D -m "$perm" -- "$source_dir/$f" "$stage/$f" || die "tidak dapat menyiapkan $f"
@@ -219,7 +231,8 @@ stage_files() {
                 ;;
         esac
     done
-    systemd-analyze --system verify "$stage/deployment/$service" "$stage/deployment/$timer" \
+    for unit in "${managed_units[@]}"; do verify_units+=("$stage/deployment/$unit"); done
+    systemd-analyze --system verify "${verify_units[@]}" \
         > "$backup/unit-verify.log" 2>&1 || die "validasi unit gagal; lihat $backup/unit-verify.log"
 }
 
@@ -257,11 +270,13 @@ put_file() {
 unit_action() { systemctl --system "$@" >> "$backup/deployment.log" 2>&1; }
 
 rollback() {
-    local i dst saved unit state enabled failed=0
+    local i dst saved unit state enabled failed=0 seen_timer=0
     printf 'Deployment gagal; memulihkan file dan unit Nathaya.\n' >&2
     if (( units_touched )); then
         # Hentikan timer dahulu agar tidak memulai kolektor selama pemulihan.
-        for unit in "$timer" "$service"; do
+        for unit in "$timer" "${managed_units[@]}"; do
+            if [[ "$unit" == "$timer" && ${seen_timer:-0} == 1 ]]; then continue; fi
+            if [[ "$unit" == "$timer" ]]; then seen_timer=1; fi
             state=$(unit_property "$unit" ActiveState) || { failed=1; continue; }
             case "$state" in active|activating|deactivating|reloading)
                 unit_action stop "$unit" || failed=1 ;;
@@ -279,7 +294,7 @@ rollback() {
     done
     if (( units_touched )); then
         unit_action daemon-reload || failed=1
-        for unit in "$service" "$timer"; do
+        for unit in "${managed_units[@]}"; do
             if [[ ${prior_active[$unit]} == active ]]; then
                 unit_action start "$unit" || failed=1
             elif [[ $(unit_property "$unit" ActiveState) == failed ]]; then
@@ -323,6 +338,7 @@ deploy() {
     if (( login_enabled )); then
         inputs+=("$stage/deployment/nathaya-login.sh"); outputs+=("$hook")
     fi
+    if (( ssh_enabled )); then stage_ssh_outputs; fi
     if ! exists "$timer_link"; then
         # Symlink WantedBy=timers.target; hanya symlink ini yang diubah untuk enablement.
         ln -s -- "../$timer" "$stage/timer-link" || die 'tidak dapat menyiapkan symlink timer'
@@ -337,17 +353,21 @@ deploy() {
     if [[ ${prior_active[$timer]} == active ]]; then
         unit_action stop "$timer" || die "gagal menghentikan $timer sebelum deployment"
     fi
+    if (( ssh_enabled )) && [[ ${prior_active[$ssh_service]} == active ]]; then
+        unit_action stop "$ssh_service" || die "gagal menghentikan $ssh_service sebelum deployment"
+    fi
     for i in "${!inputs[@]}"; do put_file "${inputs[i]}" "${outputs[i]}"; done
     unit_action daemon-reload || die 'systemctl daemon-reload gagal'
     unit_action start "$timer" || die "gagal memulai $timer"
     [[ $(unit_property "$timer" UnitFileState) == enabled ]] || die "$timer belum aktif saat boot (enabled)"
     [[ $(unit_property "$timer" ActiveState) == active ]] || die "$timer tidak berjalan (active)"
+    if (( ssh_enabled )); then activate_ssh_unit; fi
     deployment_started=0
 }
 
 main() {
-    local mode_install=install request_login=0 login_enabled=0 option
-    local -a packages=()
+    local mode_install=install request_login=0 login_enabled=0 request_ssh=0 ssh_enabled=0 option
+    local -a packages=() managed_units=() staged_deployment=()
     local backup= stage= pending_temp= backup_count=0 deployment_started=0 units_touched=0 lock_fd
     local -a touched=() created_dirs=()
     local -A originals=() prior_active=() prior_enabled=()
@@ -356,16 +376,18 @@ main() {
             --help|-h) usage; return 0 ;;
             --check) mode_install=check ;;
             --enable-login-menu) request_login=1 ;;
+            --enable-ssh) request_ssh=1 ;;
             *) die "opsi tidak dikenal: $option (lihat --help)" ;;
         esac
     done
     validate_host
-    validate_sources
     check_conflicts
+    validate_sources
     missing_dependencies
     if [[ "$mode_install" == check ]]; then
         printf 'Preflight OK. Dependensi yang perlu dipasang: %s. Login otomatis: %s.\n' \
             "${packages[*]:-tidak ada}" "$login_enabled"
+        printf 'Modul Dropbear: %s (1=aktif saat instalasi).\n' "$ssh_enabled"
         if (( EUID != local_uid )); then printf 'Instalasi tetap harus dijalankan sebagai root.\n'; fi
         return 0
     fi
@@ -397,6 +419,7 @@ main() {
     deploy
     printf 'Dashboard terpasang: %s. Jalankan menu.\n' "$target"
     printf 'Timer %s: enabled, active. Login otomatis: %s.\n' "$timer" "$login_enabled"
+    if (( ssh_enabled )); then printf 'Dropbear Nathaya: enabled, active.\n'; fi
     printf 'Log/backup (akses root): %s\n' "$backup"
     exit 0  # Jalankan EXIT trap selagi variabel transaksi masih dalam lingkup main.
 }

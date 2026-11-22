@@ -1,0 +1,19 @@
+[Unit]
+Description=Nathaya isolated Dropbear forwarding
+After=network.target
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/python3 -I /opt/nathaya/modules/ssh/backend.py serve
+StateDirectory=nathaya-ssh
+StateDirectoryMode=0700
+RuntimeDirectory=nathaya-ssh
+RuntimeDirectoryMode=0700
+UMask=0077
+KillMode=control-group
+LimitCORE=0
+TasksMax=512
+TimeoutStartSec=20s
+
+[Install]
+WantedBy=multi-user.target

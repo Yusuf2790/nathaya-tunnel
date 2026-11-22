@@ -1,51 +1,36 @@
 #!/usr/bin/env bash
 
 NATHAYA_TELEGRAM_CONFIG="/etc/nathaya-tunnel/config.conf"
-NATHAYA_TELEGRAM_LOG="/opt/nathaya/logs/telegram.log"
 
-telegram_send_message() {
+# Existing config/chat, HTML <pre> for aligned details. Secrets travel via stdin.
+telegram_send_message() (
+    set +x
     local message="${1:-}"
-    local response_file http_code
+    local TELEGRAM_STATUS=OFF TELEGRAM_BOT_TOKEN= TELEGRAM_ADMIN_ID=
+    [[ -r "$NATHAYA_TELEGRAM_CONFIG" && -n "$message" ]] || return 2
+    # shellcheck source=/dev/null
+    source "$NATHAYA_TELEGRAM_CONFIG" >/dev/null 2>&1 || return 2
+    [[ "$TELEGRAM_STATUS" == ON && "$TELEGRAM_BOT_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]+$ &&
+       "$TELEGRAM_ADMIN_ID" =~ ^-?[0-9]+$ ]] || return 2
+    printf '%s\n%s\n%s' "$TELEGRAM_BOT_TOKEN" "$TELEGRAM_ADMIN_ID" "$message" |
+        /usr/bin/python3 -I -c '
+import html
+import json
+import sys
+import urllib.parse
+import urllib.request
 
-    [[ -r "$NATHAYA_TELEGRAM_CONFIG" ]] || return 1
-    [[ -n "$message" ]] || return 1
-
-    source "$NATHAYA_TELEGRAM_CONFIG"
-
-    [[ "${TELEGRAM_STATUS:-OFF}" == "ON" ]] || return 2
-    [[ -n "${TELEGRAM_BOT_TOKEN:-}" ]] || return 3
-    [[ "${TELEGRAM_ADMIN_ID:-}" =~ ^-?[0-9]+$ ]] || return 4
-    command -v curl >/dev/null 2>&1 || return 5
-
-    response_file="$(mktemp)" || return 6
-    chmod 600 "$response_file"
-
-    http_code="$(
-        curl -sS \
-            --connect-timeout 5 \
-            --max-time 15 \
-            -o "$response_file" \
-            -w '%{http_code}' \
-            -X POST \
-            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            --data-urlencode "chat_id=${TELEGRAM_ADMIN_ID}" \
-            --data-urlencode "text=${message}" \
-            --data-urlencode "parse_mode=${parse_mode:-HTML}" \
-            2>/dev/null
-    )" || http_code="000"
-
-    if [[ "$http_code" == "200" ]] &&
-       grep -q '"ok":[[:space:]]*true' "$response_file"; then
-        rm -f "$response_file"
-        return 0
-    fi
-
-    {
-        printf '%s Telegram send failed; HTTP=%s\n' \
-            "$(date '+%F %T')" "${http_code:-unknown}"
-    } >> "$NATHAYA_TELEGRAM_LOG"
-    chmod 600 "$NATHAYA_TELEGRAM_LOG" 2>/dev/null || true
-
-    rm -f "$response_file"
-    return 7
-}
+try:
+    token, chat, message = sys.stdin.read().split("\n", 2)
+    data = urllib.parse.urlencode({"chat_id": chat, "parse_mode": "HTML",
+                                  "text": "<pre>" + html.escape(message, quote=False) + "</pre>"}).encode()
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            return None
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+    with opener.open("https://api.telegram.org/bot" + token + "/sendMessage", data, timeout=15) as response:
+        sys.exit(0 if json.loads(response.read(1048576)).get("ok") is True else 7)
+except Exception:
+    sys.exit(7)
+' 2>/dev/null
+)

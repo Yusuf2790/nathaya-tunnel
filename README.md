@@ -102,10 +102,98 @@ Interface dipilih dari default route IPv4, dengan IPv6 sebagai cadangan.
 Untuk memilih interface sendiri, tulis namanya pada satu baris di
 `/etc/nathaya-tunnel/traffic-interface`.
 
-Bot Notifikasi menampilkan status konfigurasi pengiriman Telegram yang
-sudah dipakai modul SSH. Menu SSH, VMESS, VLESS, TROJAN, Bot Akses VPS, dan
-Set Banner menampilkan “Modul belum tersedia”. File modul SSH dan data akun
-yang sudah ada tetap disimpan.
+## Modul SSH tahap pertama (opsional)
+
+Aktifkan hanya pada **VPS uji** sampai uji koneksi nyata di bawah lulus:
+
+```bash
+sudo bash install-dashboard.sh --check --enable-ssh
+sudo bash install-dashboard.sh --enable-ssh
+systemctl status nathaya-dropbear.service
+ss -ltnp
+```
+
+Installer memasang `dropbear-bin` (bukan layanan Dropbear bawaan distro),
+Bubblewrap, OpenSSL, dan Python Cryptography jika diperlukan. Unit khusus
+`nathaya-dropbear.service` memakai TCP 109. Untuk menambah TCP 143, buat
+`/etc/nathaya-tunnel/ssh-ports.conf` milik root dengan isi `109 143`, lalu
+jalankan preflight dan installer lagi. Installer menolak listener asing pada
+port yang dipilih; tidak mengubah firewall, port, atau konfigurasi SSH admin.
+Instal ulang mempertahankan modul yang terpasang, akun, dan host key. Restart
+layanan saat instal ulang dapat memutus tunnel pelanggan yang sedang aktif.
+
+Menu SSH menyediakan Create, Trial, List Member/detail, Lock, dan Unlock.
+Delete, Renew, Check User Login, List User Expired, dan Limit IP masih bertanda
+**Belum tersedia**. Validasi saat ini membatasi username ke 4–32 karakter,
+password ke 1–64 karakter, durasi Create ke 3650 hari dan Trial ke 720 jam.
+Gunakan `\x` / `\z` pada prompt tersembunyi untuk password literal `x` / `z`.
+`NATHAYA_TZ` (contoh `Asia/Jakarta`) pada konfigurasi dashboard memilih zona
+waktu detail; jika tidak diatur, gunakan zona VPS.
+
+Pelanggan hanya dibuat dalam SQLite Nathaya, bukan pada akun Linux host.
+Worker Dropbear memakai namespace terpisah dengan passwd/shadow sintetis,
+password, dan local TCP forwarding (`ssh -N -L` atau `-D`). Remote forwarding
+(`-R`) dimatikan. Tidak tersedia home, kunci publik pelanggan, shell yang dapat
+dieksekusi, atau perangkat PTY. Beberapa klien mungkin menerima respons awal
+atas permintaan sesi/subsystem, tetapi tidak boleh mendapat shell, eksekusi
+perintah, atau transfer file. Verifikasi dengan paket distro dan VPS uji
+sebelum mengandalkan pembatasan ini. [Manual Dropbear](https://manpages.debian.org/trixie/dropbear-bin/dropbear.8.en.html).
+
+Lock/Unlock hanya mengubah akun Nathaya. Supervisor memeriksa akun aktif dan
+memutus worker milik akun yang dikunci atau kedaluwarsa; koneksi yang belum
+terautentikasi juga dapat diminta menyambung ulang jika snapshot akun berubah.
+Unlock tidak mengaktifkan akun expired atau masih terkunci otomatis. Limit IP
+dan batas dua sesi disimpan sebagai metadata, **belum ditegakkan**. `0` berarti
+IP unik tidak dibatasi; tahap berikutnya tetap harus membedakan IP unik dan
+sesi serta menerapkan penguncian 15 menit.
+
+Telegram menggunakan bot dan chat admin yang sama, mengirim username dan
+password ke chat tersebut setelah commit akun. Gunakan hanya chat admin yang
+dikendalikan sendiri; kredensial yang dikirim tersimpan di Telegram. Pengiriman
+yang gagal tidak membatalkan akun. Ulangi dari List Member bila diperlukan.
+
+### Backup / pemulihan SSH
+
+Direktori `/var/lib/nathaya-ssh` (root, `0700`) berisi `accounts.sqlite3`,
+`password.key` (AES-256-GCM, terpisah dari DB), dan `dropbear_ed25519_host_key`.
+Backup ketiganya bersama konfigurasi port; simpan salinan kunci secara terpisah
+dan aman. Gunakan backup SQLite yang konsisten, atau hentikan layanan **dan
+jangan jalankan operasi akun** selama backup/restore. Pulihkan ke lokasi yang
+sama dengan pemilik root dan izin file `0600`, lalu aktifkan layanan lagi.
+Tanpa `password.key` yang cocok, password lama tak dapat dibuka. Baris lama yang
+ada di penyimpanan Nathaya tanpa salinan terenkripsi tetap tampil tetapi
+password ditandai tidak tersedia. Akun Linux lama tidak dimigrasikan otomatis.
+
+### Uji modul SSH
+
+```bash
+bash -n install-dashboard.sh && bash -n deployment/ssh-installer.sh
+bash -n modules/menu/ssh.sh && bash -n modules/common/telegram.sh
+bash -n deployment/tests/ssh-menu-smoke.sh
+git diff --check
+bash deployment/tests/installer-smoke.sh
+bash deployment/tests/ssh-menu-smoke.sh
+python3 -B deployment/tests/ssh-backend-test.py  # memerlukan cryptography
+```
+
+Di Ubuntu 22.04 **disposabel**, buat akun member dan trial, lalu dari klien uji:
+
+1. Gunakan `ssh -p 109 -N -L 8088:127.0.0.1:8080 AKUN@VPS_UJI` ke server HTTP
+   uji pada VPS. Buktikan akses lewat `curl http://127.0.0.1:8088` berhasil dan
+   koneksi bertahan lebih dari 20 detik. Jangan masukkan password di argv.
+2. Pastikan `ssh -tt -p 109 AKUN@VPS_UJI`, `ssh -p 109 AKUN@VPS_UJI id`,
+   `sftp -P 109 AKUN@VPS_UJI` dan `scp -O -P 109 ...` gagal mendapatkan terminal,
+   mengeksekusi perintah, atau menyalin file. Cek bahwa autentikasi public-key
+   pelanggan dan remote forwarding tidak berfungsi.
+3. Buat tunnel dari dua akun. Lock satu akun; pastikan tunnel akun itu terputus,
+   login baru ditolak, dan akun lain tetap tersambung. Unlock dan uji lagi sebelum
+   kedaluwarsa. Verifikasi akun pelanggan ditolak di port admin, lalu uji login
+   admin yang biasa dari koneksi kedua sebelum menutup shell admin pertama.
+4. Uji Telegram gagal (chat admin uji, bukan produksi), ulangi pengiriman, dan
+   instal ulang. Bandingkan fingerprint host key serta keberadaan akun dan
+   password sebelum/sesudah. Uji konflik port 143 sebelum aktivasi jika dipilih.
+
+VMESS, VLESS, TROJAN, Bot Akses VPS, dan Set Banner masih belum tersedia.
 
 ## Pengujian installer
 
