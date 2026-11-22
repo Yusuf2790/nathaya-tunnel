@@ -125,8 +125,11 @@ layanan saat instal ulang dapat memutus tunnel pelanggan yang sedang aktif.
 Menu SSH menyediakan Create, Trial, List Member/detail, Lock, dan Unlock.
 Delete, Renew, Check User Login, List User Expired, dan Limit IP masih bertanda
 **Belum tersedia**. Validasi saat ini membatasi username ke 4–32 karakter,
-password ke 1–64 karakter, durasi Create ke 3650 hari dan Trial ke 720 jam.
-Gunakan `\x` / `\z` pada prompt tersembunyi untuk password literal `x` / `z`.
+password ke 1–64 karakter. Create menerima angka hari 1–3650 (misalnya `7`,
+bukan `7d`); Trial tetap menerima jam berakhiran `h`, misalnya `6h`, hingga 720 jam.
+Di Create, password terlihat saat diketik dan ditampilkan kembali jika mundur.
+Enter mempertahankan password sebelumnya. Gunakan `\x` / `\z` untuk password
+literal `x` / `z`.
 `NATHAYA_TZ` (contoh `Asia/Jakarta`) pada konfigurasi dashboard memilih zona
 waktu detail; jika tidak diatur, gunakan zona VPS.
 
