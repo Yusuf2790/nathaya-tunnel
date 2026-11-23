@@ -35,6 +35,25 @@ run_installer() (
     set_paths "$root"
     local_uid=$EUID
     python_bin=$python
+    check_ws_tls() {
+        [[ ! -e "$root/state/no-tls" ]] || die 'TLS belum lengkap'
+        ws_domain=tunnel.example.test
+    }
+    check_listener() {
+        [[ ! -e "$root/state/conflict-$1" ]] || die "Benturan TCP $1"
+        if [[ "${3:-0}" == 1 ]]; then
+            [[ $(cat "$root/state/$2") == active ]] || die "TCP $1 tidak aktif"
+        fi
+    }
+    verify_relay() { :; }
+    stage_ws_config() {
+        [[ ! -e "$root/state/bad-proxy-config" ]] || die 'konfigurasi HAProxy tidak valid'
+        mkdir "$stage/ws"
+        printf 'fixture\n' > "$stage/ws/domain"
+        printf 'fixture\n' > "$stage/ws/tls.pem"
+        printf '%064d\n' 1 > "$stage/ws/relay.key"
+        printf '# Managed by Nathaya Tunnel (WS frontend v1)\n' > "$stage/ws/haproxy.cfg"
+    }
     uname() { printf 'x86_64\n'; }
     dpkg() { printf 'amd64\n'; }
     missing_dependencies() {
@@ -69,6 +88,7 @@ run_installer() (
                         if [[ -f "$root/state/$unit" ]]; then cat "$root/state/$unit"; else printf 'inactive\n'; fi ;;
                     --property=UnitFileState)
                         if [[ "$unit" == "$timer" && -e "$timer_link" ]]; then printf 'enabled\n'
+                        elif [[ -e "$unit_dir/multi-user.target.wants/$unit" ]]; then printf 'enabled\n'
                         elif [[ "$unit" == "$service" && -f "$unit_dir/$unit" ]]; then printf 'static\n'
                         elif [[ -f "$unit_dir/$unit" ]]; then printf 'disabled\n'; fi ;;
                     *) return 1 ;;
@@ -81,6 +101,11 @@ run_installer() (
                 if [[ "$name" == start ]]; then
                     if [[ "$unit" == "$timer" && -e "$root/state/fail-start" ]]; then
                         rm -- "$root/state/fail-start"
+                        printf 'failed\n' > "$root/state/$unit"
+                        return 1
+                    fi
+                    if [[ -e "$root/state/fail-$unit" ]]; then
+                        rm -- "$root/state/fail-$unit"
                         printf 'failed\n' > "$root/state/$unit"
                         return 1
                     fi
@@ -122,6 +147,9 @@ run_installer "$host" > "$work/install"
 [[ -x "$host/usr/local/bin/menu" && ! -e "$host/etc/profile.d/nathaya-login.sh" &&
    -L "$host/etc/systemd/system/timers.target.wants/nathaya-traffic.timer" &&
    $(cat "$host/state/nathaya-traffic.timer") == active ]] || fail 'instalasi fresh'
+for unit in nathaya-dropbear.service nathaya-ws.service nathaya-haproxy.service; do
+    [[ $(cat "$host/state/$unit") == active ]] || fail "layanan wajib tidak aktif: $unit"
+done
 grep -Fxq 'update' "$host/state/apt" || fail 'APT update tidak dipanggil'
 grep -Fxq 'install -y --no-install-recommends curl' "$host/state/apt" || fail 'APT memasang paket yang salah'
 mkdir -p "$host"/{etc/nathaya-tunnel,var/lib/nathaya-tunnel,etc,opt/nathaya/logs}
@@ -142,6 +170,26 @@ expect_failure "$host" 'Rollback deployment selesai'
 [[ -L "$host/usr/local/bin/menu" && $(cat "$host/opt/nathaya/modules/dashboard/traffic.sh") == '# versi terpasang' &&
    $(cat "$host/state/nathaya-traffic.timer") == active ]] || fail 'rollback upgrade tidak memulihkan berkas/timer'
 for f in "${persist[@]}"; do [[ $(cat "$host/$f") == "fixture $f" ]] || fail "data berubah sesudah rollback: $f"; done
+
+# HAProxy failure during an upgrade must not restart a still-working TCP 109 service.
+: > "$host/state/actions"
+touch "$host/state/fail-nathaya-haproxy.service"
+expect_failure "$host" 'Rollback deployment selesai'
+if grep -Fxq 'stop nathaya-dropbear.service' "$host/state/actions"; then fail 'TCP 109 ikut dihentikan'; fi
+[[ $(cat "$host/state/nathaya-dropbear.service") == active && $(cat "$host/state/nathaya-haproxy.service") == active ]] ||
+    fail 'rollback frontend gagal memulihkan layanan'
+
+host=$(fixture ws-preflight)
+touch "$host/state/want-package" "$host/state/conflict-80"
+expect_failure "$host" 'Benturan TCP 80'
+rm "$host/state/conflict-80"
+touch "$host/state/no-tls"
+expect_failure "$host" 'TLS belum lengkap'
+[[ ! -e "$host/state/apt" && ! -e "$host/state/actions" ]] || fail 'preflight melakukan perubahan'
+rm "$host/state/no-tls"
+touch "$host/state/bad-proxy-config"
+expect_failure "$host" 'konfigurasi HAProxy tidak valid'
+[[ ! -e "$host/state/actions" ]] || fail 'HAProxy diaktifkan sebelum validasi'
 
 host=$(fixture invalid-unit)
 touch "$host/state/fail-verify"

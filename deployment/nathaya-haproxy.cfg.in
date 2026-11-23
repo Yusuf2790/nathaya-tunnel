@@ -1,0 +1,40 @@
+# Managed by Nathaya Tunnel (WS frontend v1)
+global
+    user haproxy
+    group haproxy
+    maxconn 512
+    ssl-default-bind-options ssl-min-ver TLSv1.2
+
+defaults
+    mode http
+    timeout connect 5s
+    timeout http-request 10s
+    timeout client 30s
+    timeout server 30s
+    timeout tunnel 1h
+
+frontend nathaya_public
+    bind [::]:80 v4v6
+    bind [::]:443 v4v6 ssl crt @CERT@ alpn http/1.1
+    acl allowed_host hdr(host) -i @DOMAIN@ @DOMAIN@:80 @DOMAIN@:443
+    acl upgrade_present hdr(Upgrade) -m found
+    acl websocket hdr(Upgrade) -i websocket
+    acl websocket_conn hdr(Connection) -m reg -i (^|,)[[:space:]]*upgrade[[:space:]]*(,|$)
+    acl ssh_path path -m str /ssh
+    acl ssh_method method GET
+    http-request deny deny_status 400 unless { hdr_cnt(host) eq 1 } allowed_host
+    http-request deny deny_status 404 if upgrade_present !ssh_path
+    http-request deny deny_status 400 if upgrade_present !websocket
+    http-request deny deny_status 400 if upgrade_present !websocket_conn
+    http-request deny deny_status 400 if upgrade_present !ssh_method
+    http-request redirect prefix https://@DOMAIN@ code 308 if !{ ssl_fc } !upgrade_present
+    http-request deny deny_status 404 unless upgrade_present
+    default_backend nathaya_gateway
+
+backend nathaya_gateway
+    http-request del-header Forwarded
+    http-request del-header X-Forwarded-For
+    http-request del-header X-Real-IP
+    http-request set-header X-Nathaya-Source-IP %[src]
+    http-request set-header X-Nathaya-Relay-Auth @TOKEN@
+    server ws_gateway 127.0.0.1:18080

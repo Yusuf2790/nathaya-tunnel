@@ -493,6 +493,46 @@ async def handle_client(client, peer, sessions, inventory):
         sessions.discard(worker)
 
 
+def relay_secret():
+    path = Path('/etc/nathaya-tunnel/managed-ws/relay.key')
+    if not path.exists() and not path.is_symlink():
+        return None
+    secret_path(path)
+    token = path.read_bytes().strip()
+    if re.fullmatch(rb'[a-f0-9]{64}', token) is None:
+        raise AccountError('Kunci relay WebSocket tidak valid.')
+    return token
+
+
+async def read_relay_peer(client, token):
+    loop = asyncio.get_running_loop()
+    line = bytearray()
+    # Use the raw socket without buffering past the metadata into SSH packets.
+    while len(line) < 128:
+        byte = await loop.sock_recv(client, 1)
+        if not byte:
+            break
+        line += byte
+        if byte == b'\n':
+            match = re.fullmatch(rb'NATHAYA1 ([a-f0-9]{64}) ([0-9A-Fa-f:.]+)\n', line)
+            if match is not None and secrets.compare_digest(match[1], token):
+                return (str(ipaddress.ip_address(match[2].decode('ascii'))), 0)
+            break
+    raise ValueError('Invalid internal relay metadata')
+
+
+async def relay_client(client, token, sessions, inventory):
+    try:
+        peer = await asyncio.wait_for(read_relay_peer(client, token), 3)
+        await asyncio.get_running_loop().sock_sendall(client, b'OK\n')
+        await handle_client(client, peer, sessions, inventory)
+    except (ValueError, OSError, asyncio.TimeoutError):
+        pass
+    finally:
+        client.close()
+        sessions.discard(asyncio.current_task())
+
+
 async def serve():
     initialize()
     secret_path(RUNTIME, True)
@@ -506,18 +546,21 @@ async def serve():
     sessions = set()
     inventory = SessionInventory()
     inventory_server = None
+    token = relay_secret()
     loop = asyncio.get_running_loop()
 
-    async def accept(listener):
+    async def accept(listener, internal=False):
         while True:
             client, peer = await loop.sock_accept(listener)
             if len(sessions) >= 128:
                 client.close()
             else:
-                sessions.add(asyncio.create_task(handle_client(client, peer, sessions, inventory)))
+                task = relay_client(client, token, sessions, inventory) if internal else handle_client(client, peer, sessions, inventory)
+                sessions.add(asyncio.create_task(task))
 
     try:
-        for port in read_ports():
+        ports = read_ports()
+        for port in ports:
             listener = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
             sockets.append(listener)
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -525,12 +568,23 @@ async def serve():
             listener.bind(('::', port))
             listener.listen(128)
             listener.setblocking(False)
+        public = [accept(s) for s in sockets]
+        if token is not None:
+            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sockets.append(listener)
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(('127.0.0.1', 18091))
+            listener.listen(128)
+            listener.setblocking(False)
+            public.append(accept(listener, internal=True))
         inventory_server = await serve_inventory(inventory)
+        if token is not None:
+            (RUNTIME / 'relay-info').write_text(json.dumps([os.getpid(), sorted(ports), hashlib.sha256(token).hexdigest()]))
         if addr := os.environ.get('NOTIFY_SOCKET'):
             with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as notifier:
                 notifier.connect('\0' + addr[1:] if addr.startswith('@') else addr)
                 notifier.sendall(b'READY=1')
-        await asyncio.gather(*(accept(s) for s in sockets))
+        await asyncio.gather(*public)
     finally:
         for listener in sockets:
             listener.close()

@@ -3,6 +3,7 @@ import asyncio
 import importlib.util
 import os
 from pathlib import Path
+import socket
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -293,6 +294,27 @@ class BackendTest(unittest.TestCase):
 
         with patch.object(backend, 'RUNTIME', runtime):
             asyncio.run(exercise())
+
+    def test_relay_header_rejects_forgery_and_preserves_ssh_bytes(self):
+        async def exercise():
+            token = b'a' * 64
+            for hello, expected in (
+                (b'NATHAYA1 ' + token + b' 2001:db8::2\n', ('2001:db8::2', 0)),
+                (b'NATHAYA1 ' + b'b' * 64 + b' 192.0.2.1\n', None),
+                (b'NATHAYA1 ' + token + b' 999.1.1.1\n', None),
+                (b'SSH-2.0-untrusted\n', None),
+            ):
+                left, right = socket.socketpair()
+                with left, right:
+                    left.setblocking(False)
+                    right.sendall(hello + b'SSH-2.0-fixture')
+                    if expected is None:
+                        with self.assertRaises(ValueError):
+                            await backend.read_relay_peer(left, token)
+                    else:
+                        self.assertEqual(await backend.read_relay_peer(left, token), expected)
+                        self.assertEqual(left.recv(99), b'SSH-2.0-fixture')
+        asyncio.run(exercise())
 
     def test_auth_log_and_ports(self):
         message = b"<85>Nov 21 00:10:11 dropbear[2]: Password auth succeeded for 'fixture1' from 127.0.0.1:1234"

@@ -4,12 +4,14 @@ source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P) || exit 1
 service=nathaya-traffic.service
 timer=nathaya-traffic.timer
 ssh_service=nathaya-dropbear.service
+ws_service=nathaya-ws.service
+proxy_service=nathaya-haproxy.service
 app_files=(
     menu.sh
     modules/common/{functions,telegram,ui}.sh
     modules/dashboard/{dashboard.sh,traffic.sh,traffic.py}
     modules/menu/{domain,main,set_domain,ssh}.sh
-    modules/ssh/backend.py
+    modules/ssh/{backend,ws_gateway}.py
 )
 deploy_files=(deployment/menu deployment/nathaya-login.sh "deployment/$service" "deployment/$timer")
 local_uid=0
@@ -24,6 +26,13 @@ set_paths() {
     timer_link="$unit_dir/timers.target.wants/$timer"
     ssh_link="$unit_dir/multi-user.target.wants/$ssh_service"
     ssh_ports_file="$base/etc/nathaya-tunnel/ssh-ports.conf"
+    ws_config="$base/etc/nathaya-tunnel/config.conf"
+    ws_managed="$base/etc/nathaya-tunnel/managed-ws"
+    ws_runtime="$base/run/nathaya-ssh"
+    ws_cert="$base/etc/nathaya-tunnel/tls/fullchain.pem"
+    ws_key="$base/etc/nathaya-tunnel/tls/privkey.pem"
+    haproxy_bin=/usr/sbin/haproxy
+    apt_policy="$base/usr/sbin/policy-rc.d"
     os_release="$base/etc/os-release"
     systemd_runtime="$base/run/systemd/system"
     lock_file="$base/run/nathaya-install.lock"
@@ -40,7 +49,8 @@ Pemakaian: bash install-dashboard.sh [--check] [--enable-login-menu] [--enable-s
                        mengunci installer, atau mengubah unit systemd.
   --enable-login-menu  Aktifkan menu otomatis pada login SSH root interaktif
                        untuk instalasi baru. Instal ulang mempertahankan pilihan lama.
-  --enable-ssh         Pasang/aktifkan Dropbear Nathaya yang terisolasi.
+  --enable-ssh         Kompatibilitas; SSH 109 dan WS/WSS 80/443 selalu dipasang.
+  Siapkan DOMAIN dan TLS penuh di /etc/nathaya-tunnel sebelum instalasi.
 USAGE
 }
 
@@ -88,7 +98,7 @@ validate_host() {
 
 validate_sources() {
     local f
-    for f in "${app_files[@]}" "${staged_deployment[@]}"; do
+    for f in "${app_files[@]}" "${staged_deployment[@]}" deployment/nathaya-haproxy.cfg.in; do
         [[ -f "$source_dir/$f" && ! -L "$source_dir/$f" && -r "$source_dir/$f" ]] ||
             die "file sumber hilang, bukan file biasa, atau tidak terbaca: $f"
     done
@@ -120,6 +130,8 @@ check_unit_conflicts() {
 
 # shellcheck source=deployment/ssh-installer.sh
 source "$source_dir/deployment/ssh-installer.sh" || exit 1
+# shellcheck source=deployment/ws-installer.sh
+source "$source_dir/deployment/ws-installer.sh" || exit 1
 
 check_conflicts() {
     local f dst existing=0 have_app_files=0
@@ -169,8 +181,12 @@ check_conflicts() {
     fi
     (( !have_app_files || existing )) || conflict "$target"
     select_ssh_module
+    select_ws_units
     check_unit_conflicts
-    if (( ssh_enabled )); then check_ssh_ports; fi
+    check_ssh_ports
+    check_ws_ports
+    check_vendor_proxy
+    check_ws_tls
 
     login_enabled=0
     if exists "$hook" || (( !existing && request_login )); then login_enabled=1; fi
@@ -181,7 +197,7 @@ check_conflicts() {
 
 missing_dependencies() {
     packages=()
-    if [[ ! -x "$python_bin" ]] || ! "$python_bin" -I -c 'import sys; sys.exit(sys.version_info < (3, 8))'; then
+    if [[ ! -x "$python_bin" ]] || ! "$python_bin" -IB -c 'import sys; sys.exit(sys.version_info < (3, 8))'; then
         packages+=(python3)
     fi
     command -v ip >/dev/null || packages+=(iproute2)
@@ -192,7 +208,8 @@ missing_dependencies() {
     command -v hostname >/dev/null || packages+=(hostname)
     command -v awk >/dev/null || packages+=(mawk)
     if ! command -v tput >/dev/null || ! command -v clear >/dev/null; then packages+=(ncurses-bin); fi
-    if (( ssh_enabled )); then ssh_dependencies; fi
+    ssh_dependencies
+    ws_dependencies
     return 0
 }
 
@@ -270,13 +287,13 @@ put_file() {
 unit_action() { systemctl --system "$@" >> "$backup/deployment.log" 2>&1; }
 
 rollback() {
-    local i dst saved unit state enabled failed=0 seen_timer=0
+    local i dst saved unit state enabled failed=0
     printf 'Deployment gagal; memulihkan file dan unit Nathaya.\n' >&2
     if (( units_touched )); then
-        # Hentikan timer dahulu agar tidak memulai kolektor selama pemulihan.
-        for unit in "$timer" "${managed_units[@]}"; do
-            if [[ "$unit" == "$timer" && ${seen_timer:-0} == 1 ]]; then continue; fi
-            if [[ "$unit" == "$timer" ]]; then seen_timer=1; fi
+        # Stop frontend before backend, and leave an untouched TCP 109 listener alone.
+        for ((i=${#managed_units[@]}-1; i>=0; i--)); do
+            unit=${managed_units[i]}
+            [[ ${runtime_touched[$unit]:-0} == 1 ]] || continue
             state=$(unit_property "$unit" ActiveState) || { failed=1; continue; }
             case "$state" in active|activating|deactivating|reloading)
                 unit_action stop "$unit" || failed=1 ;;
@@ -295,10 +312,12 @@ rollback() {
     if (( units_touched )); then
         unit_action daemon-reload || failed=1
         for unit in "${managed_units[@]}"; do
-            if [[ ${prior_active[$unit]} == active ]]; then
-                unit_action start "$unit" || failed=1
-            elif [[ $(unit_property "$unit" ActiveState) == failed ]]; then
-                unit_action reset-failed "$unit" || failed=1
+            if [[ ${runtime_touched[$unit]:-0} == 1 ]]; then
+                if [[ ${prior_active[$unit]} == active ]]; then
+                    unit_action start "$unit" || failed=1
+                elif [[ $(unit_property "$unit" ActiveState) == failed ]]; then
+                    unit_action reset-failed "$unit" || failed=1
+                fi
             fi
             state=$(unit_property "$unit" ActiveState) || failed=1
             enabled=$(unit_property "$unit" UnitFileState) || failed=1
@@ -321,6 +340,7 @@ on_exit() {
     trap '' INT TERM HUP
     set +e
     if [[ -n "$pending_temp" ]]; then rm -f -- "$pending_temp"; fi
+    finish_proxy_apt || printf 'Gagal membereskan HAProxy distro; lihat log APT.\n' >&2
     if (( rc != 0 && deployment_started )); then rollback; fi
     if [[ -n "$stage" ]]; then rm -rf -- "$stage"; fi
     if (( rc != 0 )) && [[ -n "$backup" ]]; then printf 'Log/backup: %s\n' "$backup" >&2; fi
@@ -328,7 +348,7 @@ on_exit() {
 }
 
 deploy() {
-    local f i
+    local f i unit restart_ssh=1
     local -a inputs=() outputs=()
     for f in "${app_files[@]}"; do
         inputs+=("$stage/$f"); outputs+=("$target/$f")
@@ -338,7 +358,8 @@ deploy() {
     if (( login_enabled )); then
         inputs+=("$stage/deployment/nathaya-login.sh"); outputs+=("$hook")
     fi
-    if (( ssh_enabled )); then stage_ssh_outputs; fi
+    stage_ssh_outputs
+    stage_ws_outputs
     if ! exists "$timer_link"; then
         # Symlink WantedBy=timers.target; hanya symlink ini yang diubah untuk enablement.
         ln -s -- "../$timer" "$stage/timer-link" || die 'tidak dapat menyiapkan symlink timer'
@@ -348,35 +369,51 @@ deploy() {
     snapshot_states
     for f in "${outputs[@]}"; do record_file "$f"; done
 
+    if [[ ${prior_active[$ssh_service]} == active ]] &&
+       cmp -s -- "$target/modules/ssh/backend.py" "$stage/modules/ssh/backend.py" && relay_config_is_running; then
+        restart_ssh=0
+    fi
     deployment_started=1
     units_touched=1
-    if [[ ${prior_active[$timer]} == active ]]; then
-        unit_action stop "$timer" || die "gagal menghentikan $timer sebelum deployment"
-    fi
-    if (( ssh_enabled )) && [[ ${prior_active[$ssh_service]} == active ]]; then
-        unit_action stop "$ssh_service" || die "gagal menghentikan $ssh_service sebelum deployment"
-    fi
+    for unit in "$proxy_service" "$ws_service" "$timer"; do
+        if [[ ${prior_active[$unit]} == active ]]; then
+            runtime_touched[$unit]=1
+            unit_action stop "$unit" || die "gagal menghentikan $unit sebelum deployment"
+        fi
+    done
     for i in "${!inputs[@]}"; do put_file "${inputs[i]}" "${outputs[i]}"; done
     unit_action daemon-reload || die 'systemctl daemon-reload gagal'
+    runtime_touched[$timer]=1
     unit_action start "$timer" || die "gagal memulai $timer"
     [[ $(unit_property "$timer" UnitFileState) == enabled ]] || die "$timer belum aktif saat boot (enabled)"
     [[ $(unit_property "$timer" ActiveState) == active ]] || die "$timer tidak berjalan (active)"
-    if (( ssh_enabled )); then activate_ssh_unit; fi
+    # Keep existing direct SSH running until the gateway and HAProxy are ready.
+    activate_ws_units
+    if (( restart_ssh )); then
+        runtime_touched[$ssh_service]=1
+        if [[ ${prior_active[$ssh_service]} == active ]]; then
+            unit_action stop "$ssh_service" || die "gagal menghentikan $ssh_service sebelum pembaruan"
+        fi
+    fi
+    activate_ssh_unit
+    check_ssh_ports 1
+    check_ws_ports 1
+    verify_relay
     deployment_started=0
 }
 
 main() {
-    local mode_install=install request_login=0 login_enabled=0 request_ssh=0 ssh_enabled=0 option
+    local mode_install=install request_login=0 login_enabled=0 option ws_domain= vendor_fresh=0
     local -a packages=() managed_units=() staged_deployment=()
     local backup= stage= pending_temp= backup_count=0 deployment_started=0 units_touched=0 lock_fd
     local -a touched=() created_dirs=()
-    local -A originals=() prior_active=() prior_enabled=()
+    local -A originals=() prior_active=() prior_enabled=() runtime_touched=()
     for option in "$@"; do
         case "$option" in
             --help|-h) usage; return 0 ;;
             --check) mode_install=check ;;
             --enable-login-menu) request_login=1 ;;
-            --enable-ssh) request_ssh=1 ;;
+            --enable-ssh) : ;;  # Compatibility only; all SSH routes are mandatory.
             *) die "opsi tidak dikenal: $option (lihat --help)" ;;
         esac
     done
@@ -387,7 +424,7 @@ main() {
     if [[ "$mode_install" == check ]]; then
         printf 'Preflight OK. Dependensi yang perlu dipasang: %s. Login otomatis: %s.\n' \
             "${packages[*]:-tidak ada}" "$login_enabled"
-        printf 'Modul Dropbear: %s (1=aktif saat instalasi).\n' "$ssh_enabled"
+        printf 'Target: SSH 109, WS 80 dan WSS 443 (%s/ssh).\n' "$ws_domain"
         if (( EUID != local_uid )); then printf 'Instalasi tetap harus dijalankan sebagai root.\n'; fi
         return 0
     fi
@@ -408,18 +445,21 @@ main() {
     missing_dependencies
     if (( ${#packages[@]} )); then
         printf 'Memasang dependensi: %s\n' "${packages[*]}"
+        prepare_proxy_apt
         apt-get update > "$backup/apt.log" 2>&1 || die "APT update gagal; lihat $backup/apt.log"
         DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${packages[@]}" \
             >> "$backup/apt.log" 2>&1 || die "APT install gagal; lihat $backup/apt.log"
+        finish_proxy_apt || die "gagal menonaktifkan unit HAProxy distro; lihat $backup/apt.log"
         missing_dependencies
         (( ${#packages[@]} == 0 )) || die "dependensi masih belum tersedia setelah APT: ${packages[*]}"
     fi
     stage_files
     check_conflicts
+    stage_ws_config
     deploy
     printf 'Dashboard terpasang: %s. Jalankan menu.\n' "$target"
     printf 'Timer %s: enabled, active. Login otomatis: %s.\n' "$timer" "$login_enabled"
-    if (( ssh_enabled )); then printf 'Dropbear Nathaya: enabled, active.\n'; fi
+    printf 'Dropbear TCP 109, WS TCP 80, WSS TCP 443: enabled, active (%s/ssh).\n' "$ws_domain"
     printf 'Log/backup (akses root): %s\n' "$backup"
     exit 0  # Jalankan EXIT trap selagi variabel transaksi masih dalam lingkup main.
 }

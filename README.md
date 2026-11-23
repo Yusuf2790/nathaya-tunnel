@@ -77,7 +77,7 @@ dan [systemd-analyze verify](https://www.freedesktop.org/software/systemd/man/la
 
 ## Konfigurasi dashboard
 
-Konfigurasi opsional. Jika perlu, buat `/etc/nathaya-tunnel` sebagai root dan
+Footer dan Telegram opsional. Buat `/etc/nathaya-tunnel` sebagai root dan
 simpan `/etc/nathaya-tunnel/config.conf` dengan izin `0600`, milik root. Dashboard
 membaca file ini sebagai skrip Bash, jadi jangan gunakan file dari sumber yang
 tidak tepercaya. Contoh konfigurasi:
@@ -102,25 +102,49 @@ Interface dipilih dari default route IPv4, dengan IPv6 sebagai cadangan.
 Untuk memilih interface sendiri, tulis namanya pada satu baris di
 `/etc/nathaya-tunnel/traffic-interface`.
 
-## Modul SSH tahap pertama (opsional)
+## SSH, WebSocket, dan TLS
 
-Aktifkan hanya pada **VPS uji** sampai uji koneksi nyata di bawah lulus:
+Instalasi standar memasang dan mengaktifkan `nathaya-dropbear.service`,
+`nathaya-ws.service` (aiohttp), dan `nathaya-haproxy.service`. Tidak perlu flag.
+`--enable-ssh` masih diterima untuk kompatibilitas dan tidak mengubah hasil.
 
-```bash
-sudo bash install-dashboard.sh --check --enable-ssh
-sudo bash install-dashboard.sh --enable-ssh
-systemctl status nathaya-dropbear.service
-ss -ltnp
-```
+| Jalur NetMod | Port | Pengaturan |
+|---|---:|---|
+| SSH langsung | 109 | Host domain VPS, SSH tanpa WS |
+| WS (NoSSL) | 80 | WebSocket standar, host domain VPS, path `/ssh`, TLS mati |
+| WSS | 443 | WebSocket standar, host/SNI domain VPS, path `/ssh`, TLS dan verifikasi sertifikat aktif |
 
-Installer memasang `dropbear-bin` (bukan layanan Dropbear bawaan distro),
-Bubblewrap, OpenSSL, dan Python Cryptography jika diperlukan. Unit khusus
-`nathaya-dropbear.service` memakai TCP 109. Untuk menambah TCP 143, buat
-`/etc/nathaya-tunnel/ssh-ports.conf` milik root dengan isi `109 143`, lalu
-jalankan preflight dan installer lagi. Installer menolak listener asing pada
-port yang dipilih; tidak mengubah firewall, port, atau konfigurasi SSH admin.
-Instal ulang mempertahankan modul yang terpasang, akun, dan host key. Restart
-layanan saat instal ulang dapat memutus tunnel pelanggan yang sedang aktif.
+Gunakan akun Nathaya yang sama di ketiga jalur. Port tambahan SSH langsung 143
+tetap bisa dipilih melalui `/etc/nathaya-tunnel/ssh-ports.conf` berisi `109 143`.
+HTTP biasa di port 80 untuk domain yang valid diarahkan ke HTTPS. Host lain
+atau WebSocket dengan endpoint salah ditolak.
+
+### Siapkan domain dan sertifikat sebelum instalasi
+
+1. Atur DNS domain ke VPS dan isi `DOMAIN="tunnel.example.com"` di
+   `/etc/nathaya-tunnel/config.conf`, milik root. Pertahankan pengaturan lain.
+2. Sediakan fullchain PEM dan private key PEM tanpa passphrase yang sesuai di
+   `/etc/nathaya-tunnel/tls/fullchain.pem` dan `/etc/nathaya-tunnel/tls/privkey.pem`.
+   File harus milik root; private key harus berizin `0600` atau `0400`.
+   Symlink boleh dipakai jika tujuan dan direktori aman. Klien harus mempercayai CA.
+3. Jalankan `sudo bash install-dashboard.sh --check`, lalu
+   `sudo bash install-dashboard.sh` jika preflight lulus. Port 80, 443, 109,
+   dan listener loopback 18080/18091 tidak boleh berbenturan. Installer tidak
+   mengambil alih `haproxy.service` distro yang aktif/enabled. Saat memasang
+   paket HAProxy baru, unit distro dicegah berjalan otomatis.
+
+Installer tidak membuka firewall atau mengubah SSH admin. Izinkan port publik
+sesuai kebijakan VPS; **jangan** membuka 18080/18091. HAProxy mengambil IP peer
+TCP dan menimpa header relay. Gateway dan supervisor memvalidasi metadata
+melalui loopback dengan kunci internal; ketiga jalur memakai inventaris sama.
+
+Setelah memperbarui sertifikat atau DOMAIN, jalankan installer lagi. ACME
+otomatis belum tersedia. Instal ulang mempertahankan akun, host key, dan kunci
+relay. Gateway dan HAProxy dinyalakan sebelum supervisor SSH disentuh. Jika
+supervisor dan konfigurasi relainya tidak berubah, TCP 109 tidak di-restart.
+Cutover supervisor yang diperlukan dapat memutus tunnel lama. Rollback
+memulihkan file dan listener, bukan sesi yang terputus.
+Rujukan konfigurasi: [HAProxy 2.4](https://docs.haproxy.org/2.4/configuration.html).
 
 Menu SSH menyediakan Create, Delete, Renew, Trial, Check User Login, List
 Member/detail, List User Expired, Lock, dan Unlock. Limit IP masih bertanda
@@ -202,7 +226,8 @@ menghapus sesi lama dan memutus tunnel yang sedang berjalan; lakukan restart
 pada VPS uji untuk memuat versi supervisor ini. Tidak ada penegakan Limit IP
 atau batas sesi dari layar ini.
 
-Di VPS uji, hubungkan NetMod **langsung ke TCP 109** dengan akun Nathaya:
+Di VPS uji, hubungkan NetMod dengan akun Nathaya lewat **109**, **WS 80**, dan
+**WSS 443** sesuai tabel di atas. Bandingkan IP Wi-Fi dan data seluler:
 
 1. Coba sebelum autentikasi dan dengan password salah. Muat ulang daftar:
    kedua percobaan itu tidak boleh terlihat. Setelah autentikasi berhasil,
@@ -232,11 +257,13 @@ password ditandai tidak tersedia. Akun Linux lama tidak dimigrasikan otomatis.
 
 ```bash
 bash -n install-dashboard.sh && bash -n deployment/ssh-installer.sh
+bash -n deployment/ws-installer.sh && bash -n deployment/tests/installer-smoke.sh
 bash -n modules/menu/ssh.sh && bash -n modules/common/telegram.sh
 bash -n deployment/tests/ssh-menu-smoke.sh
 git diff --check
 bash deployment/tests/installer-smoke.sh
 bash deployment/tests/ssh-menu-smoke.sh
+python3 -B deployment/tests/ws-proxy-test.py  # haproxy, openssl, aiohttp; port lokal sementara
 python3 -B deployment/tests/ssh-menu-pty-test.py  # memerlukan PTY
 python3 -B deployment/tests/ssh-backend-test.py  # memerlukan cryptography
 ```
