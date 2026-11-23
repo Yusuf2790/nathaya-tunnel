@@ -9,159 +9,160 @@ source "$NATHAYA_BASE/modules/menu/ssh.sh"
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 
+get_width() { printf '%s\n' "${test_width:-50}"; }
 ssh_backend() {
     case "$1" in
         available) [[ "$2" != taken ]] ;;
-        list) printf '%s\n' member01 0001 1234 member02 ;;
+        table)
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                member01 member 1 4102444800 0 2 0 0 \
+                0001 trial 1 4102444800 1 2 1 0 \
+                1234 member 1 4102444800 2 2 0 0 \
+                member02 member 1 4102444800 3 2 1 0 \
+                expired1 member 1 2 0 2 1 0 \
+                autolock member 1 4102444800 0 2 1 4102444800 ;;
         detail)
-            case "$2" in member01|0001|1234|member02) printf '%s\n' "$2" ;; *) return 1 ;; esac ;;
-        lock|unlock) printf '%s:%s\n' "$1" "$2" >> "$work/actions" ;;
+            case "$2" in
+                member01|1234) printf '%s\n' "$2" member 1 4102444800 0 2 0 0 ;;
+                0001|member02) printf '%s\n' "$2" member 1 4102444800 1 2 1 0 ;;
+                *) return 1 ;;
+            esac ;;
         create)
             local pw
-            read -r pw
-            printf '%s:%s:%s:%s\n' "$2" "$pw" "$3" "$4" > "$work/account"
+            IFS= read -r pw
+            printf '%s:%s:%s:%s\n' "$2" "$pw" "$3" "$4" >> "$work/created"
             printf '%s\n' "$2" ;;
-        trial) printf '%s:%s\n' "$2" "$3" > "$work/trial"; printf 'trial-fixture\n' ;;
+        trial)
+            printf '%s:%s\n' "$2" "$3" >> "$work/trials"
+            printf 'trial-fixture\n' ;;
+        lock|unlock) printf '%s:%s\n' "$1" "$2" >> "$work/actions" ;;
     esac
 }
 ssh_result() { printf '%s\n' "$2"; }
 ssh_member_detail() { printf 'Detail fixture: %s\n' "$1"; }
 
-assert_block() {
-    local file="$1" block ending=""
-    if [[ $# == 2 ]]; then ending=$'\n\n'; fi
-    block=$(cat)
-    if [[ $(cat "$file") != *"$block$ending"* ]]; then
-        printf 'Blok tata letak tidak ditemukan di %s\n' "$file" >&2
-        exit 1
-    fi
-}
-
-[[ $(ssh_decode_password '\x') == x && $(ssh_decode_password '\z') == z ]]
 [[ $(ssh_limit_value 09) == 9 && $(ssh_limit_value 0) == 0 ]]
-if ssh_limit_value 100 || ssh_duration_value 0 '' 3650 || ssh_duration_value 3651 '' 3650 ||
-   ssh_duration_value 7d '' 3650 || ssh_duration_value 999999999999999 '' 3650 ||
-   ssh_duration_value 6 h 720; then
-    printf 'Input tidak valid diterima.\n' >&2
-    exit 1
-fi
-[[ $(ssh_duration_value 30 '' 3650) == 30 && $(ssh_duration_value 6h h 720) == 6 ]]
-[[ $(ssh_row 'Host server' test) == '  Host server   : test' ]]
+[[ $(ssh_duration_value 30 '' 3650) == 30 && $(ssh_duration_value 3650 '' 3650) == 3650 ]]
+[[ $(ssh_trial_duration 30m) == 30m && $(ssh_trial_duration 1h) == 1h ]]
+[[ $(ssh_duration_label trial 1800) == '30 menit' && $(ssh_duration_label trial 3600) == '1 jam' ]]
+for bad in 0m 0h -1m 30 43201m 721h; do
+    if ssh_trial_duration "$bad"; then printf 'Durasi tidak valid diterima: %s\n' "$bad" >&2; exit 1; fi
+done
 
-# Kembali dari Limit IP ke password, lalu Enter mempertahankan nilai yang terlihat.
-ssh_create_wizard member > "$work/screen" <<'INPUT'
+# 30d ditolak. x bukan navigasi saat menjadi password. n mempertahankan isian.
+ssh_create_wizard member > "$work/create-screen" <<'INPUT'
 BAD
 member01
-\x
-z
-
+x
 0
-7d
-7
+30d
+30
+n
+
+
+
+
+
+x
 y
 INPUT
-[[ $(cat "$work/account") == 'member01:x:0:7' ]]
-grep -Fq 'Username tidak valid' "$work/screen"
-grep -Fq '✓ SSH ACCOUNT CREATED' "$work/screen"
-grep -Eq 'Password lama +: x$' "$work/screen"
-grep -Fq 'Masukkan angka 1–3650 tanpa akhiran.' "$work/screen"
-if grep -Fq $'\033' "$work/screen"; then
-    printf 'Escape sequence ditemukan pada input noninteraktif.\n' >&2
+[[ $(cat "$work/created") == 'member01:x:0:30' ]]
+grep -Fq 'Username tidak valid.' "$work/create-screen"
+grep -Fq 'Masukkan angka 1–3650 tanpa akhiran, misalnya 30.' "$work/create-screen"
+grep -Eq 'Password +: \[x\]' "$work/create-screen"
+grep -Fq 'CONFIRM CREATE' "$work/create-screen"
+grep -Fq 'Buat akun ini? [y/n]' "$work/create-screen"
+if grep -Eq '\[[zx]\].*(Kembali|Keluar)' "$work/create-screen"; then
+    printf 'Formulir masih menampilkan navigasi z/x.\n' >&2
     exit 1
 fi
-awk '/┤ Create ├/ { seen=1; if ((getline) <= 0 || length($0)) bad=1 } END { exit (!seen || bad) }' "$work/screen"
-for prompt in Username Password 'Limit IP' 'Masa aktif dalam hari'; do
-    assert_block "$work/screen" blank <<BLOCK
-  $prompt:
+awk '/┤ (CREATE SSH ACCOUNT|CONFIRM CREATE) ├/ { seen=1; if ((getline) <= 0 || length($0)) bad=1 }
+     /^  (Username|Password|Limit IP|Masa aktif)( |\()/ && index($0, ":") { if (index($0, ":") != 21) bad=1 }
+     END { exit (!seen || bad) }' "$work/create-screen"
 
-  [z]   Kembali
-  [x]   Keluar
-BLOCK
-done
-assert_block "$work/screen" blank <<'BLOCK'
-  Username      : member01
-
-  Limit IP      : Unlimited
-
-  Masa aktif    : 7 hari
-
-  Konfirmasi:
-
-  [y]   Buat akun
-  [z]   Kembali
-  [x]   Keluar
-BLOCK
-rm -- "$work/account"
-
-rc=0
-ssh_create_wizard member > "$work/cancel" <<'INPUT' || rc=$?
-member01
-\z
+ssh_create_wizard member > "$work/create-z" <<'INPUT'
+member02
+z
 2
-3
-x
+30
+y
 INPUT
-[[ $rc == 10 && ! -e "$work/account" ]]
+[[ $(tail -n 1 "$work/created") == 'member02:z:2:30' ]]
 ssh_create_wizard trial > "$work/trial-screen" <<'INPUT'
 2
-6h
+0m
+-1h
+30
+30m
+y
 INPUT
-[[ $(cat "$work/trial") == '2:6' ]]
-grep -Fq '✓ SSH TRIAL CREATED' "$work/trial-screen"
+ssh_create_wizard trial > "$work/trial-hour" <<'INPUT'
+0
+1h
+y
+INPUT
+[[ $(cat "$work/trials") == $'2:30m\n0:1h' ]]
+grep -Fq 'CONFIRM TRIAL' "$work/trial-screen"
+grep -Fq '30m = 30 menit; 1h = 1 jam.' "$work/trial-screen"
+grep -Eq 'Masa aktif +: 30 menit$' "$work/trial-screen"
+grep -Eq 'Masa aktif +: 1 jam$' "$work/trial-hour"
 
-# Nomor diprioritaskan untuk 0001; @ memilih nama numerik persis.
-ssh_account_menu lock Lock > "$work/lock-screen" <<'INPUT'
+ssh_account_menu lock 'Lock SSH' > "$work/lock-screen" <<'INPUT'
 999999999999999999999999999
+0001
+n
 0001
 y
 z
 INPUT
 [[ $(cat "$work/actions") == 'lock:member01' ]]
 grep -Fq 'Nomor atau username tidak ditemukan.' "$work/lock-screen"
-grep -Fq 'Gunakan @1234' "$work/lock-screen"
-assert_block "$work/lock-screen" <<'BLOCK'
-  [1]   member01
-  [2]   0001
-  [3]   1234
-  [4]   member02
-
-  [z]   Kembali
-  [x]   Keluar
-BLOCK
-awk '/┤ Lock ├/ { seen=1; if ((getline) <= 0 || length($0)) bad=1 } END { exit (!seen || bad) }' "$work/lock-screen"
-assert_block "$work/lock-screen" <<'BLOCK'
-  Username      : member01
-  [y]   Konfirmasi
-BLOCK
-ssh_account_menu unlock Unlock > "$work/unlock-screen" <<'INPUT'
+grep -Fq 'CONFIRM LOCK' "$work/lock-screen"
+grep -Eq 'Username +: member01$' "$work/lock-screen"
+ssh_account_menu unlock 'Unlock SSH' > "$work/unlock-screen" <<'INPUT'
 @0001
 y
 z
 INPUT
-ssh_account_menu unlock Unlock > "$work/unlock-name" <<'INPUT'
+ssh_account_menu unlock 'Unlock SSH' > "$work/unlock-name" <<'INPUT'
 member02
 y
 z
 INPUT
-ssh_account_menu unlock Unlock > "$work/unlock-number" <<'INPUT'
-3
+ssh_account_menu unlock 'Unlock SSH' > "$work/unlock-number" <<'INPUT'
+2
 y
 z
 INPUT
-[[ $(cat "$work/actions") == $'lock:member01\nunlock:0001\nunlock:member02\nunlock:1234' ]]
-assert_block "$work/unlock-screen" <<'BLOCK'
-  Username      : 0001
-  [y]   Konfirmasi
-BLOCK
-ssh_account_menu list 'List Member' > "$work/members-screen" <<'INPUT'
-2
+[[ $(cat "$work/actions") == $'lock:member01\nunlock:0001\nunlock:member02\nunlock:member02' ]]
+grep -Fq 'CONFIRM UNLOCK' "$work/unlock-screen"
+grep -Eq 'Username +: 0001$' "$work/unlock-screen"
+if grep -Eq 'expired1|autolock' "$work/unlock-screen"; then
+    printf 'Unlock mencantumkan akun yang tidak memenuhi syarat.\n' >&2
+    exit 1
+fi
+ssh_account_menu list 'List Member' > "$work/members" <<'INPUT'
+@0001
 z
 INPUT
-grep -Fq '[2]   0001' "$work/members-screen"
-grep -Fq 'Detail fixture: 0001' "$work/members-screen"
+grep -Fq 'Detail fixture: 0001' "$work/members"
+grep -Eq 'Total Member +: 6$' "$work/members"
+grep -Eq 'Aktif +: 2$' "$work/members"
+grep -Eq 'Locked +: 3$' "$work/members"
+grep -Eq 'Expired +: 1$' "$work/members"
+rc=0
+test_width=32 ssh_account_menu list 'List Member' > "$work/narrow" <<'INPUT' || rc=$?
+x
+INPUT
+[[ $rc == 10 ]]
+grep -Fq 'Expired  | Limit IP | Status' "$work/narrow"
+grep -Fq 'z. Kembali ke menu SSH' "$work/narrow"
+grep -Fq 'x. Keluar' "$work/narrow"
+grep -Fq 'Pilihan:' "$work/narrow"
+if grep -Eq '(^|[[:space:]])Type([[:space:]:]|$)' "$work/members"; then exit 1; fi
 
 ssh_width=48
 ssh_detail_lines() { ssh_row Username 'fixture'; }
 telegram_send_message() { return 7; }
 [[ $(ssh_send_account fixture x 'Fixture') == *'kirim ulang dari List Member'* ]]
-printf 'OK: Create/Trial, tata letak, z/x, pilihan akun, dan kegagalan Telegram (mock).\n'
+printf 'OK: Create/Trial, tabel, konfirmasi y/n, pilihan akun, dan Telegram (mock).\n'

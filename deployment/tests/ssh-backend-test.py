@@ -54,6 +54,20 @@ class BackendTest(unittest.TestCase):
         with self.assertRaises(backend.AccountError):
             backend.change_lock(a, False)
 
+    def test_trial_duration_units_and_legacy_hours(self):
+        with patch.object(backend.time, 'time', return_value=1800000000):
+            for value, seconds in (('30m', 1800), ('1h', 3600), ('2', 7200)):
+                ip_limit, duration, unit = backend.trial_duration_args('0', value)
+                name = backend.create('trial', '', '', ip_limit, duration, trial_unit=unit)
+                with backend.database() as db:
+                    row = backend.account_row(db, name)
+                    self.assertEqual(row['created'], 1800000000)
+                    self.assertEqual(row['expires'], row['created'] + seconds)
+            for value in ('0m', '0h', '-1m', '43201m', '721h'):
+                with self.assertRaises(backend.AccountError):
+                    ip_limit, duration, unit = backend.trial_duration_args('0', value)
+                    backend.create('trial', '', '', ip_limit, duration, trial_unit=unit)
+
     def test_collision_and_failure(self):
         backend.create('member', 'fixture1', 'x', 1, 7)
         with self.assertRaises(backend.AccountError):

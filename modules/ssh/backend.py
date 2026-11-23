@@ -118,10 +118,17 @@ def generated(size):
     return ''.join(secrets.choice(ALPHABET) for _ in range(size))
 
 
-def create(kind, username, password, ip_limit, duration):
+def create(kind, username, password, ip_limit, duration, *, trial_unit='h'):
     if not 0 <= ip_limit <= 99:
         raise AccountError('Limit IP harus 0–99.')
-    if kind not in ('member', 'trial') or not 1 <= duration <= (3650 if kind == 'member' else 720):
+    units = {'h': (720, 3600), 'm': (43200, 60)}
+    if kind == 'member':
+        maximum, seconds = 3650, 86400
+    elif kind == 'trial' and trial_unit in units:
+        maximum, seconds = units[trial_unit]
+    else:
+        raise AccountError('Jenis akun atau satuan masa aktif tidak valid.')
+    if not 1 <= duration <= maximum:
         raise AccountError('Masa aktif di luar rentang.')
     with database() as db:
         db.execute('BEGIN IMMEDIATE')
@@ -146,7 +153,7 @@ def create(kind, username, password, ip_limit, duration):
         nonce = os.urandom(12)
         sealed = nonce + cipher().encrypt(nonce, password.encode('ascii'), username.encode('ascii'))
         created = int(time.time())
-        expires = created + duration * (86400 if kind == 'member' else 3600)
+        expires = created + duration * seconds
         db.execute('INSERT INTO accounts VALUES (?, ?, ?, ?, ?, 2, 0, 0, ?, ?)',
                    (username, kind, created, expires, ip_limit, verifier, sealed))
     return username
@@ -330,9 +337,17 @@ async def serve():
             listener.close()
 
 
+def trial_duration_args(ip_limit, duration):
+    match = re.fullmatch(r'([0-9]{1,5})([mh]?)', duration)
+    if not match:
+        raise AccountError('Gunakan menit (m) atau jam (h) untuk Trial.')
+    # The original CLI accepted bare integers as hours; keep those callers working.
+    return int(ip_limit), int(match[1]), match[2] or 'h'
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('operation', choices=('serve', 'available', 'create', 'trial', 'list', 'detail', 'password', 'lock', 'unlock', 'ports'))
+    parser.add_argument('operation', choices=('serve', 'available', 'create', 'trial', 'list', 'table', 'detail', 'password', 'lock', 'unlock', 'ports'))
     parser.add_argument('values', nargs='*')
     args = parser.parse_args()
     operation, values = args.operation, args.values
@@ -347,7 +362,8 @@ def main():
         username, ip_limit, duration = values
         print(create('member', username, sys.stdin.readline(66).rstrip('\n'), int(ip_limit), int(duration)))
     elif operation == 'trial' and len(values) == 2:
-        print(create('trial', '', '', *map(int, values)))
+        ip_limit, quantity, unit = trial_duration_args(*values)
+        print(create('trial', '', '', ip_limit, quantity, trial_unit=unit))
     elif operation in ('lock', 'unlock') and len(values) == 1:
         change_lock(values[0], operation == 'lock')
     else:
@@ -355,6 +371,10 @@ def main():
             if operation == 'list' and not values:
                 for row in db.execute(f'SELECT {PUBLIC} FROM accounts ORDER BY username'):
                     print(row['username'])
+            elif operation == 'table' and not values:
+                # Public data only; no verifier, password, or per-account subprocess.
+                for row in db.execute(f'SELECT {PUBLIC} FROM accounts ORDER BY username'):
+                    print('\t'.join(str(value) for value in row))
             elif operation == 'available' and len(values) == 1:
                 if not name_free(db, values[0]):
                     raise AccountError('Username sudah dipakai; pilih nama lain.')

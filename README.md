@@ -125,11 +125,16 @@ layanan saat instal ulang dapat memutus tunnel pelanggan yang sedang aktif.
 Menu SSH menyediakan Create, Trial, List Member/detail, Lock, dan Unlock.
 Delete, Renew, Check User Login, List User Expired, dan Limit IP masih bertanda
 **Belum tersedia**. Validasi saat ini membatasi username ke 4–32 karakter,
-password ke 1–64 karakter. Create menerima angka hari 1–3650 (misalnya `7`,
-bukan `7d`); Trial tetap menerima jam berakhiran `h`, misalnya `6h`, hingga 720 jam.
-Di Create, password terlihat saat diketik dan ditampilkan kembali jika mundur.
-Enter mempertahankan password sebelumnya. Gunakan `\x` / `\z` untuk password
-literal `x` / `z`.
+password ke 1–64 karakter. Create menerima angka hari 1–3650 (contoh `30`,
+bukan `30d`). Trial menerima menit berakhiran `m` atau jam berakhiran `h`,
+misalnya `30m` atau `1h`, hingga 720 jam (43.200 menit). Pemanggilan backend
+lama dengan angka tanpa satuan tetap dihitung dalam jam.
+
+Password Create terlihat saat diketik; `x` dan `z` dapat dimasukkan langsung.
+Di formulir dan konfirmasi, Ctrl+C membatalkan dan kembali ke menu SSH. Pada
+konfirmasi, `n` kembali ke formulir atau daftar dan hanya `y` menjalankan aksi.
+Pada daftar, `z` kembali ke menu SSH dan `x` keluar. Pilih akun dengan nomor
+atau username; `@1234` memilih username numerik tanpa memakai nomor baris.
 `NATHAYA_TZ` (contoh `Asia/Jakarta`) pada konfigurasi dashboard memilih zona
 waktu detail; jika tidak diatur, gunakan zona VPS.
 
@@ -176,6 +181,7 @@ bash -n deployment/tests/ssh-menu-smoke.sh
 git diff --check
 bash deployment/tests/installer-smoke.sh
 bash deployment/tests/ssh-menu-smoke.sh
+python3 -B deployment/tests/ssh-menu-pty-test.py  # memerlukan PTY
 python3 -B deployment/tests/ssh-backend-test.py  # memerlukan cryptography
 ```
 

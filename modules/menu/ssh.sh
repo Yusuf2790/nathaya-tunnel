@@ -7,10 +7,11 @@ ssh_page() {
     clear_screen
     ssh_width=$(get_width)
     draw_nathaya_header "$ssh_width"
-    draw_section_title "$1" "$ssh_width"
+    draw_section_title "$1" "$ssh_width" "${2:-$CYAN}"
+    printf '\n'
 }
 
-ssh_row() { printf '  %-13s : %s\n' "$1" "$2"; }
+ssh_row() { printf '  %-17s : %s\n' "$1" "$2"; }
 ssh_rule() { printf '  '; repeat_char '═' "$((ssh_width - 2))"; printf '\n'; }
 ssh_backend() { /usr/bin/python3 -I "$NATHAYA_BASE/modules/ssh/backend.py" "$@"; }
 ssh_ready() { systemctl is-active --quiet nathaya-dropbear.service; }
@@ -28,28 +29,46 @@ ssh_read() {
     return 0
 }
 
-ssh_create_read() {
-    local label="$1" confirmation="${2:-0}" rows=5 rc=0 move_cursor=0
-    printf '  %s:\n\n' "$label"
-    if (( confirmation )); then
-        draw_menu_item y 'Buat akun'
-        rows=$((rows + 1))
+# Only the form/confirmation owns SIGINT. Do not run this function in a subshell.
+ssh_cancel_scope() {
+    local saved_int ssh_interrupted=0 rc=0
+    saved_int=$(trap -p INT)
+    trap 'ssh_interrupted=1' INT
+    "$@" || rc=$?
+    if [[ -n "$saved_int" ]]; then eval "$saved_int"; else trap - INT; fi
+    if (( ssh_interrupted )); then return 2; fi
+    return "$rc"
+}
+
+ssh_prompt() {
+    local prompt="$1" rc=0
+    if (( ${ssh_interrupted:-0} )); then return 2; fi
+    if [[ -t 0 ]]; then
+        IFS= read -r -p "$prompt" ssh_input || rc=$?
+    else
+        printf '%s' "$prompt"
+        IFS= read -r ssh_input || rc=$?
+        printf '\n'
     fi
-    draw_submenu_navigation
-    printf '\n'
-    if [[ -t 0 && -t 1 && ${TERM:-dumb} != dumb ]]; then
-        # Simpan posisi di bawah pilihan, lalu pindah ke akhir prompt.
-        printf '\0337\033[%dA\r\033[%dC' "$rows" "$((${#label} + 4))"
-        move_cursor=1
-    fi
-    IFS= read -r ssh_input || rc=$?
-    if (( move_cursor )); then printf '\0338'; fi
+    if (( ${ssh_interrupted:-0} )); then return 2; fi
     if (( rc )); then return "$DASHBOARD_EXIT"; fi
-    case "${ssh_input,,}" in
-        z) return 1 ;;
-        x) return "$DASHBOARD_EXIT" ;;
-    esac
     return 0
+}
+
+ssh_confirm() {
+    local action="$1" question="$2"
+    shift 2
+    ssh_page "CONFIRM $action" "$ORANGE"
+    while (( $# )); do ssh_row "$1" "$2"; shift 2; done
+    printf '\n'
+    while true; do
+        ssh_prompt "  $question [y/n] " || return $?
+        case "${ssh_input,,}" in
+            y) return 0 ;;
+            n) return 1 ;;
+            *) printf '  Masukkan y atau n.\n' ;;
+        esac
+    done
 }
 
 ssh_limit_value() {
@@ -60,7 +79,7 @@ ssh_limit_value() {
 
 ssh_duration_value() {
     local LC_ALL=C suffix="$2" maximum="$3"
-    [[ "$1" =~ ^([0-9]{1,4})$suffix$ ]] || return 1
+    [[ "$1" =~ ^([0-9]{1,5})$suffix$ ]] || return 1
     local n=$((10#${BASH_REMATCH[1]}))
     (( n > 0 && n <= maximum )) || return 1
     printf '%s\n' "$n"
@@ -73,13 +92,38 @@ ssh_decode_password() {
     printf '%s' "$value"
 }
 
+ssh_trial_duration() {
+    local unit="${1: -1}" maximum
+    case "$unit" in m) maximum=43200 ;; h) maximum=720 ;; *) return 1 ;; esac
+    local quantity
+    quantity=$(ssh_duration_value "$1" "$unit" "$maximum") || return 1
+    printf '%s%s\n' "$quantity" "$unit"
+}
+
+ssh_duration_label() {
+    local kind="$1" seconds="$2"
+    if [[ "$kind" != trial ]]; then printf '%s hari\n' "$(( seconds / 86400 ))"
+    elif (( seconds % 3600 == 0 )); then printf '%s jam\n' "$(( seconds / 3600 ))"
+    else printf '%s menit\n' "$(( seconds / 60 ))"; fi
+}
+
 ssh_expiry() {
-    local zone=${NATHAYA_TZ:-}
+    local zone=${NATHAYA_TZ:-} format="${2:-%d %b %Y, %H.%M %Z}"
     if [[ -n "$zone" && "$zone" != /* && "$zone" != *..* && -f "/usr/share/zoneinfo/$zone" ]]; then
-        TZ="$zone" LC_ALL=C date -d "@$1" '+%d %b %Y, %H.%M %Z'
+        TZ="$zone" LC_ALL=C date -d "@$1" "+$format"
     else
-        LC_ALL=C date -d "@$1" '+%d %b %Y, %H.%M %Z'
+        LC_ALL=C date -d "@$1" "+$format"
     fi
+}
+
+ssh_limit_label() {
+    if [[ "$1" == 0 ]]; then printf 'Unlimited\n'; else printf '%s IP\n' "$1"; fi
+}
+
+ssh_account_status() {
+    if (( $1 <= $4 )); then printf 'Expired\n'
+    elif (( $2 || $3 > $4 )); then printf 'Locked\n'
+    else printf 'Aktif\n'; fi
 }
 
 ssh_detail_lines() {
@@ -109,23 +153,13 @@ ssh_detail_lines() {
         done
     fi
     ssh_rule
-    value='Unlimited'
-    if [[ ${account[4]} != 0 ]]; then value="${account[4]} IP"; fi
-    ssh_row 'Limit IP' "$value"
+    ssh_row 'Limit IP' "$(ssh_limit_label "${account[4]}")"
     ssh_row 'Batas sesi' "${account[5]} koneksi aktif"
-    if [[ ${account[1]} == trial ]]; then
-        label="$(( (account[3] - account[2]) / 3600 )) jam"
-    else
-        label="$(( (account[3] - account[2]) / 86400 )) hari"
-    fi
+    label=$(ssh_duration_label "${account[1]}" "$(( account[3] - account[2] ))")
     ssh_row 'Masa aktif' "$label"
     value=$(ssh_expiry "${account[3]}") || value='—'
     ssh_row Kedaluwarsa "$value"
-    value='Aktif'
-    if (( account[3] <= $(date +%s) )); then value='Expired'
-    elif (( account[6] )); then value='Terkunci manual'
-    elif (( account[7] > $(date +%s) )); then value='Terkunci otomatis'; fi
-    ssh_row Status "$value"
+    ssh_row Status "$(ssh_account_status "${account[3]}" "${account[6]}" "${account[7]}" "$(date +%s)")"
     if [[ -n "$telegram" ]]; then ssh_row Telegram "$telegram"; fi
     printf '  Limit IP / sesi belum diterapkan\n'
 }
@@ -154,101 +188,87 @@ ssh_result() {
     wait_submenu_navigation "$ssh_width"
 }
 
-ssh_create_wizard() {
-    local kind="$1" title='Create' username= password= ip= duration= step=1 rc=0 n output error= suffix= max=3650
-    local ssh_width ssh_input LC_ALL=C
-    if [[ "$kind" == trial ]]; then title='Trial'; step=3; suffix=h; max=720; fi
-    while true; do
-        ssh_page "$title"
-        if [[ "$kind" == member ]]; then printf '\n'; fi
-        if [[ -n "$error" ]]; then
-            printf '  %s\n' "$error"
-            if [[ "$kind" == member ]]; then printf '\n'; fi
+ssh_create_form() {
+    local kind="$1" n label previous prompt error
+    local -a fields=(Username Password 'Limit IP' 'Masa aktif (hari)')
+    if [[ "$kind" == trial ]]; then
+        ssh_page 'TRIAL SSH'
+        printf '  %bTekan Ctrl+C untuk membatalkan pembuatan akun trial.%b\n\n' "$GREEN" "$RESET"
+        printf '  Limit IP 0–99; 0 = Unlimited.\n  30m = 30 menit; 1h = 1 jam.\n\n'
+        fields=('Limit IP' 'Masa aktif trial')
+    else
+        ssh_page 'CREATE SSH ACCOUNT'
+        printf '  %bTekan Ctrl+C untuk membatalkan pembuatan akun.%b\n\n' "$GREEN" "$RESET"
+        printf '  Username 4–32; password 1–64.\n  Huruf kecil dan angka saja.\n  Limit IP 0–99; 0 = Unlimited.\n  Masa aktif 1–3650 hari (contoh 30).\n\n'
+    fi
+    for label in "${fields[@]}"; do
+        case "$label" in
+            Username) previous=$username ;;
+            Password) previous=$password ;;
+            'Limit IP') previous=$ip; [[ "$kind" != member ]] || printf '\n' ;;
+            *) previous=$duration ;;
+        esac
+        printf -v prompt '  %-17s : ' "$label"
+        if [[ -n "$previous" ]]; then prompt+="[$previous] "; fi
+        while true; do
+            ssh_prompt "$prompt" || return $?
+            n=${ssh_input:-$previous}
             error=
-        fi
-        rc=0
-        case "$step" in
-            1)
-                printf '  Gunakan 4–32 huruf kecil atau angka.\n\n'
-                if [[ -n "$username" ]]; then ssh_row Username "$username"; printf '\n'; fi
-                ssh_create_read 'Username' || rc=$? ;;
-            2)
-                printf '%s\n\n' '  Huruf kecil/angka (1–64). \x dan \z = literal.'
-                if [[ -n "$password" ]]; then
-                    ssh_row 'Password lama' "$password"
-                    printf '\n  Tekan Enter untuk mempertahankan.\n\n'
-                fi
-                ssh_create_read 'Password' || rc=$? ;;
-            3)
-                if [[ "$kind" == member ]]; then
-                    printf '  Rentang 0–99. 0 = Unlimited.\n\n'
-                    if [[ -n "$ip" ]]; then ssh_row 'Limit IP' "${ip/#0/Unlimited}"; printf '\n'; fi
-                    ssh_create_read 'Limit IP' || rc=$?
-                else
-                    [[ -z "$ip" ]] || ssh_row 'Limit IP' "${ip/#0/Unlimited}"
-                    ssh_read 'Limit IP (0–99, 0 = Unlimited)' || rc=$?
-                fi ;;
-            4)
-                if [[ "$kind" == member ]]; then
-                    printf '  Contoh: 7. Rentang: 1–3650 hari.\n\n'
-                    if [[ -n "$duration" ]]; then ssh_row 'Masa aktif' "$duration hari"; printf '\n'; fi
-                    ssh_create_read 'Masa aktif dalam hari' || rc=$?
-                else
-                    [[ -z "$duration" ]] || ssh_row 'Masa aktif' "$duration$suffix"
-                    ssh_read "Masa aktif (contoh 1$suffix, maksimum $max$suffix)" || rc=$?
-                fi ;;
-            5)
-                ssh_row Username "$username"; printf '\n'
-                ssh_row 'Limit IP' "${ip/#0/Unlimited}"; printf '\n'
-                ssh_row 'Masa aktif' "$duration hari"; printf '\n'
-                ssh_create_read 'Konfirmasi' 1 || rc=$? ;;
-        esac
-        if (( rc == DASHBOARD_EXIT )); then return "$rc"; fi
-        if (( rc == 1 )); then
-            if (( step == 1 )) || [[ "$kind" == trial && "$step" == 3 ]]; then return 0; fi
-            step=$((step - 1))
-            continue
-        fi
-        case "$step" in
-            1)
-                n=${ssh_input:-$username}
-                if [[ ! "$n" =~ ^[a-z0-9]{4,32}$ ]]; then error='Username tidak valid.'; continue; fi
-                if ! output=$(ssh_backend available "$n" 2>&1); then error=$output; continue; fi
-                username=$n ;;
-            2)
-                if [[ -n "$ssh_input" || -z "$password" ]]; then
-                    if ! n=$(ssh_decode_password "$ssh_input"); then error='Password tidak valid.'; continue; fi
-                    password=$n
-                fi ;;
-            3)
-                if ! n=$(ssh_limit_value "${ssh_input:-$ip}"); then error='Limit IP harus bilangan bulat 0–99.'; continue; fi
-                ip=$n ;;
-            4)
-                if [[ -z "$ssh_input" && -n "$duration" ]]; then ssh_input=$duration$suffix; fi
-                if ! n=$(ssh_duration_value "$ssh_input" "$suffix" "$max"); then
-                    if [[ "$kind" == member ]]; then error='Masukkan angka 1–3650 tanpa akhiran.'
-                    else error="Masa aktif harus 1$suffix–$max$suffix."; fi
-                    continue
-                fi
-                duration=$n
-                if [[ "$kind" == trial ]]; then
-                    if output=$(ssh_backend trial "$ip" "$duration" 2>&1); then
-                        ssh_result "$output" '✓ SSH TRIAL CREATED'; return $?
-                    fi
-                    error=$output; continue
-                fi ;;
-            5)
-                if [[ ${ssh_input,,} != y ]]; then error='Pilih y, z, atau x.'; continue; fi
-                if output=$(printf '%s\n' "$password" | ssh_backend create "$username" "$ip" "$duration" 2>&1); then
-                    password= ssh_input=
-                    ssh_result "$output" '✓ SSH ACCOUNT CREATED'; return $?
-                fi
-                error=$output
-                if [[ "$error" == *'sudah dipakai'* ]]; then step=1; fi
-                continue ;;
-        esac
-        step=$((step + 1))
+            case "$label" in
+                Username)
+                    if [[ ! "$n" =~ ^[a-z0-9]{4,32}$ ]]; then error='Username tidak valid.'
+                    elif error=$(ssh_backend available "$n" 2>&1); then username=$n; error=;
+                    else error=${error:-Username tidak dapat diperiksa.}; fi ;;
+                Password)
+                    if n=$(ssh_decode_password "$n"); then password=$n; else error='Password tidak valid.'; fi ;;
+                'Limit IP')
+                    if n=$(ssh_limit_value "$n"); then ip=$n; else error='Limit IP harus bilangan bulat 0–99.'; fi ;;
+                'Masa aktif (hari)')
+                    if n=$(ssh_duration_value "$n" '' 3650); then duration=$n
+                    else error='Masukkan angka 1–3650 tanpa akhiran, misalnya 30.'; fi ;;
+                'Masa aktif trial')
+                    if n=$(ssh_trial_duration "$n"); then duration=$n
+                    else error='Gunakan 1–43200m atau 1–720h (contoh 30m atau 1h).'; fi ;;
+            esac
+            if (( ssh_interrupted )); then return 2; fi
+            if [[ -z "$error" ]]; then break; fi
+            printf '  %b%s%b\n' "$RED" "$error" "$RESET"
+        done
     done
+    if [[ "$kind" == trial ]]; then
+        # Keep the unit the admin entered on the confirmation page.
+        label='jam'; [[ "$duration" != *m ]] || label='menit'
+        ssh_confirm TRIAL 'Buat akun trial ini?' 'Limit IP' "$(ssh_limit_label "$ip")" \
+            'Masa aktif' "${duration%?} $label"
+    else
+        ssh_confirm CREATE 'Buat akun ini?' Username "$username" 'Limit IP' "$(ssh_limit_label "$ip")" \
+            'Masa aktif' "$duration hari"
+    fi
+}
+
+ssh_create_wizard() {
+    local kind="$1" username= password= ip= duration= output title rc ssh_width ssh_input LC_ALL=C
+    while true; do
+        rc=0; ssh_cancel_scope ssh_create_form "$kind" || rc=$?
+        case "$rc" in
+            1) continue ;;  # n: go back with the form values intact.
+            2) return 0 ;;  # Ctrl+C: return to the SSH menu.
+            0) break ;;
+            *) return "$rc" ;;
+        esac
+    done
+    if [[ "$kind" == trial ]]; then
+        title='✓ SSH TRIAL CREATED'
+        rc=0; output=$(ssh_backend trial "$ip" "$duration" 2>&1) || rc=$?
+    else
+        title='✓ SSH ACCOUNT CREATED'
+        rc=0; output=$(printf '%s\n' "$password" | ssh_backend create "$username" "$ip" "$duration" 2>&1) || rc=$?
+    fi
+    password= ssh_input=
+    if (( rc == 0 )); then ssh_result "$output" "$title"; return $?; fi
+    ssh_page 'Pembuatan akun gagal'
+    printf '  %s\n' "${output:-Operasi tidak berhasil.}"
+    wait_submenu_navigation "$ssh_width"
 }
 
 ssh_member_detail() {
@@ -294,58 +314,125 @@ ssh_select_account() {
     return 1
 }
 
+ssh_action_eligible() {
+    local operation="$1" expires="$2" manual="$3" automated="$4" now="$5"
+    case "$operation" in
+        lock) (( expires > now && !manual )) ;;
+        unlock) (( expires > now && manual && automated <= now )) ;;
+        *) return 0 ;;
+    esac
+}
+
+ssh_account_table() {
+    local i no_width=3 name_width=8 name room idx
+    idx=${#accounts[@]}
+    if (( ${#idx} > no_width )); then no_width=${#idx}; fi
+    for name in "${accounts[@]}"; do
+        if (( ${#name} > name_width )); then name_width=${#name}; fi
+    done
+    local fmt='%*s  %-*s  %-8s  %-9s  %s\n'
+    if (( no_width + name_width + 32 <= ssh_width )); then
+        printf "$fmt" "$no_width" No. "$name_width" Username Expired 'Limit IP' Status
+        repeat_char '─' "$ssh_width"; printf '\n'
+        for i in "${!accounts[@]}"; do
+            printf "$fmt" "$no_width" "$((i + 1))" "$name_width" "${accounts[i]}" \
+                "${dates[i]}" "${limits[i]}" "${statuses[i]}"
+        done
+    else
+        printf '%*s  Username\n  Expired  | Limit IP | Status\n' "$no_width" No.
+        repeat_char '─' "$ssh_width"; printf '\n'
+        room=$((ssh_width - no_width - 2))
+        for i in "${!accounts[@]}"; do
+            name=${accounts[i]}
+            printf '%*s  %s\n' "$no_width" "$((i + 1))" "${name:0:room}"
+            if (( ${#name} > room )); then printf '%*s  %s\n' "$no_width" '' "${name:room}"; fi
+            printf '  %s | %s | %s\n' "${dates[i]}" "${limits[i]}" "${statuses[i]}"
+        done
+    fi
+}
+
 ssh_account_menu() {
-    local operation="$1" label="$2" ssh_width ssh_input rc names name output index message=
-    local -a accounts=()
+    local operation="$1" label="$2" ssh_width ssh_input rc data name output message= now
+    local stored_kind created expires ip sessions manual automated status active locked expired
+    local -a accounts=() dates=() limits=() statuses=() account=()
     while true; do
         ssh_page "$label"
-        printf '\n'
-        if [[ -n "$message" ]]; then printf '  %s\n\n' "$message"; fi
-        accounts=()
-        if names=$(ssh_backend list 2>/dev/null); then
-            if [[ -n "$names" ]]; then
-                mapfile -t accounts <<< "$names"
-                for index in "${!accounts[@]}"; do
-                    draw_menu_item "$((index + 1))" "${accounts[index]}"
-                done
+        if [[ -n "$message" ]]; then printf '  %s\n\n' "$message"; message=; fi
+        accounts=(); dates=(); limits=(); statuses=()
+        active=0 locked=0 expired=0
+        now=$(date +%s)
+        if data=$(ssh_backend table 2>/dev/null); then
+            while IFS=$'\t' read -r name stored_kind created expires ip sessions manual automated; do
+                [[ -n "$name" ]] || continue
+                if ! ssh_action_eligible "$operation" "$expires" "$manual" "$automated" "$now"; then continue; fi
+                status=$(ssh_account_status "$expires" "$manual" "$automated" "$now")
+                accounts+=("$name")
+                dates+=("$(ssh_expiry "$expires" '%d/%m/%y' || printf '—')")
+                limits+=("$(ssh_limit_label "$ip")")
+                statuses+=("$status")
+                case "$status" in
+                    Aktif) active=$((active + 1)) ;;
+                    Locked) locked=$((locked + 1)) ;;
+                    Expired) expired=$((expired + 1)) ;;
+                esac
+            done <<< "$data"
+            if (( ${#accounts[@]} )); then ssh_account_table; else printf '  Tidak ada akun yang dapat ditampilkan.\n'; fi
+            printf '\n'
+            if [[ "$operation" == list ]]; then
+                ssh_row 'Total Member' "${#accounts[@]}"
+                ssh_row Aktif "$active"
+                ssh_row Locked "$locked"
+                ssh_row Expired "$expired"
             else
-                printf '  Belum ada akun Nathaya.\n'
+                ssh_row 'Total akun' "${#accounts[@]}"
             fi
         else
             printf '  Data akun tidak dapat dibaca.\n'
         fi
         printf '\n'
-        rc=0; ssh_read 'Nomor atau username' 'Pilih nomor atau username. Gunakan @1234 untuk username numerik.' || rc=$?
-        if (( rc == DASHBOARD_EXIT )); then return "$rc"; fi
-        if (( rc == 1 )); then return 0; fi
+        if (( ${#accounts[@]} )); then printf '  Nomor atau username; @1234 untuk username numerik.\n'; fi
+        printf '  %bz.%b Kembali ke menu SSH\n  %bx.%b Keluar\n\n' "$GREEN" "$RESET" "$RED" "$RESET"
+        ssh_prompt '  Pilihan: ' || return $?
+        case "${ssh_input,,}" in
+            z) return 0 ;;
+            x) return "$DASHBOARD_EXIT" ;;
+        esac
         if ! name=$(ssh_select_account "$ssh_input" "${accounts[@]}"); then
             message='Nomor atau username tidak ditemukan.'
             continue
         fi
-        if ! output=$(ssh_backend detail "$name" 2>&1); then message=$output; continue; fi
         if [[ "$operation" == list ]]; then
             ssh_member_detail "$name" || return $?
-            message=
             continue
         fi
-        while true; do
-            ssh_page "Konfirmasi $label"
-            ssh_row Username "$name"
-            draw_menu_item y 'Konfirmasi'
-            rc=0; ssh_read 'Pilih' || rc=$?
-            if (( rc == DASHBOARD_EXIT )); then return "$rc"; fi
-            if (( rc == 1 )); then break; fi
-            if [[ ${ssh_input,,} != y ]]; then continue; fi
-            if output=$(ssh_backend "$operation" "$name" 2>&1); then
-                if [[ "$operation" == lock ]]; then output='Akun terkunci; sesi akun dihentikan oleh layanan.'
-                else output='Akses akun dipulihkan.'; fi
-            fi
-            ssh_page "Hasil $label"
-            ssh_row Username "$name"
-            printf '  %s\n' "$output"
-            wait_submenu_navigation "$ssh_width"
-            return $?
-        done
+        if ! output=$(ssh_backend detail "$name" 2>&1); then message=$output; continue; fi
+        mapfile -t account <<< "$output"
+        now=$(date +%s)
+        if (( ${#account[@]} != 8 )) ||
+           ! ssh_action_eligible "$operation" "${account[3]}" "${account[6]}" "${account[7]}" "$now"; then
+            message='Akun tidak lagi memenuhi syarat. Pilih akun lain.'
+            continue
+        fi
+        rc=0
+        ssh_cancel_scope ssh_confirm "${operation^^}" 'Lanjutkan aksi ini?' Username "$name" \
+            Expired "$(ssh_expiry "${account[3]}" || printf '—')" \
+            'Limit IP' "$(ssh_limit_label "${account[4]}")" \
+            Status "$(ssh_account_status "${account[3]}" "${account[6]}" "${account[7]}" "$now")" || rc=$?
+        case "$rc" in
+            1) continue ;;
+            2) return 0 ;;
+            0) ;;
+            *) return "$rc" ;;
+        esac
+        if output=$(ssh_backend "$operation" "$name" 2>&1); then
+            if [[ "$operation" == lock ]]; then output='Akun terkunci; sesi akun dihentikan oleh layanan.'
+            else output='Akses akun dipulihkan.'; fi
+        fi
+        ssh_page "Hasil $label"
+        ssh_row Username "$name"
+        printf '  %s\n' "$output"
+        wait_submenu_navigation "$ssh_width"
+        return $?
     done
 }
 
@@ -381,8 +468,8 @@ show_ssh_menu() {
                     1) ssh_create_wizard member || return $? ;;
                     4) ssh_create_wizard trial || return $? ;;
                     6) ssh_account_menu list 'List Member' || return $? ;;
-                    8) ssh_account_menu lock Lock || return $? ;;
-                    9) ssh_account_menu unlock Unlock || return $? ;;
+                    8) ssh_account_menu lock 'Lock SSH' || return $? ;;
+                    9) ssh_account_menu unlock 'Unlock SSH' || return $? ;;
                 esac ;;
         esac
     done
