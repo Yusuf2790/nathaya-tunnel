@@ -33,7 +33,10 @@ ssh_read() {
 ssh_cancel_scope() {
     local saved_int ssh_interrupted=0 rc=0
     saved_int=$(trap -p INT)
-    trap 'ssh_interrupted=1' INT
+    # Bash may resume read after a trap that only sets a flag.
+    trap 'ssh_interrupted=1
+        if [[ ${FUNCNAME[0]-} == ssh_prompt ]]; then return 2; fi
+    ' INT
     "$@" || rc=$?
     if [[ -n "$saved_int" ]]; then eval "$saved_int"; else trap - INT; fi
     if (( ssh_interrupted )); then return 2; fi
