@@ -122,8 +122,8 @@ port yang dipilih; tidak mengubah firewall, port, atau konfigurasi SSH admin.
 Instal ulang mempertahankan modul yang terpasang, akun, dan host key. Restart
 layanan saat instal ulang dapat memutus tunnel pelanggan yang sedang aktif.
 
-Menu SSH menyediakan Create, Delete, Renew, Trial, List Member/detail, Lock,
-dan Unlock. Check User Login, List User Expired, dan Limit IP masih bertanda
+Menu SSH menyediakan Create, Delete, Renew, Trial, List Member/detail, List
+User Expired, Lock, dan Unlock. Check User Login dan Limit IP masih bertanda
 **Belum tersedia**. Validasi saat ini membatasi username ke 4–32 karakter,
 password ke 1–64 karakter. Create menerima angka hari 1–3650 (contoh `30`,
 bukan `30d`). Trial menerima menit berakhiran `m` atau jam berakhiran `h`,
@@ -149,6 +149,15 @@ atau username; `@1234` memilih username numerik tanpa memakai nomor baris.
   selama konfirmasi, konfirmasi dimuat ulang atau kamu diminta memilih ulang
   bila akun telah diganti. Renew tidak mengubah password, jenis akun, limit,
   atau status lock.
+- **List User Expired** mencakup akun reguler dan Trial yang sudah kedaluwarsa,
+  termasuk yang terkunci. Pilih `d` untuk menghapus satu akun atau `a` untuk
+  menghapus semua akun pada daftar. Untuk satu akun gunakan nomor, username,
+  atau `@username`. Pilih `y` untuk menghapus, `n` untuk kembali ke daftar, atau
+  Ctrl+C untuk membatalkan dan kembali ke menu SSH.
+- Jika akun tunggal diperpanjang atau diganti sebelum penghapusan, atau jika
+  daftar berubah sebelum penghapusan massal, aksi dibatalkan dan daftar dimuat
+  ulang. Hapus massal berjalan dalam satu transaksi; kegagalan tidak menyisakan
+  penghapusan sebagian. Tidak ada restart layanan Dropbear.
 `NATHAYA_TZ` (contoh `Asia/Jakarta`) pada konfigurasi dashboard memilih zona
 waktu detail; jika tidak diatur, gunakan zona VPS.
 

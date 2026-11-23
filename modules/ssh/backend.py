@@ -190,7 +190,7 @@ def status_for(expires, locked, auto_until, now):
     return 'Locked' if locked or auto_until > now else 'Aktif'
 
 
-def action_snapshot(db, username, identity, days=None):
+def action_snapshot(db, username, identity, days=None, *, expired_only=False):
     if days is not None and not 1 <= days <= 3650:
         raise AccountError('Tambahan masa aktif harus 1–3650 hari.')
     row = db.execute('SELECT * FROM accounts WHERE username=?', (username,)).fetchone()
@@ -198,7 +198,9 @@ def action_snapshot(db, username, identity, days=None):
         raise ReplacedAccount('Akun hilang atau diganti. Pilih ulang dari daftar.')
     now = int(time.time())
     status = status_for(row['expires'], row['locked'], row['auto_until'], now)
-    state = [identity, row['expires'], row['ip_limit'], row['locked'], row['auto_until'], status, days]
+    if expired_only and status != 'Expired':
+        raise StaleAccount('Akun tidak lagi expired. Tidak ada akun yang dihapus.')
+    state = [identity, row['expires'], row['ip_limit'], row['locked'], row['auto_until'], status, days, expired_only]
     token = hashlib.sha256(json.dumps(['nathaya-action-v1', *state]).encode()).hexdigest()
     proposed = max(row['expires'], now) + days * 86400 if days is not None else 0
     return row, status, token, proposed, now
@@ -210,10 +212,10 @@ def action_days(value):
     return int(value)
 
 
-def change_account(username, identity, expected_token, days=None):
+def change_account(username, identity, expected_token, days=None, *, expired_only=False):
     with database() as db:
         db.execute('BEGIN IMMEDIATE')
-        row, _, token, proposed, now = action_snapshot(db, username, identity, days)
+        row, _, token, proposed, now = action_snapshot(db, username, identity, days, expired_only=expired_only)
         if not secrets.compare_digest(token, expected_token):
             raise StaleAccount('Data akun berubah. Tinjau konfirmasi terbaru.')
         if days is None:
@@ -221,6 +223,28 @@ def change_account(username, identity, expected_token, days=None):
             return None
         db.execute('UPDATE accounts SET expires=? WHERE username=?', (proposed, username))
         return proposed, status_for(proposed, row['locked'], row['auto_until'], now)
+
+
+def expired_snapshot(db, now):
+    rows = db.execute(f'SELECT {PUBLIC}, verifier, sealed FROM accounts WHERE expires <= ? ORDER BY username',
+                      (now,)).fetchall()
+    # Include immutable identity and public state, not secrets or the wall clock.
+    entries = [(*tuple(row)[:-2], account_identity(row)) for row in rows]
+    fingerprint = hashlib.sha256(json.dumps(['nathaya-expired-v1', entries]).encode()).hexdigest()
+    return entries, fingerprint
+
+
+def delete_all_expired(expected_fingerprint):
+    with database() as db:
+        db.execute('BEGIN IMMEDIATE')
+        now = int(time.time())
+        entries, fingerprint = expired_snapshot(db, now)
+        if not secrets.compare_digest(fingerprint, expected_fingerprint):
+            raise StaleAccount('Daftar expired berubah. Tidak ada akun yang dihapus; tinjau daftar terbaru.')
+        deleted = db.execute('DELETE FROM accounts WHERE expires <= ?', (now,)).rowcount
+        if deleted != len(entries):
+            raise AccountError('Jumlah akun berubah saat penghapusan. Seluruh operasi dibatalkan.')
+    return deleted
 
 
 def change_lock(username, lock):
@@ -411,6 +435,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('operation', choices=('serve', 'available', 'create', 'trial', 'list', 'table',
                                              'action-table', 'action-view', 'delete', 'renew', 'detail',
+                                             'expired-table', 'expired-view', 'delete-expired', 'delete-all-expired',
                                              'password', 'lock', 'unlock', 'ports'))
     parser.add_argument('values', nargs='*')
     args = parser.parse_args()
@@ -432,14 +457,19 @@ def main():
         change_lock(values[0], operation == 'lock')
     elif operation == 'delete' and len(values) == 3:
         change_account(*values)
+    elif operation == 'delete-expired' and len(values) == 3:
+        change_account(*values, expired_only=True)
+    elif operation == 'delete-all-expired' and len(values) == 1:
+        print(delete_all_expired(values[0]))
     elif operation == 'renew' and len(values) == 4:
         expires, status = change_account(*values[:3], days=action_days(values[3]))
         print(expires, status, sep='\t')
     else:
         with database() as db:
-            if operation == 'action-view' and len(values) in (2, 3):
+            if (operation == 'action-view' and len(values) in (2, 3)) or (operation == 'expired-view' and len(values) == 2):
                 days = action_days(values[2]) if len(values) == 3 else None
-                row, status, token, proposed, _ = action_snapshot(db, values[0], values[1], days)
+                row, status, token, proposed, _ = action_snapshot(
+                    db, values[0], values[1], days, expired_only=(operation == 'expired-view'))
                 print(row['expires'], row['ip_limit'], status, token, proposed, sep='\t')
             elif operation == 'list' and not values:
                 for row in db.execute(f'SELECT {PUBLIC} FROM accounts ORDER BY username'):
@@ -448,6 +478,11 @@ def main():
                 # Public data only; no verifier, password, or per-account subprocess.
                 for row in db.execute(f'SELECT {PUBLIC} FROM accounts ORDER BY username'):
                     print('\t'.join(str(value) for value in row))
+            elif operation == 'expired-table' and not values:
+                entries, fingerprint = expired_snapshot(db, int(time.time()))
+                print(len(entries), fingerprint, sep='\t')
+                for entry in entries:
+                    print(*entry, sep='\t')
             elif operation == 'action-table' and not values:
                 for row in db.execute(f'SELECT {PUBLIC}, verifier, sealed FROM accounts ORDER BY username'):
                     print(*tuple(row)[:-2], account_identity(row), sep='\t')

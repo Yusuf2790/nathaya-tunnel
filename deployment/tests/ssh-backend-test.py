@@ -145,6 +145,89 @@ class BackendTest(unittest.TestCase):
             actual, status = backend.change_account(name, identity, token, days=1)
             self.assertEqual((actual, status), (preview + 5, 'Aktif'))
 
+    def expire(self, name, expiry, locked=0):
+        with backend.database() as db:
+            db.execute('UPDATE accounts SET expires=?, locked=? WHERE username=?', (expiry, locked, name))
+
+    def expired_set(self, now):
+        with backend.database() as db:
+            rows, fingerprint = backend.expired_snapshot(db, now)
+        return {row[0] for row in rows}, fingerprint
+
+    def preview_expired(self, name):
+        with backend.database() as db:
+            identity = backend.account_identity(backend.account_row(db, name, '*'))
+            _, status, token, _, _ = backend.action_snapshot(db, name, identity, expired_only=True)
+        self.assertEqual(status, 'Expired')
+        return identity, token
+
+    def test_expired_single_revalidates_renew_and_recreation(self):
+        now = 1800000000
+        with patch.object(backend.time, 'time', return_value=now):
+            member = backend.create('member', 'expiredone', 'x', 0, 7)
+            trial = backend.create('trial', '', '', 0, 1)
+            self.assertEqual(self.expired_set(now)[0], set())
+            self.expire(member, now)
+            self.expire(trial, now - 1, locked=1)
+            self.assertEqual(self.expired_set(now)[0], {member, trial})
+            identity, token = self.preview_expired(member)
+            _, renew_token, _, _ = self.action(member, 1)
+            backend.change_account(member, identity, renew_token, days=1)
+            with self.assertRaises(backend.StaleAccount):
+                backend.change_account(member, identity, token, expired_only=True)
+            trial_id, trial_token = self.preview_expired(trial)
+            backend.change_account(trial, trial_id, trial_token, expired_only=True)
+            self.expire(member, now)
+            identity, token = self.preview_expired(member)
+            backend.change_account(member, identity, token, expired_only=True)
+            backend.create('member', member, 'x', 0, 7)
+            self.expire(member, now)
+            with self.assertRaises(backend.ReplacedAccount):
+                backend.change_account(member, identity, token, expired_only=True)
+            self.assertEqual(self.expired_set(now)[0], {member})
+
+    def test_bulk_expired_aborts_when_any_account_changes(self):
+        now = 1800000000
+        with patch.object(backend.time, 'time', return_value=now):
+            a = backend.create('member', 'expiredall', 'x', 0, 7)
+            b = backend.create('trial', '', '', 0, 1)
+            future = backend.create('member', 'nexttoexpire', 'z', 0, 7)
+            active = backend.create('member', 'stillactive', 'z', 0, 7)
+            self.expire(a, now)
+            self.expire(b, now - 1, locked=1)
+            self.expire(future, now + 1)
+            _, original = self.expired_set(now)
+            identity, renew_token, _, _ = self.action(a, 1)
+            backend.change_account(a, identity, renew_token, days=1)
+            with self.assertRaises(backend.StaleAccount):
+                backend.delete_all_expired(original)
+            self.assertEqual(self.expired_set(now)[0], {b})
+            _, unchanged = self.expired_set(now)
+        with patch.object(backend.time, 'time', return_value=now + 1):
+            with self.assertRaises(backend.StaleAccount):
+                backend.delete_all_expired(unchanged)
+            self.assertEqual(self.expired_set(now + 1)[0], {b, future})
+            _, latest = self.expired_set(now + 1)
+            self.assertEqual(backend.delete_all_expired(latest), 2)
+            self.assertEqual(self.expired_set(now + 1)[0], set())
+            with backend.database() as db:
+                self.assertEqual({row[0] for row in db.execute('SELECT username FROM accounts')}, {a, active})
+
+    def test_bulk_expired_rolls_back_when_delete_fails(self):
+        now = 1800000000
+        with patch.object(backend.time, 'time', return_value=now):
+            first = backend.create('member', 'firstdel', 'x', 0, 7)
+            last = backend.create('member', 'lastdel', 'x', 0, 7)
+            self.expire(first, now)
+            self.expire(last, now)
+            _, fingerprint = self.expired_set(now)
+            with backend.database() as db:
+                db.execute("CREATE TRIGGER refuse_delete BEFORE DELETE ON accounts WHEN OLD.username = 'lastdel' "
+                           "BEGIN SELECT RAISE(FAIL, 'fixture rejected'); END")
+            with self.assertRaises(backend.sqlite3.IntegrityError):
+                backend.delete_all_expired(fingerprint)
+            self.assertEqual(self.expired_set(now), ({first, last}, fingerprint))
+
     def test_auth_log_and_ports(self):
         message = b"<85>Nov 21 00:10:11 dropbear[2]: Password auth succeeded for 'fixture1' from 127.0.0.1:1234"
         self.assertEqual(backend.auth_username(message), 'fixture1')

@@ -21,6 +21,37 @@ ssh_backend() {
                 member02 member 1 4102444800 3 2 1 0 \
                 expired1 member 1 2 0 2 1 0 \
                 autolock member 1 4102444800 0 2 1 4102444800 ;;
+        expired-table)
+            case "${expired_fixture:-normal}" in
+                unavailable) printf 'fixture backend offline\n' >&2; return 1 ;;
+                empty) printf '0\tempty-token\n'; return 0 ;;
+            esac
+            if [[ -f "$work/bulk-done" ]]; then printf '0\tempty-token\n'; return 0; fi
+            if [[ -f "$work/single-done" ]]; then
+                printf '1\tremaining-batch\nexpired1\tmember\t1\t2\t0\t2\t0\t0\tid-expired1\n'
+                return 0
+            fi
+            printf '2\t%s\n' "$([[ -f "$work/bulk-stale" ]] && printf new-batch || printf old-batch)"
+            printf '0001\ttrial\t1\t2\t1\t2\t1\t0\tid-0001\nexpired1\tmember\t1\t2\t0\t2\t0\t0\tid-expired1\n' ;;
+        expired-view) [[ "$3" == "id-$2" ]] || return 4; printf '2\t1\tExpired\texpired-token\t0\n' ;;
+        delete-expired)
+            [[ "$3" == "id-$2" && "$4" == expired-token ]] || return 4
+            if [[ "${expired_fixture:-normal}" == renewed ]]; then
+                printf 'Akun tidak lagi expired. Tidak ada akun yang dihapus.\n' >&2
+                return 3
+            fi
+            printf 'single:%s\n' "$2" >> "$work/expired-actions"
+            touch "$work/single-done" ;;
+        delete-all-expired)
+            if [[ "$2" == old-batch ]]; then
+                touch "$work/bulk-stale"
+                printf 'Daftar expired berubah. Tidak ada akun yang dihapus.\n' >&2
+                return 3
+            fi
+            [[ "$2" == new-batch ]] || return 4
+            printf 'bulk:%s\n' "$2" >> "$work/expired-actions"
+            touch "$work/bulk-done"
+            printf '2\n' ;;
         action-table) ssh_backend table | awk '{ print $0 "\tid-" $1 }' ;;
         action-view)
             [[ "$3" == "id-$2" ]] || return 4
@@ -230,6 +261,60 @@ check_table_style() {
 }
 check_table_style 50
 check_table_style 32
+
+expired_fixture=empty ssh_expired_menu > "$work/expired-empty" <<'INPUT'
+z
+INPUT
+grep -Fq 'Tidak ada akun SSH expired' "$work/expired-empty"
+if grep -Eq '^  [da]\.' "$work/expired-empty"; then exit 1; fi
+expired_fixture=unavailable ssh_expired_menu > "$work/expired-error" <<'INPUT'
+z
+INPUT
+grep -Fq 'fixture backend offline' "$work/expired-error"
+ssh_expired_menu > "$work/expired-cancel" <<'INPUT'
+d
+1
+n
+a
+n
+z
+INPUT
+[[ ! -e "$work/expired-actions" ]]
+expired_fixture=renewed ssh_expired_menu > "$work/expired-renewed" <<'INPUT'
+d
+@0001
+y
+z
+INPUT
+[[ ! -e "$work/expired-actions" ]]
+grep -Fq 'Akun tidak lagi expired.' "$work/expired-renewed"
+ssh_expired_menu > "$work/expired-single" <<'INPUT'
+d
+member01
+@0001
+
+y
+z
+INPUT
+[[ $(cat "$work/expired-actions") == 'single:0001' ]]
+grep -Fq 'Akun tidak ditemukan dalam daftar expired.' "$work/expired-single"
+grep -Fq 'Hapus akun expired ini? [y/n]:' "$work/expired-single"
+grep -Fq 'Akun 0001 berhasil dihapus.' "$work/expired-single"
+grep -Eq 'Total akun expired +: 1$' "$work/expired-single"
+rm -- "$work/single-done"  # Mulai fixture massal yang terpisah.
+ssh_expired_menu > "$work/expired-all" <<'INPUT'
+a
+y
+a
+y
+z
+INPUT
+[[ $(cat "$work/expired-actions") == $'single:0001\nbulk:new-batch' ]]
+grep -Fq 'CONFIRM DELETE ALL EXPIRED' "$work/expired-all"
+grep -Fq 'Hapus semua 2 akun expired ini? [y/n]:' "$work/expired-all"
+grep -Fq 'Daftar expired berubah.' "$work/expired-all"
+grep -Fq '2 akun expired berhasil dihapus.' "$work/expired-all"
+grep -Fq 'Tidak ada akun SSH expired' "$work/expired-all"
 
 ssh_width=48
 ssh_detail_lines() { ssh_row Username 'fixture'; }

@@ -376,6 +376,10 @@ ssh_account_table() {
 ssh_mutation_confirm() {
     local action="$1" name="$2" identity="$3" raw expires ip status proposed rc=0
     local -a args=("$name" "$identity")
+    local view=action-view question='Hapus akun ini?'
+    if [[ "$action" == expired ]]; then
+        view=expired-view; question='Hapus akun expired ini?'
+    fi
     if [[ "$action" == renew ]]; then
         if [[ -z "$days" ]]; then
             ssh_page 'RENEW SSH'
@@ -389,7 +393,7 @@ ssh_mutation_confirm() {
         fi
         args+=("$days")
     fi
-    raw=$(ssh_backend action-view "${args[@]}" 2>&1) || rc=$?
+    raw=$(ssh_backend "$view" "${args[@]}" 2>&1) || rc=$?
     if (( rc )); then
         mutation_message=$raw
         return 1
@@ -399,8 +403,8 @@ ssh_mutation_confirm() {
         mutation_message='Data konfirmasi tidak dapat dibaca.'
         return 1
     fi
-    if [[ "$action" == delete ]]; then
-        ssh_confirm DELETE 'Hapus akun ini?' Username "$name" \
+    if [[ "$action" == delete || "$action" == expired ]]; then
+        ssh_confirm DELETE "$question" Username "$name" \
             Expired "$(ssh_expiry "$expires" || printf '—')" Status "$status" 'Limit IP' "$(ssh_limit_label "$ip")"
     else
         local new_date
@@ -550,6 +554,101 @@ ssh_account_menu() {
     done
 }
 
+ssh_pick_expired() {
+    local i
+    printf '  Nomor atau username; @1234 untuk username numerik.\n'
+    while true; do
+        ssh_prompt '  Akun expired: ' || return $?
+        if target=$(ssh_select_account "$ssh_input" "${accounts[@]}"); then break; fi
+        printf '  Akun tidak ditemukan dalam daftar expired.\n'
+    done
+    for i in "${!accounts[@]}"; do
+        if [[ "${accounts[i]}" == "$target" ]]; then
+            target_identity=${identities[i]}
+            break
+        fi
+    done
+    ssh_mutation_confirm expired "$target" "$target_identity"
+}
+
+ssh_expired_mutation() {
+    local choice="$1" fingerprint="$2" rc=0 output target= target_identity= action_token= mutation_message=
+    if [[ "$choice" == d ]]; then
+        ssh_cancel_scope ssh_pick_expired || rc=$?
+    else
+        ssh_cancel_scope ssh_confirm 'DELETE ALL EXPIRED' "Hapus semua ${#accounts[@]} akun expired ini?" \
+            'Total akun expired' "${#accounts[@]}" || rc=$?
+    fi
+    if (( rc )); then
+        if [[ -n "$mutation_message" ]]; then message=$mutation_message; fi
+        return "$rc"
+    fi
+    if [[ "$choice" == d ]]; then
+        if output=$(ssh_backend delete-expired "$target" "$target_identity" "$action_token" 2>&1); then
+            message="Akun $target berhasil dihapus."
+        else
+            message=${output:-Penghapusan akun expired gagal.}
+        fi
+    elif output=$(ssh_backend delete-all-expired "$fingerprint" 2>&1); then
+        message="$output akun expired berhasil dihapus."
+    else
+        message=${output:-Penghapusan semua akun expired gagal.}
+    fi
+    return 0
+}
+
+ssh_expired_menu() {
+    local ssh_width ssh_input data snapshot expected_count fingerprint message= rc ready
+    local name kind created expires ip sessions manual automated identity
+    local -a accounts=() dates=() limits=() statuses=() identities=()
+    while true; do
+        ssh_page 'LIST USER EXPIRED'
+        if [[ -n "$message" ]]; then printf '  %s\n\n' "$message"; message=; fi
+        accounts=(); dates=(); limits=(); statuses=(); identities=(); ready=0
+        if data=$(ssh_backend expired-table 2>&1); then
+            snapshot=${data%%$'\n'*}
+            IFS=$'\t' read -r expected_count fingerprint <<< "$snapshot"
+            if [[ "$data" == *$'\n'* ]]; then
+                while IFS=$'\t' read -r name kind created expires ip sessions manual automated identity; do
+                    [[ -n "$name" && -n "$identity" ]] || continue
+                    accounts+=("$name"); identities+=("$identity")
+                    dates+=("$(ssh_expiry "$expires" '%d/%m/%y' || printf '—')")
+                    limits+=("$(ssh_limit_label "$ip")")
+                    statuses+=(Expired)
+                done <<< "${data#*$'\n'}"
+            fi
+            if [[ "$expected_count" != "${#accounts[@]}" || -z "$fingerprint" ]]; then
+                printf '  Data akun SSH expired tidak lengkap. Daftar tidak dapat dihapus.\n'
+            elif (( ${#accounts[@]} )); then
+                ready=1
+                ssh_account_table 0 "${#accounts[@]}"
+                ssh_row 'Total akun expired' "${#accounts[@]}"
+            else
+                printf '  Tidak ada akun SSH expired\n'
+            fi
+        else
+            printf '  Data akun SSH expired tidak dapat dibaca: %s\n' "${data:-backend gagal.}"
+        fi
+        printf '\n'
+        if (( ready )); then
+            printf '  %bd.%b Hapus satu akun expired\n  %ba.%b Hapus semua akun expired\n' "$ORANGE" "$RESET" "$ORANGE" "$RESET"
+        fi
+        printf '  %bz.%b Kembali ke menu SSH\n  %bx.%b Keluar\n\n' "$GREEN" "$RESET" "$RED" "$RESET"
+        rc=0; ssh_cancel_scope ssh_prompt '  Pilihan: ' || rc=$?
+        case "$rc" in 0) ;; 2) return 0 ;; *) return "$rc" ;; esac
+        case "${ssh_input,,}" in
+            z) return 0 ;;
+            x) return "$DASHBOARD_EXIT" ;;
+            d|a)
+                if (( ready )); then
+                    rc=0; ssh_expired_mutation "${ssh_input,,}" "$fingerprint" || rc=$?
+                    case "$rc" in 0|1) continue ;; 2) return 0 ;; *) return "$rc" ;; esac
+                fi ;;
+        esac
+        message='Pilihan tidak valid.'
+    done
+}
+
 show_ssh_menu() {
     # Jangan jejak nilai input atau payload kredensial jika Bash dijalankan dengan -x.
     set +x
@@ -559,7 +658,7 @@ show_ssh_menu() {
         ssh_page 'MANAJEMEN SSH'
         for index in "${!labels[@]}"; do
             case "$index" in
-                4|6|9) draw_menu_item "$((index + 1))" "${labels[index]} — Belum tersedia" ;;
+                4|9) draw_menu_item "$((index + 1))" "${labels[index]} — Belum tersedia" ;;
                 *) draw_menu_item "$((index + 1))" "${labels[index]}" ;;
             esac
         done
@@ -567,11 +666,11 @@ show_ssh_menu() {
         if (( rc == DASHBOARD_EXIT )); then return "$rc"; fi
         if (( rc == 1 )); then return 0; fi
         case "$ssh_input" in
-            5|7|10)
+            5|10)
                 ssh_page "${labels[ssh_input - 1]}"
                 printf '  Belum tersedia\n'
                 wait_submenu_navigation "$ssh_width" || return $? ;;
-            1|2|3|4|6|8|9)
+            1|2|3|4|6|7|8|9)
                 if ! ssh_ready; then
                     ssh_page "${labels[ssh_input - 1]}"
                     printf '  Modul Dropbear belum aktif. Gunakan installer --enable-ssh pada VPS uji.\n'
@@ -584,6 +683,7 @@ show_ssh_menu() {
                     3) ssh_account_menu renew 'RENEW SSH' || return $? ;;
                     4) ssh_create_wizard trial || return $? ;;
                     6) ssh_account_menu list 'List Member' || return $? ;;
+                    7) ssh_expired_menu || return $? ;;
                     8) ssh_account_menu lock 'Lock SSH' || return $? ;;
                     9) ssh_account_menu unlock 'Unlock SSH' || return $? ;;
                 esac ;;
