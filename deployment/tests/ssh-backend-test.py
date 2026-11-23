@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
+import asyncio
 import importlib.util
 import os
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -227,6 +229,70 @@ class BackendTest(unittest.TestCase):
             with self.assertRaises(backend.sqlite3.IntegrityError):
                 backend.delete_all_expired(fingerprint)
             self.assertEqual(self.expired_set(now), ({first, last}, fingerprint))
+
+    def test_session_events_group_only_live_authenticated_transports(self):
+        inventory = backend.SessionInventory()
+        access = {'member01': ('hash1', 'identity1'), 'member02': ('hash2', 'identity2')}
+        ok = b"<85>dropbear[1]: Password auth succeeded for 'member01' from 192.0.2.99:9999"
+        other_ok = ok.replace(b'member01', b'member02')
+        denied = b"<85>dropbear[1]: Bad password attempt for 'member01' from 192.0.2.99:9999"
+        p1, p2, p3, p4 = [SimpleNamespace(returncode=None) for _ in range(4)]
+        mapped = ('::ffff:192.0.2.1', 1234, 0, 0)
+        self.assertEqual(inventory.rows(), [])  # Before authentication.
+        self.assertIsNone(inventory.observe(1, p1, mapped, denied, access, access, None))
+        self.assertEqual(inventory.rows(), [])
+        owner = inventory.observe(1, p1, mapped, ok, access, access, None)
+        inventory.observe(1, p1, mapped, ok, access, access, owner)
+        inventory.observe(2, p2, ('192.0.2.1', 2345), ok, access, access, None)
+        inventory.observe(3, p3, ('fe80::1234', 3456, 0, 2), ok, access, access, None)
+        inventory.observe(4, p4, ('2001:db8::2', 4567, 0, 0), other_ok, access, access, None)
+        self.assertEqual(inventory.rows(), [['member01', '192.0.2.1', 2], ['member01', 'fe80::1234%2', 1],
+                                            ['member02', '2001:db8::2', 1]])
+        p1.returncode = 0  # Ignore dead workers even if cleanup has not run.
+        self.assertEqual(inventory.rows()[0], ['member01', '192.0.2.1', 1])
+        inventory.remove(1)
+        for eligible in ({'member02': access['member02']}, {**access, 'member01': ('hash1', 'replacement')}):
+            self.assertFalse(backend.same_access(access, eligible, 'member01'))
+            with self.assertRaises(backend.AccountError):
+                inventory.observe(2, p2, mapped, ok, access, eligible, 'member01')
+            self.assertTrue(backend.same_access(access, eligible, 'member02'))
+        inventory.remove(2)
+        inventory.remove(3)
+        self.assertEqual(inventory.rows(), [['member02', '2001:db8::2', 1]])
+
+    def test_inventory_socket_empty_error_and_restart(self):
+        runtime = Path(self.temp.name) / 'run'
+        runtime.mkdir(mode=0o700)
+
+        async def exercise():
+            loop = asyncio.get_running_loop()
+
+            async def read():
+                return await loop.run_in_executor(None, backend.online_rows)
+
+            with self.assertRaises(backend.AccountError):
+                await read()
+            inventory = backend.SessionInventory()
+            worker = SimpleNamespace(returncode=None)
+            inventory.workers[1] = (worker, 'member01', '2001:db8::1')
+            server = await backend.serve_inventory(inventory)
+            try:
+                self.assertEqual(backend.inventory_path().stat().st_mode & 0o777, 0o600)
+                self.assertEqual(await read(), [['member01', '2001:db8::1', 1]])
+            finally:
+                server.close()
+                await server.wait_closed()
+            with self.assertRaises(backend.AccountError):
+                await read()
+            restarted = await backend.serve_inventory(backend.SessionInventory())
+            try:
+                self.assertEqual(await read(), [])
+            finally:
+                restarted.close()
+                await restarted.wait_closed()
+
+        with patch.object(backend, 'RUNTIME', runtime):
+            asyncio.run(exercise())
 
     def test_auth_log_and_ports(self):
         message = b"<85>Nov 21 00:10:11 dropbear[2]: Password auth succeeded for 'fixture1' from 127.0.0.1:1234"

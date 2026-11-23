@@ -3,8 +3,10 @@
 
 import argparse
 import asyncio
+from collections import Counter
 from contextlib import contextmanager
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -15,6 +17,7 @@ import socket
 import sqlite3
 import stat
 import string
+import struct
 import subprocess
 import sys
 import tempfile
@@ -30,7 +33,8 @@ KEY_TOOL = '/usr/bin/dropbearkey'
 BWRAP = '/usr/bin/bwrap'
 ALPHABET = string.ascii_lowercase + string.digits
 NAME = re.compile(r'(?:[a-z0-9]{4,32}|trial-[a-z0-9]{12})\Z')
-AUTH = re.compile(rb"^Password auth succeeded for '([a-z0-9-]{4,32})' from [0-9a-fA-F:.%\[\]-]+(?::[0-9]+)?$")
+# Match the success event, but never use its peer text as the source IP.
+AUTH = re.compile(rb"^Password auth succeeded for '([a-z0-9-]{4,32})' from [^,\s]+$")
 SCHEMA = '''CREATE TABLE IF NOT EXISTS accounts (
     username TEXT PRIMARY KEY, kind TEXT NOT NULL, created INTEGER NOT NULL,
     expires INTEGER NOT NULL, ip_limit INTEGER NOT NULL, sessions INTEGER NOT NULL,
@@ -323,7 +327,114 @@ def auth_username(line):
     return match[1].decode('ascii') if match else None
 
 
-async def handle_client(client, sessions):
+def peer_ip(peer):
+    address = ipaddress.ip_address(peer[0].split('%', 1)[0])
+    if address.version == 6:
+        if address.ipv4_mapped is not None:
+            return str(address.ipv4_mapped)
+        scope = peer[3] if len(peer) == 4 else 0
+        if scope:
+            return f'{address}%{scope}'
+    return str(address)
+
+
+class SessionInventory:
+    def __init__(self):
+        self.workers = {}
+
+    def observe(self, worker, process, peer, entry, original, eligible, owner):
+        observed = auth_username(entry)
+        if observed is None:
+            return owner
+        if not same_access(original, eligible, observed) or (owner is not None and owner != observed):
+            raise AccountError('Sesi tidak lagi memenuhi syarat.')
+        if process.returncode is None:
+            self.workers.setdefault(worker, (process, observed, peer_ip(peer)))
+        return observed
+
+    def remove(self, worker):
+        self.workers.pop(worker, None)
+
+    def rows(self):
+        counts = Counter((name, ip) for process, name, ip in self.workers.values() if process.returncode is None)
+        return [[name, ip, count] for (name, ip), count in sorted(counts.items())]
+
+
+def local_uid(sock):
+    return struct.unpack('iII', sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('iII')))[1]
+
+
+def inventory_path():
+    return RUNTIME / 'inventory.sock'
+
+
+async def serve_inventory(inventory):
+    path = inventory_path()
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.geteuid():
+            raise AccountError('Path inventaris sesi tidak aman.')
+        path.unlink()
+
+    async def respond(_reader, writer):
+        try:
+            if local_uid(writer.get_extra_info('socket')) == os.geteuid():
+                payload = json.dumps({'version': 1, 'rows': inventory.rows()}, separators=(',', ':'))
+                writer.write(payload.encode('ascii') + b'\n')
+                await asyncio.wait_for(writer.drain(), timeout=1)
+        except (OSError, asyncio.TimeoutError):
+            pass
+        finally:
+            writer.close()
+
+    server = await asyncio.start_unix_server(respond, path=str(path))
+    try:
+        path.chmod(0o600)
+    except OSError:
+        server.close()
+        await server.wait_closed()
+        raise
+    return server
+
+
+def online_rows():
+    try:
+        secret_path(RUNTIME, True)
+        path = inventory_path()
+        info = path.lstat()
+        if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            raise ValueError('unsafe socket')
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(2)
+            client.connect(str(path))
+            if local_uid(client) != os.geteuid():
+                raise ValueError('wrong producer UID')
+            with client.makefile('rb') as stream:
+                raw = stream.readline(32769)
+        if len(raw) > 32768 or not raw.endswith(b'\n'):
+            raise ValueError('missing or oversized response')
+        payload = json.loads(raw)
+        rows = payload['rows']
+        if payload['version'] != 1 or not isinstance(rows, list) or len(rows) > 128:
+            raise ValueError('unsupported response')
+        for name, ip, count in rows:
+            if (not isinstance(name, str) or not NAME.fullmatch(name) or not isinstance(ip, str)
+                    or type(count) is not int or not 1 <= count <= 128):
+                raise ValueError('invalid row')
+            address, _, scope = ip.partition('%')
+            if scope and (not scope.isascii() or not scope.isdecimal() or ':' not in address):
+                raise ValueError('invalid scope')
+            ipaddress.ip_address(address)
+        return rows
+    except (OSError, ValueError, TypeError, KeyError, AccountError):
+        raise AccountError('Data sesi Dropbear Nathaya tidak dapat dibaca. Periksa layanan lalu coba lagi.') from None
+
+
+async def handle_client(client, peer, sessions, inventory):
+    worker = asyncio.current_task()
     process = None
     poll = None
     line = None
@@ -349,16 +460,14 @@ async def handle_client(client, sessions):
             line = asyncio.create_task(loop.sock_recv(log_socket, 8192))
             while not poll.done():
                 await asyncio.wait((poll, line), timeout=0.5, return_when=asyncio.FIRST_COMPLETED)
+                if poll.done() or process.returncode is not None:
+                    break
                 eligible = active_accounts()
                 if line.done():
                     entry = line.result()
                     if not entry:
                         break
-                    observed = auth_username(entry)
-                    if observed is not None:
-                        if not same_access(users, eligible, observed) or (owner is not None and owner != observed):
-                            break
-                        owner = observed
+                    owner = inventory.observe(worker, process, peer, entry, users, eligible, owner)
                     line = asyncio.create_task(loop.sock_recv(log_socket, 8192))
                 if owner is None:
                     if time.monotonic() - start > 20 or any(not same_access(users, eligible, name) for name in users):
@@ -369,6 +478,7 @@ async def handle_client(client, sessions):
         # Do not forward the daemon's stderr, account information, or socket data to logs.
         pass
     finally:
+        inventory.remove(worker)
         client.close()
         if line is not None:
             line.cancel()
@@ -380,7 +490,7 @@ async def handle_client(client, sessions):
             except ProcessLookupError:
                 pass
             await process.wait()
-        sessions.discard(asyncio.current_task())
+        sessions.discard(worker)
 
 
 async def serve():
@@ -394,15 +504,17 @@ async def serve():
             raise AccountError('Dropbear tidak dapat dijalankan di namespace terisolasi; listener tidak dibuka.')
     sockets = []
     sessions = set()
+    inventory = SessionInventory()
+    inventory_server = None
     loop = asyncio.get_running_loop()
 
     async def accept(listener):
         while True:
-            client, _ = await loop.sock_accept(listener)
+            client, peer = await loop.sock_accept(listener)
             if len(sessions) >= 128:
                 client.close()
             else:
-                sessions.add(asyncio.create_task(handle_client(client, sessions)))
+                sessions.add(asyncio.create_task(handle_client(client, peer, sessions, inventory)))
 
     try:
         for port in read_ports():
@@ -413,6 +525,7 @@ async def serve():
             listener.bind(('::', port))
             listener.listen(128)
             listener.setblocking(False)
+        inventory_server = await serve_inventory(inventory)
         if addr := os.environ.get('NOTIFY_SOCKET'):
             with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as notifier:
                 notifier.connect('\0' + addr[1:] if addr.startswith('@') else addr)
@@ -421,6 +534,10 @@ async def serve():
     finally:
         for listener in sockets:
             listener.close()
+        if inventory_server is not None:
+            inventory_server.close()
+            await inventory_server.wait_closed()
+            inventory_path().unlink(missing_ok=True)
 
 
 def trial_duration_args(ip_limit, duration):
@@ -436,7 +553,7 @@ def main():
     parser.add_argument('operation', choices=('serve', 'available', 'create', 'trial', 'list', 'table',
                                              'action-table', 'action-view', 'delete', 'renew', 'detail',
                                              'expired-table', 'expired-view', 'delete-expired', 'delete-all-expired',
-                                             'password', 'lock', 'unlock', 'ports'))
+                                             'password', 'lock', 'unlock', 'ports', 'online'))
     parser.add_argument('values', nargs='*')
     args = parser.parse_args()
     operation, values = args.operation, args.values
@@ -447,6 +564,9 @@ def main():
         asyncio.run(serve())
     elif operation == 'ports':
         print(' '.join(map(str, read_ports())))
+    elif operation == 'online' and not values:
+        for row in online_rows():
+            print(*row, sep='\t')
     elif operation == 'create' and len(values) == 3:
         username, ip_limit, duration = values
         print(create('member', username, sys.stdin.readline(66).rstrip('\n'), int(ip_limit), int(duration)))

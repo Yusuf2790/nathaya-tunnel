@@ -23,6 +23,7 @@ ssh_backend() {
         table) printf 'member01\tmember\t1\t4102444800\t0\t2\t0\t0\n' ;;
         action-table) printf 'member01\tmember\t1\t4102444800\t0\t2\t0\t0\tidentity\n' ;;
         action-view) printf '4102444800\t0\tAktif\ttoken\t4105036800\n' ;;
+        online) printf 'member01\t2001:db8::1\t2\n' ;;
         expired-table) printf '1\tbatch\nmember01\tmember\t1\t2\t0\t2\t0\t0\tidentity\n' ;;
         expired-view) printf '2\t0\tExpired\ttoken\t0\n' ;;
         detail) printf '%s\n' member01 member 1 4102444800 0 2 0 0 ;;
@@ -123,6 +124,14 @@ def main():
         os.write(fd, b'a\n')
         expect('Hapus semua 1 akun expired ini? [y/n]:')
         os.write(fd, b'\x03')
+        expect('Pilih menu SSH:')
+        os.write(fd, b'5\n')
+        expect('2001:db8::1 | 2')
+        expect('Pilihan: ')
+        os.write(fd, b'r\n')
+        expect('2001:db8::1 | 2')
+        expect('Pilihan: ')
+        os.write(fd, b'z\n')
         expect('Pilih menu SSH:')
         os.write(fd, b'z\n')
         expect('OUTER INT RESTORED')

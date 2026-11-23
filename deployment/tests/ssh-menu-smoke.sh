@@ -9,10 +9,21 @@ source "$NATHAYA_BASE/modules/menu/ssh.sh"
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 
+ssh_ready() { [[ ${online_fixture:-normal} != stopped ]]; }
 get_width() { printf '%s\n' "${test_width:-50}"; }
 ssh_backend() {
     case "$1" in
         available) [[ "$2" != taken ]] ;;
+        online)
+            case "${online_fixture:-normal}" in
+                error) printf 'fixture socket offline\n' >&2; return 1 ;;
+                empty) return 0 ;;
+            esac
+            if [[ "${online_fixture:-normal}" == refresh ]]; then
+                if [[ -e "$work/online-refreshed" ]]; then return 0; fi
+                touch "$work/online-refreshed"
+            fi
+            printf 'member01\t192.0.2.10\t2\nmember01\t2001:db8::1\t1\nmember02\t2001:db8:aaaa:bbbb:cccc:dddd:eeee:ffff\t1\n' ;;
         table)
             printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
                 member01 member 1 4102444800 0 2 0 0 \
@@ -250,7 +261,8 @@ check_table_style() {
         accounts+=("$line"); dates+=(21/11/26); statuses+=(Aktif); limits+=(Unlimited)
     done
     ssh_account_table 0 105 > "$work/style"
-    grep -Fq "$orange"'100.'"$cyan" "$work/style"
+    grep -Fq "$orange"'100.'"$reset"'  member100' "$work/style"
+    if grep -Fq "$reset$cyan"'  member100' "$work/style"; then exit 1; fi
     grep -Fq "$cyan"' NO.  USERNAME' "$work/style"
     line=$cyan$(repeat_char '─' "$ssh_width")$reset
     [[ $(head -n 1 "$work/style") == "$line" ]]
@@ -315,6 +327,45 @@ grep -Fq 'Hapus semua 2 akun expired ini? [y/n]:' "$work/expired-all"
 grep -Fq 'Daftar expired berubah.' "$work/expired-all"
 grep -Fq '2 akun expired berhasil dihapus.' "$work/expired-all"
 grep -Fq 'Tidak ada akun SSH expired' "$work/expired-all"
+
+online_fixture=refresh test_width=32 ssh_online_menu > "$work/online-refresh" <<'INPUT'
+r
+z
+INPUT
+[[ $(grep -Fc 'CHECK USER LOGIN' "$work/online-refresh") == 2 ]]
+grep -Eq 'Total user online +: 2$' "$work/online-refresh"
+grep -Eq 'Total sesi aktif +: 4$' "$work/online-refresh"
+grep -Fq '192.0.2.10 | 2' "$work/online-refresh"
+grep -Fxq '  2001:db8:aaaa:bbbb:cccc:dddd:e' "$work/online-refresh"
+grep -Fxq '  eee:ffff' "$work/online-refresh"
+grep -Fq 'Tidak ada user SSH yang online' "$work/online-refresh"
+if grep -Fq $'\033' "$work/online-refresh"; then exit 1; fi
+for unavailable in error stopped; do
+    online_fixture=$unavailable ssh_online_menu > "$work/online-error" <<'INPUT'
+z
+INPUT
+    grep -Fq 'Data sesi' "$work/online-error"
+    if grep -Fq 'Tidak ada user SSH yang online' "$work/online-error"; then exit 1; fi
+done
+rc=0
+online_fixture=empty ssh_online_menu > "$work/online-exit" <<'INPUT' || rc=$?
+x
+INPUT
+[[ $rc == 10 ]]
+
+check_online_style() {
+    local ssh_width="$1" CYAN=$'\033[1;36m' ORANGE=$'\033[38;5;208m' RESET=$'\033[0m' line
+    local -a names=(fixture01) peers=(192.0.2.10) counts=(2)
+    ssh_login_table > "$work/login-style"
+    grep -Fq "$ORANGE"'1.'"$RESET"'  fixture01' "$work/login-style"
+    grep -Fq "$CYAN"'NO.  USERNAME' "$work/login-style"
+    line=$CYAN$(repeat_char '─' "$ssh_width")$RESET
+    [[ $(tail -n 1 "$work/login-style") == "$line" ]]
+    [[ $(grep -Fc "$line" "$work/login-style") == 3 ]]
+    if (( ssh_width == 32 )); then grep -Fxq '  192.0.2.10 | 2' "$work/login-style"; fi
+}
+check_online_style 64
+check_online_style 32
 
 ssh_width=48
 ssh_detail_lines() { ssh_row Username 'fixture'; }

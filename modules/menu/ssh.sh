@@ -338,8 +338,94 @@ ssh_table_line() {
     printf '%b\n' "$RESET"
 }
 
+ssh_table_number() {
+    local width="$1" marker="$2."
+    printf '%*s%b%s%b  ' "$((width - ${#marker}))" '' "$ORANGE" "$marker" "$RESET"
+}
+
+ssh_login_table() {
+    local i name ip name_width=8 ip_width=9 no_width=3 count room offset wide=0
+    count=${#names[@]}
+    if (( ${#count} + 1 > no_width )); then no_width=$((${#count} + 1)); fi
+    for i in "${!names[@]}"; do
+        name=${names[i]}; ip=${peers[i]}
+        if (( ${#name} > name_width )); then name_width=${#name}; fi
+        if (( ${#ip} > ip_width )); then ip_width=${#ip}; fi
+    done
+    ssh_table_line
+    if (( no_width + name_width + ip_width + 16 <= ssh_width )); then
+        wide=1
+        printf '%b%*s  %-*s  %-*s  %10s%b\n' "$CYAN" "$no_width" 'NO.' \
+            "$name_width" USERNAME "$ip_width" 'IP SUMBER' 'SESI AKTIF' "$RESET"
+    else
+        printf '%b%*s  USERNAME\n  IP SUMBER / SESI AKTIF%b\n' "$CYAN" "$no_width" 'NO.' "$RESET"
+    fi
+    ssh_table_line
+    room=$((ssh_width - no_width - 2))
+    for i in "${!names[@]}"; do
+        ssh_table_number "$no_width" "$((i + 1))"
+        name=${names[i]}; ip=${peers[i]}
+        if (( wide )); then
+            printf '%-*s  %-*s  %10s\n' "$name_width" "$name" "$ip_width" "$ip" "${counts[i]}"
+        else
+            printf '%s\n' "${name:0:room}"
+            if (( ${#name} > room )); then printf '%*s  %s\n' "$no_width" '' "${name:room}"; fi
+            if (( 2 + ${#ip} + 3 + ${#counts[i]} <= ssh_width )); then
+                printf '  %s | %s\n' "$ip" "${counts[i]}"
+            else
+                # Keep all IPv6 characters on narrow displays, without ellipses.
+                for ((offset=0; offset<${#ip}; offset+=ssh_width-2)); do
+                    printf '  %s\n' "${ip:offset:ssh_width-2}"
+                done
+                printf '  Sesi aktif: %s\n' "${counts[i]}"
+            fi
+        fi
+    done
+    ssh_table_line
+}
+
+ssh_online_menu() {
+    local ssh_width ssh_input data name ip count total users
+    local -a names=() peers=() counts=()
+    local -A unique=()
+    while true; do
+        ssh_page 'CHECK USER LOGIN'
+        names=(); peers=(); counts=(); unique=(); total=0; users=0
+        if ! ssh_ready; then
+            printf '  Data sesi tidak tersedia: layanan Dropbear Nathaya tidak aktif.\n'
+        elif data=$(ssh_backend online 2>&1); then
+            while IFS=$'\t' read -r name ip count; do
+                [[ -n "$name" ]] || continue
+                names+=("$name"); peers+=("$ip"); counts+=("$count")
+                if [[ -z "${unique[$name]:-}" ]]; then
+                    unique[$name]=1
+                    users=$((users + 1))
+                fi
+                total=$((total + count))
+            done <<< "$data"
+            if (( total )); then
+                ssh_login_table
+            else
+                printf '  Tidak ada user SSH yang online\n'
+            fi
+            ssh_row 'Total user online' "$users"
+            ssh_row 'Total sesi aktif' "$total"
+        else
+            printf '  Data sesi SSH tidak dapat dibaca: %s\n' "${data:-backend gagal.}"
+        fi
+        printf '\n  %br.%b Muat ulang\n  %bz.%b Kembali ke menu SSH\n  %bx.%b Keluar\n\n' \
+            "$ORANGE" "$RESET" "$GREEN" "$RESET" "$RED" "$RESET"
+        ssh_prompt '  Pilihan: ' || return $?
+        case "${ssh_input,,}" in
+            r) continue ;;
+            z) return 0 ;;
+            x) return "$DASHBOARD_EXIT" ;;
+        esac
+    done
+}
+
 ssh_account_table() {
-    local start="$1" end="$2" i marker no_width=3 name_width=8 name room count
+    local start="$1" end="$2" i no_width=3 name_width=8 name room count
     count=${#accounts[@]}
     if (( ${#count} + 1 > no_width )); then no_width=$((${#count} + 1)); fi
     for name in "${accounts[@]}"; do
@@ -357,8 +443,7 @@ ssh_account_table() {
     ssh_table_line
     room=$((ssh_width - no_width - 2))
     for ((i=start; i<end; i++)); do
-        marker="$((i + 1))."
-        printf '%*s%b%s%b  ' "$((no_width - ${#marker}))" '' "$ORANGE" "$marker" "$CYAN"
+        ssh_table_number "$no_width" "$((i + 1))"
         name=${accounts[i]}
         if (( wide )); then
             printf "$fmt" "$name_width" "$name" "${dates[i]}" "${statuses[i]}" "${limits[i]}"
@@ -367,7 +452,6 @@ ssh_account_table() {
             if (( ${#name} > room )); then printf '%*s  %s\n' "$no_width" '' "${name:room}"; fi
             printf '  %s | %s | %s\n' "${dates[i]}" "${statuses[i]}" "${limits[i]}"
         fi
-        printf '%b' "$RESET"
     done
     ssh_table_line
 }
@@ -658,7 +742,7 @@ show_ssh_menu() {
         ssh_page 'MANAJEMEN SSH'
         for index in "${!labels[@]}"; do
             case "$index" in
-                4|9) draw_menu_item "$((index + 1))" "${labels[index]} — Belum tersedia" ;;
+                9) draw_menu_item "$((index + 1))" "${labels[index]} — Belum tersedia" ;;
                 *) draw_menu_item "$((index + 1))" "${labels[index]}" ;;
             esac
         done
@@ -666,7 +750,8 @@ show_ssh_menu() {
         if (( rc == DASHBOARD_EXIT )); then return "$rc"; fi
         if (( rc == 1 )); then return 0; fi
         case "$ssh_input" in
-            5|10)
+            5) ssh_online_menu || return $? ;;
+            10)
                 ssh_page "${labels[ssh_input - 1]}"
                 printf '  Belum tersedia\n'
                 wait_submenu_navigation "$ssh_width" || return $? ;;

@@ -122,8 +122,8 @@ port yang dipilih; tidak mengubah firewall, port, atau konfigurasi SSH admin.
 Instal ulang mempertahankan modul yang terpasang, akun, dan host key. Restart
 layanan saat instal ulang dapat memutus tunnel pelanggan yang sedang aktif.
 
-Menu SSH menyediakan Create, Delete, Renew, Trial, List Member/detail, List
-User Expired, Lock, dan Unlock. Check User Login dan Limit IP masih bertanda
+Menu SSH menyediakan Create, Delete, Renew, Trial, Check User Login, List
+Member/detail, List User Expired, Lock, dan Unlock. Limit IP masih bertanda
 **Belum tersedia**. Validasi saat ini membatasi username ke 4–32 karakter,
 password ke 1–64 karakter. Create menerima angka hari 1–3650 (contoh `30`,
 bukan `30d`). Trial menerima menit berakhiran `m` atau jam berakhiran `h`,
@@ -182,6 +182,39 @@ Telegram menggunakan bot dan chat admin yang sama, mengirim username dan
 password ke chat tersebut setelah commit akun. Gunakan hanya chat admin yang
 dikendalikan sendiri; kredensial yang dikirim tersimpan di Telegram. Pengiriman
 yang gagal tidak membatalkan akun. Ulangi dari List Member bila diperlukan.
+
+### Check User Login
+
+Buka menu SSH → **[5] Check User Login**. Tekan `r` untuk memuat ulang,
+`z` untuk kembali, atau `x` untuk keluar ke shell. Satu sesi berarti satu
+koneksi SSH terautentikasi yang masih tersambung, termasuk tunnel tanpa
+terminal. Beberapa channel dalam satu koneksi tetap dihitung satu. Tabel
+mengelompokkan koneksi per username dan IP peer yang diamati Dropbear, bukan
+per perangkat. Total user menghitung username unik; total sesi menjumlahkan
+seluruh koneksi. IPv4 dan IPv6 didukung. NAT dapat membuat beberapa perangkat
+terlihat berasal dari IP yang sama.
+
+Inventaris hidup hanya di memori supervisor. Menu membacanya melalui
+socket Unix khusus admin (`/run/nathaya-ssh/inventory.sock`); tidak ada
+kredensial atau riwayat login yang disimpan di inventaris. Socket yang tidak
+tersedia menghasilkan pesan error, bukan daftar kosong. Restart layanan
+menghapus sesi lama dan memutus tunnel yang sedang berjalan; lakukan restart
+pada VPS uji untuk memuat versi supervisor ini. Tidak ada penegakan Limit IP
+atau batas sesi dari layar ini.
+
+Di VPS uji, hubungkan NetMod **langsung ke TCP 109** dengan akun Nathaya:
+
+1. Coba sebelum autentikasi dan dengan password salah. Muat ulang daftar:
+   kedua percobaan itu tidak boleh terlihat. Setelah autentikasi berhasil,
+   satu sesi harus muncul, termasuk saat NetMod hanya menjalankan tunnel.
+2. Buka dua koneksi dari IP yang sama: satu baris harus berjumlah dua sesi.
+   Sambungkan akun yang sama dari IP berbeda (uji juga IPv6): harus muncul
+   baris kedua tetapi total user tidak bertambah. Putus koneksi dan tekan
+   `r`; jumlah sesi harus berkurang.
+3. Dengan dua akun tersambung, Lock atau Delete satu akun. Muat ulang: hanya
+   sesi akun sasaran yang hilang. Restart layanan: sesi lama tidak tampil.
+   Hentikan layanan di VPS uji dan pastikan menu menampilkan error, bukan
+   “Tidak ada user SSH yang online”.
 
 ### Backup / pemulihan SSH
 
