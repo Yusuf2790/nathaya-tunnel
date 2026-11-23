@@ -33,10 +33,7 @@ ssh_read() {
 ssh_cancel_scope() {
     local saved_int ssh_interrupted=0 rc=0
     saved_int=$(trap -p INT)
-    # Bash may resume read after a trap that only sets a flag.
-    trap 'ssh_interrupted=1
-        if [[ ${FUNCNAME[0]-} == ssh_prompt ]]; then return 2; fi
-    ' INT
+    trap 'ssh_interrupted=1' INT
     "$@" || rc=$?
     if [[ -n "$saved_int" ]]; then eval "$saved_int"; else trap - INT; fi
     if (( ssh_interrupted )); then return 2; fi
@@ -46,7 +43,16 @@ ssh_cancel_scope() {
 ssh_prompt() {
     local prompt="$1" rc=0
     if (( ${ssh_interrupted:-0} )); then return 2; fi
-    if [[ -t 0 ]]; then
+    if [[ -t 0 && -v ssh_interrupted ]]; then
+        printf '%s' "$prompt"
+        # A SIGINT near the start of read may leave it waiting for a newline.
+        # Bound each wait so cancellation is noticed without another keystroke.
+        while (( ! ssh_interrupted )); do
+            rc=0
+            IFS= read -r -t 0.25 ssh_input || rc=$?
+            if (( rc <= 128 )); then break; fi
+        done
+    elif [[ -t 0 ]]; then
         IFS= read -r -p "$prompt" ssh_input || rc=$?
     else
         printf '%s' "$prompt"

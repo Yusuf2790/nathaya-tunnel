@@ -27,6 +27,9 @@ ssh_backend() {
 }
 trap 'printf "\nOUTER INT RESTORED\n"; exit 0' INT
 show_ssh_menu
+# Check the restored trap after leaving the menu, outside Bash's blocking read.
+kill -s INT "$BASHPID"
+exit 3
 '''
 
 
@@ -77,7 +80,7 @@ def main():
         expect('Lanjutkan aksi ini? [y/n]')
         os.write(fd, b'\x03')
         expect('Pilih menu SSH:')
-        os.write(fd, b'\x03')
+        os.write(fd, b'z\n')
         expect('OUTER INT RESTORED')
         _, status = os.waitpid(pid, 0)
         reaped = True
