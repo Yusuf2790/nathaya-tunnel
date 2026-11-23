@@ -78,6 +78,73 @@ class BackendTest(unittest.TestCase):
         with backend.database() as db:
             self.assertTrue(backend.name_free(db, 'fixture2'))
 
+    def action(self, name, days=None):
+        with backend.database() as db:
+            row = backend.account_row(db, name, '*')
+            identity = backend.account_identity(row)
+            _, status, token, proposed, _ = backend.action_snapshot(db, name, identity, days)
+            return identity, token, status, proposed
+
+    def test_renew_member_and_trial_in_all_states(self):
+        now = 1800000000
+        with patch.object(backend.time, 'time', return_value=now):
+            for kind in ('member', 'trial'):
+                for state, expires, manual, auto in (
+                    ('Aktif', now + 120, 0, 0), ('Expired', now - 120, 0, 0),
+                    ('Locked', now + 120, 1, now + 300),
+                ):
+                    with self.subTest(kind=kind, state=state):
+                        name = backend.create(kind, 'test' + state.lower(), 'x', 9, 1)
+                        with backend.database() as db:
+                            db.execute('UPDATE accounts SET expires=?, locked=?, auto_until=? WHERE username=?',
+                                       (expires, manual, auto, name))
+                            before = dict(backend.account_row(db, name, '*'))
+                        identity, token, old_status, preview = self.action(name, 30)
+                        expected = max(now, expires) + 30 * 86400
+                        self.assertEqual((old_status, preview), (state, expected))
+                        saved, status = backend.change_account(name, identity, token, days=30)
+                        self.assertEqual((saved, status), (expected, 'Locked' if manual else 'Aktif'))
+                        with backend.database() as db:
+                            after = dict(backend.account_row(db, name, '*'))
+                            self.assertEqual(backend.account_identity(after), identity)
+                        self.assertEqual(after, {**before, 'expires': expected})
+                        with self.assertRaises(backend.StaleAccount):
+                            backend.change_account(name, identity, token, days=30)
+
+    def test_delete_revokes_access_and_rejects_recreated_account(self):
+        with patch.object(backend.time, 'time', return_value=1800000000):
+            member = backend.create('member', 'memberdel', 'x', 0, 7)
+            trial = backend.create('trial', '', '', 0, 1)
+            other = backend.create('member', 'otherssh', 'z', 0, 7)
+            access = backend.active_accounts()
+            for name in (member, trial):
+                identity, token, _, _ = self.action(name)
+                self.assertIsNone(backend.change_account(name, identity, token))
+                with backend.database() as db:
+                    with self.assertRaises(backend.AccountError):
+                        backend.account_row(db, name)
+                self.assertNotIn(name, backend.active_accounts())
+                with self.assertRaises(backend.ReplacedAccount):
+                    backend.change_account(name, identity, token)
+            backend.create('member', member, 'x', 0, 7)
+            after = backend.active_accounts()
+            self.assertTrue(backend.same_access(access, after, other))
+            self.assertFalse(backend.same_access(access, after, member))
+
+    def test_renew_crossing_expiry_requires_fresh_confirmation(self):
+        now = 1800000000
+        with patch.object(backend.time, 'time', return_value=now):
+            name = backend.create('trial', '', '', 0, 1, trial_unit='m')
+            identity, token, _, _ = self.action(name, 1)
+        with patch.object(backend.time, 'time', return_value=now + 61):
+            with self.assertRaises(backend.StaleAccount):
+                backend.change_account(name, identity, token, days=1)
+            _, token, status, preview = self.action(name, 1)
+            self.assertEqual(status, 'Expired')
+        with patch.object(backend.time, 'time', return_value=now + 66):
+            actual, status = backend.change_account(name, identity, token, days=1)
+            self.assertEqual((actual, status), (preview + 5, 'Aktif'))
+
     def test_auth_log_and_ports(self):
         message = b"<85>Nov 21 00:10:11 dropbear[2]: Password auth succeeded for 'fixture1' from 127.0.0.1:1234"
         self.assertEqual(backend.auth_username(message), 'fixture1')

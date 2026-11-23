@@ -4,6 +4,7 @@
 import argparse
 import asyncio
 from contextlib import contextmanager
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -166,6 +167,62 @@ def account_row(db, username, fields=PUBLIC):
     return row
 
 
+class StaleAccount(AccountError):
+    pass
+
+
+class ReplacedAccount(AccountError):
+    pass
+
+
+def account_identity(row):
+    # The encrypted password contains a random nonce. No schema change is needed.
+    # Legacy rows without an envelope fall back to their creation time and salted verifier.
+    seed = [row['username'], row['created'], row['verifier']]
+    if row['sealed'] is not None:
+        seed.append(row['sealed'].hex())
+    return hashlib.sha256(json.dumps(['nathaya-identity-v1', *seed]).encode()).hexdigest()
+
+
+def status_for(expires, locked, auto_until, now):
+    if expires <= now:
+        return 'Expired'
+    return 'Locked' if locked or auto_until > now else 'Aktif'
+
+
+def action_snapshot(db, username, identity, days=None):
+    if days is not None and not 1 <= days <= 3650:
+        raise AccountError('Tambahan masa aktif harus 1–3650 hari.')
+    row = db.execute('SELECT * FROM accounts WHERE username=?', (username,)).fetchone()
+    if row is None or not secrets.compare_digest(account_identity(row), identity):
+        raise ReplacedAccount('Akun hilang atau diganti. Pilih ulang dari daftar.')
+    now = int(time.time())
+    status = status_for(row['expires'], row['locked'], row['auto_until'], now)
+    state = [identity, row['expires'], row['ip_limit'], row['locked'], row['auto_until'], status, days]
+    token = hashlib.sha256(json.dumps(['nathaya-action-v1', *state]).encode()).hexdigest()
+    proposed = max(row['expires'], now) + days * 86400 if days is not None else 0
+    return row, status, token, proposed, now
+
+
+def action_days(value):
+    if re.fullmatch(r'[0-9]{1,4}', value) is None or not 1 <= int(value) <= 3650:
+        raise AccountError('Tambahan masa aktif harus 1–3650 hari.')
+    return int(value)
+
+
+def change_account(username, identity, expected_token, days=None):
+    with database() as db:
+        db.execute('BEGIN IMMEDIATE')
+        row, _, token, proposed, now = action_snapshot(db, username, identity, days)
+        if not secrets.compare_digest(token, expected_token):
+            raise StaleAccount('Data akun berubah. Tinjau konfirmasi terbaru.')
+        if days is None:
+            db.execute('DELETE FROM accounts WHERE username=?', (username,))
+            return None
+        db.execute('UPDATE accounts SET expires=? WHERE username=?', (proposed, username))
+        return proposed, status_for(proposed, row['locked'], row['auto_until'], now)
+
+
 def change_lock(username, lock):
     with database() as db:
         db.execute('BEGIN IMMEDIATE')
@@ -188,10 +245,15 @@ def read_ports():
 
 def active_accounts():
     with database() as db:
-        rows = db.execute('SELECT username, verifier FROM accounts WHERE locked=0 AND expires>? AND auto_until<=?',
-                          (int(time.time()), int(time.time()))).fetchall()
-    return {r['username']: r['verifier'] for r in rows if NAME.fullmatch(r['username'])
+        now = int(time.time())
+        rows = db.execute('SELECT username, created, verifier, sealed FROM accounts '
+                          'WHERE locked=0 AND expires>? AND auto_until<=?', (now, now)).fetchall()
+    return {r['username']: (r['verifier'], account_identity(r)) for r in rows if NAME.fullmatch(r['username'])
             and re.fullmatch(r'\$6\$[./A-Za-z0-9$]+', r['verifier']) and not system_name_used(r['username'])}
+
+
+def same_access(original, eligible, name):
+    return name in original and original[name] == eligible.get(name)
 
 
 def jailed_command(snapshot, probe=False):
@@ -248,7 +310,7 @@ async def handle_client(client, sessions):
             return
         with tempfile.TemporaryDirectory(dir=RUNTIME) as directory:
             snapshot = Path(directory)
-            write_snapshot(snapshot, users)
+            write_snapshot(snapshot, {name: credentials[0] for name, credentials in users.items()})
             log_socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
             log_socket.bind(str(snapshot / 'log.sock'))
             log_socket.setblocking(False)
@@ -270,14 +332,14 @@ async def handle_client(client, sessions):
                         break
                     observed = auth_username(entry)
                     if observed is not None:
-                        if observed not in eligible or observed not in users or (owner is not None and owner != observed):
+                        if not same_access(users, eligible, observed) or (owner is not None and owner != observed):
                             break
                         owner = observed
                     line = asyncio.create_task(loop.sock_recv(log_socket, 8192))
                 if owner is None:
-                    if time.monotonic() - start > 20 or any(name not in eligible for name in users):
+                    if time.monotonic() - start > 20 or any(not same_access(users, eligible, name) for name in users):
                         break
-                elif owner not in eligible:
+                elif not same_access(users, eligible, owner):
                     break
     except (OSError, ValueError, sqlite3.Error, AccountError):
         # Do not forward the daemon's stderr, account information, or socket data to logs.
@@ -347,7 +409,9 @@ def trial_duration_args(ip_limit, duration):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('operation', choices=('serve', 'available', 'create', 'trial', 'list', 'table', 'detail', 'password', 'lock', 'unlock', 'ports'))
+    parser.add_argument('operation', choices=('serve', 'available', 'create', 'trial', 'list', 'table',
+                                             'action-table', 'action-view', 'delete', 'renew', 'detail',
+                                             'password', 'lock', 'unlock', 'ports'))
     parser.add_argument('values', nargs='*')
     args = parser.parse_args()
     operation, values = args.operation, args.values
@@ -366,15 +430,27 @@ def main():
         print(create('trial', '', '', ip_limit, quantity, trial_unit=unit))
     elif operation in ('lock', 'unlock') and len(values) == 1:
         change_lock(values[0], operation == 'lock')
+    elif operation == 'delete' and len(values) == 3:
+        change_account(*values)
+    elif operation == 'renew' and len(values) == 4:
+        expires, status = change_account(*values[:3], days=action_days(values[3]))
+        print(expires, status, sep='\t')
     else:
         with database() as db:
-            if operation == 'list' and not values:
+            if operation == 'action-view' and len(values) in (2, 3):
+                days = action_days(values[2]) if len(values) == 3 else None
+                row, status, token, proposed, _ = action_snapshot(db, values[0], values[1], days)
+                print(row['expires'], row['ip_limit'], status, token, proposed, sep='\t')
+            elif operation == 'list' and not values:
                 for row in db.execute(f'SELECT {PUBLIC} FROM accounts ORDER BY username'):
                     print(row['username'])
             elif operation == 'table' and not values:
                 # Public data only; no verifier, password, or per-account subprocess.
                 for row in db.execute(f'SELECT {PUBLIC} FROM accounts ORDER BY username'):
                     print('\t'.join(str(value) for value in row))
+            elif operation == 'action-table' and not values:
+                for row in db.execute(f'SELECT {PUBLIC}, verifier, sealed FROM accounts ORDER BY username'):
+                    print(*tuple(row)[:-2], account_identity(row), sep='\t')
             elif operation == 'available' and len(values) == 1:
                 if not name_free(db, values[0]):
                     raise AccountError('Username sudah dipakai; pilih nama lain.')
@@ -394,6 +470,12 @@ def main():
 if __name__ == '__main__':
     try:
         main()
+    except StaleAccount as error:
+        print(str(error), file=sys.stderr)
+        sys.exit(3)
+    except ReplacedAccount as error:
+        print(str(error), file=sys.stderr)
+        sys.exit(4)
     except AccountError as error:
         print(str(error), file=sys.stderr)
         sys.exit(1)

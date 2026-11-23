@@ -21,8 +21,10 @@ ssh_ready() { return 0; }
 ssh_backend() {
     case "$1" in
         table) printf 'member01\tmember\t1\t4102444800\t0\t2\t0\t0\n' ;;
+        action-table) printf 'member01\tmember\t1\t4102444800\t0\t2\t0\t0\tidentity\n' ;;
+        action-view) printf '4102444800\t0\tAktif\ttoken\t4105036800\n' ;;
         detail) printf '%s\n' member01 member 1 4102444800 0 2 0 0 ;;
-        create|trial|lock|unlock) printf 'UNEXPECTED MUTATION\n' >&2; exit 2 ;;
+        create|trial|lock|unlock|delete|renew) printf 'UNEXPECTED MUTATION\n' >&2; exit 2 ;;
     esac
 }
 trap 'printf "\nOUTER INT RESTORED\n"; exit 0' INT
@@ -78,6 +80,26 @@ def main():
         expect('Pilihan: ')
         os.write(fd, b'1\n')
         expect('Lanjutkan aksi ini? [y/n]')
+        os.write(fd, b'\x03')
+        expect('Pilih menu SSH:')
+        os.write(fd, b'2\n')
+        expect('Pilihan: ')
+        os.write(fd, b'1\n')
+        expect('Hapus akun ini? [y/n]:')
+        os.write(fd, b'\x03')
+        expect('Pilih menu SSH:')
+        os.write(fd, b'3\n')
+        expect('Pilihan: ')
+        os.write(fd, b'1\n')
+        expect('Tambah durasi (hari): ')
+        os.write(fd, b'\x03')
+        expect('Pilih menu SSH:')
+        os.write(fd, b'3\n')
+        expect('Pilihan: ')
+        os.write(fd, b'1\n')
+        expect('Tambah durasi (hari): ')
+        os.write(fd, b'30\n')
+        expect('Perpanjang akun ini? [y/n]:')
         os.write(fd, b'\x03')
         expect('Pilih menu SSH:')
         os.write(fd, b'z\n')

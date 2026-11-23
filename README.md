@@ -122,8 +122,8 @@ port yang dipilih; tidak mengubah firewall, port, atau konfigurasi SSH admin.
 Instal ulang mempertahankan modul yang terpasang, akun, dan host key. Restart
 layanan saat instal ulang dapat memutus tunnel pelanggan yang sedang aktif.
 
-Menu SSH menyediakan Create, Trial, List Member/detail, Lock, dan Unlock.
-Delete, Renew, Check User Login, List User Expired, dan Limit IP masih bertanda
+Menu SSH menyediakan Create, Delete, Renew, Trial, List Member/detail, Lock,
+dan Unlock. Check User Login, List User Expired, dan Limit IP masih bertanda
 **Belum tersedia**. Validasi saat ini membatasi username ke 4–32 karakter,
 password ke 1–64 karakter. Create menerima angka hari 1–3650 (contoh `30`,
 bukan `30d`). Trial menerima menit berakhiran `m` atau jam berakhiran `h`,
@@ -135,6 +135,20 @@ Di formulir dan konfirmasi, Ctrl+C membatalkan dan kembali ke menu SSH. Pada
 konfirmasi, `n` kembali ke formulir atau daftar dan hanya `y` menjalankan aksi.
 Pada daftar, `z` kembali ke menu SSH dan `x` keluar. Pilih akun dengan nomor
 atau username; `@1234` memilih username numerik tanpa memakai nomor baris.
+
+- **Delete** mencantumkan semua akun Nathaya, termasuk Trial, locked, dan
+  expired. Setelah konfirmasi, backend memeriksa identitas akun lagi sebelum
+  menghapusnya. Penghapusan tidak dapat dibatalkan lewat menu. Supervisor
+  mencabut akses pada pemeriksaan sesi berikutnya, tanpa menghentikan layanan
+  atau memutus sesi akun lain yang sudah terautentikasi.
+- **Renew** mencantumkan akun reguler dan Trial, termasuk locked. Nomor
+  berlanjut dari bagian aktif ke expired. Masukkan tambahan `1–3650` hari.
+  Backend menambah hari dari kedaluwarsa lama atau, untuk akun expired, dari
+  waktu penyimpanan. Pratinjau akun expired bersifat perkiraan; layar hasil
+  menunjukkan tanggal yang benar-benar disimpan. Jika data akun berubah
+  selama konfirmasi, konfirmasi dimuat ulang atau kamu diminta memilih ulang
+  bila akun telah diganti. Renew tidak mengubah password, jenis akun, limit,
+  atau status lock.
 `NATHAYA_TZ` (contoh `Asia/Jakarta`) pada konfigurasi dashboard memilih zona
 waktu detail; jika tidak diatur, gunakan zona VPS.
 
@@ -201,6 +215,12 @@ Di Ubuntu 22.04 **disposabel**, buat akun member dan trial, lalu dari klien uji:
 4. Uji Telegram gagal (chat admin uji, bukan produksi), ulangi pengiriman, dan
    instal ulang. Bandingkan fingerprint host key serta keberadaan akun dan
    password sebelum/sesudah. Uji konflik port 143 sebelum aktivasi jika dipilih.
+5. Dengan minimal dua tunnel aktif, Delete satu akun. Pastikan hanya tunnel
+   akun sasaran putus, kredensialnya tidak bisa login kembali, dan akun sasaran
+   hilang dari daftar. Uji juga pembuatan ulang username yang sama saat layanan
+   berjalan. Verifikasi Renew pada akun reguler dan Trial, termasuk expired dan
+   locked: tanggal tersimpan sesuai hasil, password tetap, dan akun locked
+   tetap ditolak. Uji `n` dan Ctrl+C tanpa perubahan data.
 
 VMESS, VLESS, TROJAN, Bot Akses VPS, dan Set Banner masih belum tersedia.
 

@@ -21,6 +21,23 @@ ssh_backend() {
                 member02 member 1 4102444800 3 2 1 0 \
                 expired1 member 1 2 0 2 1 0 \
                 autolock member 1 4102444800 0 2 1 4102444800 ;;
+        action-table) ssh_backend table | awk '{ print $0 "\tid-" $1 }' ;;
+        action-view)
+            [[ "$3" == "id-$2" ]] || return 4
+            if [[ -f "$work/stale" ]]; then
+                printf '4102444900\t1\tLocked\tnew-token\t4105036900\n'
+            else
+                printf '4102444800\t1\tLocked\told-token\t4105036800\n'
+            fi ;;
+        delete)
+            [[ "$3" == "id-$2" && "$4" == old-token ]] || return 4
+            printf 'delete:%s\n' "$2" >> "$work/mutations" ;;
+        renew)
+            [[ "$3" == "id-$2" && "$5" == 30 ]] || return 4
+            if [[ "$4" == old-token ]]; then touch "$work/stale"; return 3; fi
+            [[ "$4" == new-token ]] || return 3
+            printf 'renew:%s:%s\n' "$2" "$5" >> "$work/mutations"
+            printf '4105037000\tLocked\n' ;;
         detail)
             case "$2" in
                 member01|1234) printf '%s\n' "$2" member 1 4102444800 0 2 0 0 ;;
@@ -155,11 +172,64 @@ test_width=32 ssh_account_menu list 'List Member' > "$work/narrow" <<'INPUT' || 
 x
 INPUT
 [[ $rc == 10 ]]
-grep -Fq 'Expired  | Limit IP | Status' "$work/narrow"
+grep -Fq 'EXPIRED  | STATUS | LIMIT IP' "$work/narrow"
 grep -Fq 'z. Kembali ke menu SSH' "$work/narrow"
 grep -Fq 'x. Keluar' "$work/narrow"
 grep -Fq 'Pilihan:' "$work/narrow"
 if grep -Eq '(^|[[:space:]])Type([[:space:]:]|$)' "$work/members"; then exit 1; fi
+
+ssh_account_menu delete 'DELETE SSH' > "$work/delete-screen" <<'INPUT'
+@0001
+n
+expired1
+
+y
+z
+INPUT
+[[ $(cat "$work/mutations") == 'delete:expired1' ]]
+grep -Fq 'CONFIRM DELETE' "$work/delete-screen"
+grep -Fq 'Hapus akun ini? [y/n]:' "$work/delete-screen"
+grep -Fq 'Masukkan y atau n.' "$work/delete-screen"
+grep -Fq 'HASIL DELETE' "$work/delete-screen"
+ssh_account_menu renew 'RENEW SSH' > "$work/renew-screen" <<'INPUT'
+2
+30
+n
+2
+30
+y
+y
+z
+INPUT
+[[ $(cat "$work/mutations") == $'delete:expired1\nrenew:0001:30' ]]
+grep -Fq 'DAFTAR AKUN SSH AKTIF' "$work/renew-screen"
+grep -Fq 'DAFTAR AKUN SSH EXPIRED' "$work/renew-screen"
+grep -Eq '^ *6\. +expired1' "$work/renew-screen"
+grep -Fq 'Perpanjang akun ini? [y/n]:' "$work/renew-screen"
+[[ $(grep -c 'CONFIRM RENEW' "$work/renew-screen") == 3 ]]
+grep -Fq 'HASIL RENEW' "$work/renew-screen"
+grep -Fq "$(ssh_expiry 4105037000)" "$work/renew-screen"
+
+check_table_style() {
+    local ssh_width="$1" i line cyan=$'\033[1;36m' orange=$'\033[38;5;208m' reset=$'\033[0m'
+    local CYAN=$cyan ORANGE=$orange RESET=$reset
+    local -a accounts=() dates=() limits=() statuses=()
+    for ((i=1; i<=105; i++)); do
+        printf -v line 'member%03d' "$i"
+        accounts+=("$line"); dates+=(21/11/26); statuses+=(Aktif); limits+=(Unlimited)
+    done
+    ssh_account_table 0 105 > "$work/style"
+    grep -Fq "$orange"'100.'"$cyan" "$work/style"
+    grep -Fq "$cyan"' NO.  USERNAME' "$work/style"
+    line=$cyan$(repeat_char '─' "$ssh_width")$reset
+    [[ $(head -n 1 "$work/style") == "$line" ]]
+    [[ $(tail -n 1 "$work/style") == *"$line" ]]
+    [[ $(grep -Fc "$line" "$work/style") == 3 ]]
+    sed 's/'$'\033''\[[0-9;]*m//g' "$work/style" |
+        awk '/member[0-9]+/ && match($0, /member[0-9]+/) != 7 { bad=1 } END { exit bad }'
+}
+check_table_style 50
+check_table_style 32
 
 ssh_width=48
 ssh_detail_lines() { ssh_row Username 'fixture'; }

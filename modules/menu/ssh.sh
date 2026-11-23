@@ -71,7 +71,7 @@ ssh_confirm() {
     while (( $# )); do ssh_row "$1" "$2"; shift 2; done
     printf '\n'
     while true; do
-        ssh_prompt "  $question [y/n] " || return $?
+        ssh_prompt "  $question [y/n]: " || return $?
         case "${ssh_input,,}" in
             y) return 0 ;;
             n) return 1 ;;
@@ -332,60 +332,158 @@ ssh_action_eligible() {
     esac
 }
 
+ssh_table_line() {
+    printf '%b' "$CYAN"
+    repeat_char '─' "$ssh_width"
+    printf '%b\n' "$RESET"
+}
+
 ssh_account_table() {
-    local i no_width=3 name_width=8 name room idx
-    idx=${#accounts[@]}
-    if (( ${#idx} > no_width )); then no_width=${#idx}; fi
+    local start="$1" end="$2" i marker no_width=3 name_width=8 name room count
+    count=${#accounts[@]}
+    if (( ${#count} + 1 > no_width )); then no_width=$((${#count} + 1)); fi
     for name in "${accounts[@]}"; do
         if (( ${#name} > name_width )); then name_width=${#name}; fi
     done
-    local fmt='%*s  %-*s  %-8s  %-9s  %s\n'
+    local fmt='%-*s  %-8s  %-7s  %s\n' wide=0
+    ssh_table_line
     if (( no_width + name_width + 32 <= ssh_width )); then
-        printf "$fmt" "$no_width" No. "$name_width" Username Expired 'Limit IP' Status
-        repeat_char '─' "$ssh_width"; printf '\n'
-        for i in "${!accounts[@]}"; do
-            printf "$fmt" "$no_width" "$((i + 1))" "$name_width" "${accounts[i]}" \
-                "${dates[i]}" "${limits[i]}" "${statuses[i]}"
-        done
+        wide=1
+        printf '%b%*s  %-*s  %-8s  %-7s  %s%b\n' "$CYAN" "$no_width" 'NO.' \
+            "$name_width" USERNAME EXPIRED STATUS 'LIMIT IP' "$RESET"
     else
-        printf '%*s  Username\n  Expired  | Limit IP | Status\n' "$no_width" No.
-        repeat_char '─' "$ssh_width"; printf '\n'
-        room=$((ssh_width - no_width - 2))
-        for i in "${!accounts[@]}"; do
-            name=${accounts[i]}
-            printf '%*s  %s\n' "$no_width" "$((i + 1))" "${name:0:room}"
+        printf '%b%*s  USERNAME\n  EXPIRED  | STATUS | LIMIT IP%b\n' "$CYAN" "$no_width" 'NO.' "$RESET"
+    fi
+    ssh_table_line
+    room=$((ssh_width - no_width - 2))
+    for ((i=start; i<end; i++)); do
+        marker="$((i + 1))."
+        printf '%*s%b%s%b  ' "$((no_width - ${#marker}))" '' "$ORANGE" "$marker" "$CYAN"
+        name=${accounts[i]}
+        if (( wide )); then
+            printf "$fmt" "$name_width" "$name" "${dates[i]}" "${statuses[i]}" "${limits[i]}"
+        else
+            printf '%s\n' "${name:0:room}"
             if (( ${#name} > room )); then printf '%*s  %s\n' "$no_width" '' "${name:room}"; fi
-            printf '  %s | %s | %s\n' "${dates[i]}" "${limits[i]}" "${statuses[i]}"
-        done
+            printf '  %s | %s | %s\n' "${dates[i]}" "${statuses[i]}" "${limits[i]}"
+        fi
+        printf '%b' "$RESET"
+    done
+    ssh_table_line
+}
+
+# Load and confirm against the same account identity shown in the selected row.
+ssh_mutation_confirm() {
+    local action="$1" name="$2" identity="$3" raw expires ip status proposed rc=0
+    local -a args=("$name" "$identity")
+    if [[ "$action" == renew ]]; then
+        if [[ -z "$days" ]]; then
+            ssh_page 'RENEW SSH'
+            ssh_row Username "$name"
+            printf '\n  %bTekan Ctrl+C untuk membatalkan perpanjangan akun.%b\n\n' "$GREEN" "$RESET"
+            while true; do
+                ssh_prompt '  Tambah durasi (hari): ' || return $?
+                if days=$(ssh_duration_value "$ssh_input" '' 3650); then break; fi
+                printf '  Masukkan angka 1–3650, misalnya 30.\n'
+            done
+        fi
+        args+=("$days")
+    fi
+    raw=$(ssh_backend action-view "${args[@]}" 2>&1) || rc=$?
+    if (( rc )); then
+        mutation_message=$raw
+        return 1
+    fi
+    IFS=$'\t' read -r expires ip status action_token proposed <<< "$raw"
+    if [[ ! "$expires" =~ ^[0-9]+$ || ! "$proposed" =~ ^[0-9]+$ || -z "$action_token" ]]; then
+        mutation_message='Data konfirmasi tidak dapat dibaca.'
+        return 1
+    fi
+    if [[ "$action" == delete ]]; then
+        ssh_confirm DELETE 'Hapus akun ini?' Username "$name" \
+            Expired "$(ssh_expiry "$expires" || printf '—')" Status "$status" 'Limit IP' "$(ssh_limit_label "$ip")"
+    else
+        local new_date
+        new_date=$(ssh_expiry "$proposed") || new_date='—'
+        if [[ "$status" == Expired ]]; then new_date+=' (perkiraan)'; fi
+        ssh_confirm RENEW 'Perpanjang akun ini?' Username "$name" \
+            'Expired lama' "$(ssh_expiry "$expires" || printf '—')" 'Tambah durasi' "$days hari" 'Expired baru' "$new_date"
     fi
 }
 
+ssh_account_mutation() {
+    local action="$1" name="$2" identity="$3" days= action_token= mutation_message= rc output saved status
+    while true; do
+        rc=0; ssh_cancel_scope ssh_mutation_confirm "$action" "$name" "$identity" || rc=$?
+        (( rc == 0 )) || { message=$mutation_message; return "$rc"; }
+        rc=0
+        if [[ "$action" == delete ]]; then output=$(ssh_backend delete "$name" "$identity" "$action_token" 2>&1) || rc=$?
+        else output=$(ssh_backend renew "$name" "$identity" "$action_token" "$days" 2>&1) || rc=$?; fi
+        case "$rc" in
+            3) continue ;;  # Mutable state changed: redraw and require a fresh y.
+            4) message=$output; return 1 ;;  # Replaced incarnation: do not retarget it.
+            *) break ;;
+        esac
+    done
+    ssh_page "HASIL ${action^^}"
+    ssh_row Username "$name"
+    if (( rc != 0 )); then
+        ssh_row Hasil "${output:-Operasi tidak berhasil.}"
+    elif [[ "$action" == delete ]]; then
+        ssh_row Hasil 'Akun dihapus; akses dicabut.'
+    else
+        IFS=$'\t' read -r saved status <<< "$output"
+        ssh_row 'Expired baru' "$(ssh_expiry "$saved" || printf '—')"
+        ssh_row Status "$status"
+    fi
+    wait_submenu_navigation "$ssh_width"
+}
+
 ssh_account_menu() {
-    local operation="$1" label="$2" ssh_width ssh_input rc data name output message= now
+    local operation="$1" label="$2" ssh_width ssh_input rc data name output message= now identity kind_index query split i
     local stored_kind created expires ip sessions manual automated status active locked expired
-    local -a accounts=() dates=() limits=() statuses=() account=()
+    local -a accounts=() dates=() limits=() statuses=() identities=() account=()
     while true; do
         ssh_page "$label"
         if [[ -n "$message" ]]; then printf '  %s\n\n' "$message"; message=; fi
-        accounts=(); dates=(); limits=(); statuses=()
+        accounts=(); dates=(); limits=(); statuses=(); identities=()
         active=0 locked=0 expired=0
         now=$(date +%s)
-        if data=$(ssh_backend table 2>/dev/null); then
-            while IFS=$'\t' read -r name stored_kind created expires ip sessions manual automated; do
-                [[ -n "$name" ]] || continue
-                if ! ssh_action_eligible "$operation" "$expires" "$manual" "$automated" "$now"; then continue; fi
-                status=$(ssh_account_status "$expires" "$manual" "$automated" "$now")
-                accounts+=("$name")
-                dates+=("$(ssh_expiry "$expires" '%d/%m/%y' || printf '—')")
-                limits+=("$(ssh_limit_label "$ip")")
-                statuses+=("$status")
-                case "$status" in
-                    Aktif) active=$((active + 1)) ;;
-                    Locked) locked=$((locked + 1)) ;;
-                    Expired) expired=$((expired + 1)) ;;
-                esac
-            done <<< "$data"
-            if (( ${#accounts[@]} )); then ssh_account_table; else printf '  Tidak ada akun yang dapat ditampilkan.\n'; fi
+        query=table
+        if [[ "$operation" == delete || "$operation" == renew ]]; then query=action-table; fi
+        if data=$(ssh_backend "$query" 2>/dev/null); then
+            split=0
+            local -a groups=(all)
+            if [[ "$operation" == renew ]]; then groups=(current expired); fi
+            for kind_index in "${groups[@]}"; do
+                if [[ "$kind_index" == expired ]]; then split=${#accounts[@]}; fi
+                while IFS=$'\t' read -r name stored_kind created expires ip sessions manual automated identity; do
+                    [[ -n "$name" ]] || continue
+                    if [[ "$kind_index" == current ]] && (( expires <= now )); then continue; fi
+                    if [[ "$kind_index" == expired ]] && (( expires > now )); then continue; fi
+                    if ! ssh_action_eligible "$operation" "$expires" "$manual" "$automated" "$now"; then continue; fi
+                    status=$(ssh_account_status "$expires" "$manual" "$automated" "$now")
+                    accounts+=("$name"); identities+=("$identity")
+                    dates+=("$(ssh_expiry "$expires" '%d/%m/%y' || printf '—')")
+                    limits+=("$(ssh_limit_label "$ip")")
+                    statuses+=("$status")
+                    case "$status" in
+                        Aktif) active=$((active + 1)) ;;
+                        Locked) locked=$((locked + 1)) ;;
+                        Expired) expired=$((expired + 1)) ;;
+                    esac
+                done <<< "$data"
+            done
+            if [[ "$operation" == renew ]]; then
+                printf '  %bDAFTAR AKUN SSH AKTIF%b\n' "$CYAN" "$RESET"
+                if (( split )); then ssh_account_table 0 "$split"; else printf '  Tidak ada akun.\n'; fi
+                printf '\n  %bDAFTAR AKUN SSH EXPIRED%b\n' "$CYAN" "$RESET"
+                if (( split < ${#accounts[@]} )); then ssh_account_table "$split" "${#accounts[@]}"; else printf '  Tidak ada akun.\n'; fi
+            elif (( ${#accounts[@]} )); then
+                ssh_account_table 0 "${#accounts[@]}"
+            else
+                printf '  Tidak ada akun yang dapat ditampilkan.\n'
+            fi
             printf '\n'
             if [[ "$operation" == list ]]; then
                 ssh_row 'Total Member' "${#accounts[@]}"
@@ -413,6 +511,13 @@ ssh_account_menu() {
         if [[ "$operation" == list ]]; then
             ssh_member_detail "$name" || return $?
             continue
+        fi
+        if [[ "$operation" == delete || "$operation" == renew ]]; then
+            for i in "${!accounts[@]}"; do
+                if [[ "${accounts[i]}" == "$name" ]]; then identity=${identities[i]}; break; fi
+            done
+            rc=0; ssh_account_mutation "$operation" "$name" "$identity" || rc=$?
+            case "$rc" in 1) continue ;; 2) return 0 ;; *) return "$rc" ;; esac
         fi
         if ! output=$(ssh_backend detail "$name" 2>&1); then message=$output; continue; fi
         mapfile -t account <<< "$output"
@@ -454,7 +559,7 @@ show_ssh_menu() {
         ssh_page 'MANAJEMEN SSH'
         for index in "${!labels[@]}"; do
             case "$index" in
-                1|2|4|6|9) draw_menu_item "$((index + 1))" "${labels[index]} — Belum tersedia" ;;
+                4|6|9) draw_menu_item "$((index + 1))" "${labels[index]} — Belum tersedia" ;;
                 *) draw_menu_item "$((index + 1))" "${labels[index]}" ;;
             esac
         done
@@ -462,11 +567,11 @@ show_ssh_menu() {
         if (( rc == DASHBOARD_EXIT )); then return "$rc"; fi
         if (( rc == 1 )); then return 0; fi
         case "$ssh_input" in
-            2|3|5|7|10)
+            5|7|10)
                 ssh_page "${labels[ssh_input - 1]}"
                 printf '  Belum tersedia\n'
                 wait_submenu_navigation "$ssh_width" || return $? ;;
-            1|4|6|8|9)
+            1|2|3|4|6|8|9)
                 if ! ssh_ready; then
                     ssh_page "${labels[ssh_input - 1]}"
                     printf '  Modul Dropbear belum aktif. Gunakan installer --enable-ssh pada VPS uji.\n'
@@ -475,6 +580,8 @@ show_ssh_menu() {
                 fi
                 case "$ssh_input" in
                     1) ssh_create_wizard member || return $? ;;
+                    2) ssh_account_menu delete 'DELETE SSH' || return $? ;;
+                    3) ssh_account_menu renew 'RENEW SSH' || return $? ;;
                     4) ssh_create_wizard trial || return $? ;;
                     6) ssh_account_menu list 'List Member' || return $? ;;
                     8) ssh_account_menu lock 'Lock SSH' || return $? ;;
