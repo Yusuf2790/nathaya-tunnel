@@ -6,12 +6,13 @@ timer=nathaya-traffic.timer
 ssh_service=nathaya-dropbear.service
 ws_service=nathaya-ws.service
 proxy_service=nathaya-haproxy.service
+connect_service=nathaya-connect.service
 app_files=(
     menu.sh
     modules/common/{functions,telegram,ui}.sh
     modules/dashboard/{dashboard.sh,traffic.sh,traffic.py}
     modules/menu/{domain,main,set_domain,ssh}.sh
-    modules/ssh/{backend,ws_gateway}.py
+    modules/ssh/{backend,ws_gateway,connect_gateway}.py
 )
 deploy_files=(deployment/menu deployment/nathaya-login.sh "deployment/$service" "deployment/$timer")
 local_uid=0
@@ -31,6 +32,8 @@ set_paths() {
     ws_runtime="$base/run/nathaya-ssh"
     ws_cert="$base/etc/nathaya-tunnel/tls/fullchain.pem"
     ws_key="$base/etc/nathaya-tunnel/tls/privkey.pem"
+    certbot_live="$base/etc/letsencrypt/live"
+    connect_key="$base/etc/nathaya-tunnel/connect.key"
     haproxy_bin=/usr/sbin/haproxy
     apt_policy="$base/usr/sbin/policy-rc.d"
     os_release="$base/etc/os-release"
@@ -43,14 +46,15 @@ set_paths() {
 
 usage() {
     cat <<'USAGE'
-Pemakaian: bash install-dashboard.sh [--check] [--enable-login-menu] [--enable-ssh]
+Pemakaian: bash install-dashboard.sh [--check] [--enable-login-menu] [--set-domain] [--use-certbot]
   --help               Tampilkan bantuan ini.
   --check              Jalankan preflight saja; tidak menulis file, memakai APT,
                        mengunci installer, atau mengubah unit systemd.
   --enable-login-menu  Aktifkan menu otomatis pada login SSH root interaktif
                        untuk instalasi baru. Instal ulang mempertahankan pilihan lama.
   --enable-ssh         Kompatibilitas; SSH 109 dan WS/WSS 80/443 selalu dipasang.
-  Siapkan DOMAIN dan TLS penuh di /etc/nathaya-tunnel sebelum instalasi.
+  --set-domain         Tampilkan setup interaktif untuk mengganti domain.
+  --use-certbot        Prioritaskan lineage Certbot yang valid (termasuk saat pembaruan).
 USAGE
 }
 
@@ -132,6 +136,8 @@ check_unit_conflicts() {
 source "$source_dir/deployment/ssh-installer.sh" || exit 1
 # shellcheck source=deployment/ws-installer.sh
 source "$source_dir/deployment/ws-installer.sh" || exit 1
+# shellcheck source=deployment/domain-installer.sh
+source "$source_dir/deployment/domain-installer.sh" || exit 1
 
 check_conflicts() {
     local f dst existing=0 have_app_files=0
@@ -375,8 +381,8 @@ deploy() {
     fi
     deployment_started=1
     units_touched=1
-    for unit in "$proxy_service" "$ws_service" "$timer"; do
-        if [[ ${prior_active[$unit]} == active ]]; then
+    for unit in "$connect_service" "$proxy_service" "$ws_service" "$timer"; do
+        if [[ ${prior_active[$unit]:-inactive} == active ]]; then
             runtime_touched[$unit]=1
             unit_action stop "$unit" || die "gagal menghentikan $unit sebelum deployment"
         fi
@@ -399,11 +405,15 @@ deploy() {
     check_ssh_ports 1
     check_ws_ports 1
     verify_relay
+    if (( connect_enabled )); then activate_connect_unit; fi
     deployment_started=0
 }
 
 main() {
     local mode_install=install request_login=0 login_enabled=0 option ws_domain= vendor_fresh=0
+    local set_domain=0 use_certbot=0 requested_domain= certbot_email= tls_source_cert= tls_source_key=
+    local fresh_ports=0 ssh_ports_display= connect_enabled=0
+    local -a ssh_ports=()
     local -a packages=() managed_units=() staged_deployment=()
     local backup= stage= pending_temp= backup_count=0 deployment_started=0 units_touched=0 lock_fd
     local -a touched=() created_dirs=()
@@ -413,18 +423,26 @@ main() {
             --help|-h) usage; return 0 ;;
             --check) mode_install=check ;;
             --enable-login-menu) request_login=1 ;;
+            --set-domain) set_domain=1 ;;
+            --use-certbot) use_certbot=1 ;;
             --enable-ssh) : ;;  # Compatibility only; all SSH routes are mandatory.
             *) die "opsi tidak dikenal: $option (lihat --help)" ;;
         esac
     done
     validate_host
+    if [[ "$mode_install" == install ]]; then
+        # shellcheck source=modules/common/ui.sh
+        source "$source_dir/modules/common/ui.sh"
+        trap 'cancel_setup' INT
+        setup_domain
+    fi
     check_conflicts
     validate_sources
     missing_dependencies
     if [[ "$mode_install" == check ]]; then
         printf 'Preflight OK. Dependensi yang perlu dipasang: %s. Login otomatis: %s.\n' \
             "${packages[*]:-tidak ada}" "$login_enabled"
-        printf 'Target: SSH 109, WS 80 dan WSS 443 (%s/ssh).\n' "$ws_domain"
+        printf 'Target: SSH %s, WS 80 dan WSS 443 (%s/ssh).\n' "$ssh_ports_display" "$ws_domain"
         if (( EUID != local_uid )); then printf 'Instalasi tetap harus dijalankan sebagai root.\n'; fi
         return 0
     fi
@@ -455,11 +473,13 @@ main() {
     fi
     stage_files
     check_conflicts
+    issue_ws_certificate
     stage_ws_config
     deploy
     printf 'Dashboard terpasang: %s. Jalankan menu.\n' "$target"
     printf 'Timer %s: enabled, active. Login otomatis: %s.\n' "$timer" "$login_enabled"
-    printf 'Dropbear TCP 109, WS TCP 80, WSS TCP 443: enabled, active (%s/ssh).\n' "$ws_domain"
+    printf 'Dropbear TCP %s, WS TCP 80, WSS TCP 443: enabled, active (%s/ssh).\n' "$ssh_ports_display" "$ws_domain"
+    if (( connect_enabled )); then printf 'HTTPS CONNECT TCP 8443: enabled, active.\n'; fi
     printf 'Log/backup (akses root): %s\n' "$backup"
     exit 0  # Jalankan EXIT trap selagi variabel transaksi masih dalam lingkup main.
 }

@@ -46,11 +46,14 @@ run_installer() (
         fi
     }
     verify_relay() { :; }
+    issue_ws_certificate() { :; }
     stage_ws_config() {
         [[ ! -e "$root/state/bad-proxy-config" ]] || die 'konfigurasi HAProxy tidak valid'
         mkdir "$stage/ws"
         printf 'fixture\n' > "$stage/ws/domain"
         printf 'fixture\n' > "$stage/ws/tls.pem"
+        printf 'fixture certificate\n' > "$stage/ws/fullchain.pem"
+        printf 'fixture key\n' > "$stage/ws/privkey.pem"
         printf '%064d\n' 1 > "$stage/ws/relay.key"
         printf '# Managed by Nathaya Tunnel (WS frontend v1)\n' > "$stage/ws/haproxy.cfg"
     }
@@ -147,6 +150,7 @@ run_installer "$host" > "$work/install"
 [[ -x "$host/usr/local/bin/menu" && ! -e "$host/etc/profile.d/nathaya-login.sh" &&
    -L "$host/etc/systemd/system/timers.target.wants/nathaya-traffic.timer" &&
    $(cat "$host/state/nathaya-traffic.timer") == active ]] || fail 'instalasi fresh'
+[[ $(cat "$host/etc/nathaya-tunnel/ssh-ports.conf") == "109 143" ]] || fail 'port SSH fresh bukan 109/143'
 for unit in nathaya-dropbear.service nathaya-ws.service nathaya-haproxy.service; do
     [[ $(cat "$host/state/$unit") == active ]] || fail "layanan wajib tidak aktif: $unit"
 done
@@ -183,6 +187,9 @@ host=$(fixture ws-preflight)
 touch "$host/state/want-package" "$host/state/conflict-80"
 expect_failure "$host" 'Benturan TCP 80'
 rm "$host/state/conflict-80"
+touch "$host/state/conflict-143"
+expect_failure "$host" 'Benturan TCP 143'
+rm "$host/state/conflict-143"
 touch "$host/state/no-tls"
 expect_failure "$host" 'TLS belum lengkap'
 [[ ! -e "$host/state/apt" && ! -e "$host/state/actions" ]] || fail 'preflight melakukan perubahan'
@@ -202,6 +209,17 @@ expect_failure "$host" 'Rollback deployment selesai' --enable-login-menu
 [[ ! -e "$host/usr/local/bin/menu" && ! -e "$host/etc/profile.d/nathaya-login.sh" && ! -e "$host/opt/nathaya" &&
    ! -e "$host/etc/systemd/system/nathaya-traffic.timer" && ! -e "$host/etc/systemd/system/timers.target.wants" &&
    -e "$host/state/package-installed" ]] || fail 'rollback fresh menghapus paket atau menyisakan deployment'
+
+host=$(fixture explicit-ports)
+mkdir -p "$host/etc/nathaya-tunnel"
+printf '109\n' > "$host/etc/nathaya-tunnel/ssh-ports.conf"
+printf '%064d\n' 7 > "$host/etc/nathaya-tunnel/connect.key"
+run_installer "$host" > "$work/explicit-ports.out"
+[[ $(cat "$host/etc/nathaya-tunnel/ssh-ports.conf") == 109 ]] || fail 'port admin tertimpa'
+[[ $(cat "$host/state/nathaya-connect.service") == active ]] || fail 'CONNECT opsional tidak aktif'
+rm -- "$host/etc/nathaya-tunnel/connect.key"
+run_installer "$host" > "$work/connect-disabled.out"
+[[ $(cat "$host/state/nathaya-connect.service") == inactive ]] || fail 'CONNECT tanpa kunci masih aktif'
 
 host=$(fixture login)
 run_installer "$host" --enable-login-menu > "$work/login-install.out"

@@ -108,43 +108,72 @@ Instalasi standar memasang dan mengaktifkan `nathaya-dropbear.service`,
 `nathaya-ws.service` (aiohttp), dan `nathaya-haproxy.service`. Tidak perlu flag.
 `--enable-ssh` masih diterima untuk kompatibilitas dan tidak mengubah hasil.
 
-| Jalur NetMod | Port | Pengaturan |
+| Mode klien | Port | Pengaturan |
 |---|---:|---|
-| SSH langsung | 109 | Host domain VPS, SSH tanpa WS |
-| WS (NoSSL) | 80 | WebSocket standar, host domain VPS, path `/ssh`, TLS mati |
-| WSS | 443 | WebSocket standar, host/SNI domain VPS, path `/ssh`, TLS dan verifikasi sertifikat aktif |
+| SSH langsung (NetMod) | 109 dan 143 | Host domain VPS, SSH tanpa WebSocket. |
+| WS (NoSSL) | 80 | Klien SSH-over-WebSocket standar, host domain VPS, path `/ssh`, TLS mati. |
+| WSS | 443 | Klien SSH-over-WebSocket standar, host dan SNI domain VPS, path `/ssh`, verifikasi TLS aktif. |
+| HTTPS CONNECT (opsional) | 8443 | Proksi TLS domain VPS, autentikasi Basic, tujuan tetap `DOMAIN:109`. Dukungan NetMod belum diuji. |
 
-Gunakan akun Nathaya yang sama di ketiga jalur. Port tambahan SSH langsung 143
-tetap bisa dipilih melalui `/etc/nathaya-tunnel/ssh-ports.conf` berisi `109 143`.
-HTTP biasa di port 80 untuk domain yang valid diarahkan ke HTTPS. Host lain
-atau WebSocket dengan endpoint salah ditolak.
+Instalasi baru tanpa konfigurasi port menyimpan `109 143` di
+`/etc/nathaya-tunnel/ssh-ports.conf`. Instal ulang mempertahankan pilihan admin;
+instalasi lama tanpa file itu tetap memakai 109. HTTP biasa di port 80 untuk
+host yang valid diarahkan ke HTTPS; host asing dan endpoint WS yang salah ditolak.
 
-### Siapkan domain dan sertifikat sebelum instalasi
+### Setup domain dan sertifikat
 
-1. Atur DNS domain ke VPS dan isi `DOMAIN="tunnel.example.com"` di
-   `/etc/nathaya-tunnel/config.conf`, milik root. Pertahankan pengaturan lain.
-2. Sediakan fullchain PEM dan private key PEM tanpa passphrase yang sesuai di
-   `/etc/nathaya-tunnel/tls/fullchain.pem` dan `/etc/nathaya-tunnel/tls/privkey.pem`.
-   File harus milik root; private key harus berizin `0600` atau `0400`.
-   Symlink boleh dipakai jika tujuan dan direktori aman. Klien harus mempercayai CA.
-3. Jalankan `sudo bash install-dashboard.sh --check`, lalu
-   `sudo bash install-dashboard.sh` jika preflight lulus. Port 80, 443, 109,
-   dan listener loopback 18080/18091 tidak boleh berbenturan. Installer tidak
-   mengambil alih `haproxy.service` distro yang aktif/enabled. Saat memasang
-   paket HAProxy baru, unit distro dicegah berjalan otomatis.
+1. Arahkan DNS domain ke VPS. Pada instalasi interaktif tanpa DOMAIN, isi
+   formulir **SETUP DOMAIN**, lihat hasil resolusi dan ringkasan port, lalu
+   konfirmasi. Untuk mengganti domain pada instalasi lama gunakan
+   `sudo bash install-dashboard.sh --set-domain`. `n` atau Ctrl+C sebelum
+   deployment membatalkan setup tanpa menulis konfigurasi. Mode noninteraktif
+   membaca `DOMAIN="tunnel.example.com"` dari `/etc/nathaya-tunnel/config.conf`;
+   pengaturan lain di file itu tetap dipertahankan.
+2. Installer memprioritaskan pasangan PEM admin di
+   `/etc/nathaya-tunnel/tls/{fullchain,privkey}.pem`, lalu mencari lineage Certbot
+   yang cocok. Sertifikat harus berlaku untuk domain dan cocok dengan private
+   key PEM tanpa passphrase. File yang dipasang milik root; private key `0600`.
+3. Jika belum ada sertifikat valid, installer interaktif pada pemasangan baru
+   dapat meminta izin untuk Certbot standalone dan email ACME. TCP 80 harus
+   bebas dan dapat dijangkau publik; DNS yang berhasil di VPS saja tidak
+   membuktikan akses publik. Jika port sudah dipakai, sediakan PEM admin atau
+   terbitkan sertifikat dengan DNS-01 lewat plugin/kredensial yang dikelola
+   admin. Installer tidak menghentikan layanan asing; bebaskan port 80/443
+   secara terencana sebelum deployment.
+4. `sudo bash install-dashboard.sh --check` hanya memeriksa, tidak meminta input,
+   menerbitkan sertifikat, atau mengubah layanan. Jalankan
+   `sudo bash install-dashboard.sh` untuk pemasangan setelah persiapan. Installer
+   memvalidasi HAProxy sebelum aktivasi dan tidak membuka firewall atau mengubah
+   akses SSH admin. Jangan membuka listener internal 18080/18091 ke publik.
 
-Installer tidak membuka firewall atau mengubah SSH admin. Izinkan port publik
-sesuai kebijakan VPS; **jangan** membuka 18080/18091. HAProxy mengambil IP peer
-TCP dan menimpa header relay. Gateway dan supervisor memvalidasi metadata
-melalui loopback dengan kunci internal; ketiga jalur memakai inventaris sama.
+**Pembaruan TLS.** Untuk PEM admin, sediakan pasangan baru dan jalankan ulang
+installer. Untuk Certbot, perbarui lineage dengan metode yang sesuai, lalu
+jalankan `sudo bash install-dashboard.sh --use-certbot` agar sertifikat lineage
+baru dipilih meski salinan lokal belum expired. Standalone memerlukan port 80
+bebas; untuk pembaruan tanpa menghentikan HAProxy, siapkan DNS-01 melalui plugin
+admin atau gunakan sertifikat eksternal. Installer memuat PEM baru dengan
+mengaktifkan ulang frontend setelah validasi; lakukan pada jendela pemeliharaan.
+Rollback memulihkan konfigurasi/PEM dan listener sebelumnya, bukan sesi yang
+sudah putus atau state eksternal Certbot. Lihat [panduan Certbot](https://eff-certbot.readthedocs.io/en/stable/using.html).
 
-Setelah memperbarui sertifikat atau DOMAIN, jalankan installer lagi. ACME
-otomatis belum tersedia. Instal ulang mempertahankan akun, host key, dan kunci
-relay. Gateway dan HAProxy dinyalakan sebelum supervisor SSH disentuh. Jika
-supervisor dan konfigurasi relainya tidak berubah, TCP 109 tidak di-restart.
-Cutover supervisor yang diperlukan dapat memutus tunnel lama. Rollback
-memulihkan file dan listener, bukan sesi yang terputus.
-Rujukan konfigurasi: [HAProxy 2.4](https://docs.haproxy.org/2.4/configuration.html).
+### HTTPS CONNECT terbatas
+
+Tidak aktif secara default. Untuk mengaktifkan, buat
+`/etc/nathaya-tunnel/connect.key` (milik root, `0600`) berisi satu baris acak,
+misalnya dibuat dengan `openssl rand -hex 32` dan disimpan langsung ke file
+berizin ketat. Jalankan preflight dan installer. Untuk menonaktifkan, hapus
+file kunci dan jalankan installer lagi. Jangan membagikan kunci lewat log.
+
+Gunakan proksi HTTPS domain VPS port 8443, username proksi `nathaya`, dan
+password dari file tadi. Target CONNECT harus `DOMAIN:109`. Target ini hanya
+allowlist; gateway selalu meneruskan ke relay Nathaya, bukan ke alamat dari
+klien. Setelah CONNECT, login memakai akun SSH Nathaya biasa. Untuk uji NetMod,
+coba profil proksi **TLS ke proksi**, aktifkan autentikasi proksi, dan kosongkan
+Payload. Jika versi NetMod tidak mendukungnya, jangan kirim Basic auth melalui
+HTTP tanpa TLS. Lihat [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110.html#section-9.3.6).
+
+Supervisor mencatat IP peer listener, bukan header IP dari klien. Semua jalur
+memakai akun, host key, aturan akses, dan inventaris Check User Login yang sama.
 
 Menu SSH menyediakan Create, Delete, Renew, Trial, Check User Login, List
 Member/detail, List User Expired, Lock, dan Unlock. Limit IP masih bertanda
@@ -257,12 +286,15 @@ password ditandai tidak tersedia. Akun Linux lama tidak dimigrasikan otomatis.
 
 ```bash
 bash -n install-dashboard.sh && bash -n deployment/ssh-installer.sh
-bash -n deployment/ws-installer.sh && bash -n deployment/tests/installer-smoke.sh
+bash -n deployment/ws-installer.sh && bash -n deployment/domain-installer.sh
+bash -n deployment/tests/installer-smoke.sh
 bash -n modules/menu/ssh.sh && bash -n modules/common/telegram.sh
 bash -n deployment/tests/ssh-menu-smoke.sh
 git diff --check
 bash deployment/tests/installer-smoke.sh
 bash deployment/tests/ssh-menu-smoke.sh
+bash deployment/tests/domain-tls-test.sh  # fixture OpenSSL, tanpa systemd
+python3 -B deployment/tests/connect-gateway-test.py
 python3 -B deployment/tests/ws-proxy-test.py  # haproxy, openssl, aiohttp; port lokal sementara
 python3 -B deployment/tests/ssh-menu-pty-test.py  # memerlukan PTY
 python3 -B deployment/tests/ssh-backend-test.py  # memerlukan cryptography
@@ -300,7 +332,7 @@ lokal berikut tanpa menjalankan installer terhadap host:
 
 ```bash
 bash -n install-dashboard.sh
-bash -n deployment/tests/installer-smoke.sh
+bash -n deployment/tests/installer-smoke.sh && bash -n deployment/tests/domain-tls-test.sh
 git diff --check
 if command -v shellcheck >/dev/null; then
     shellcheck -x install-dashboard.sh deployment/tests/installer-smoke.sh

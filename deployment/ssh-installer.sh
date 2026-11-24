@@ -18,17 +18,25 @@ select_ssh_module() {
     staged_deployment+=("deployment/$ssh_service")
 }
 
-check_ssh_ports() {
-    local port
-    local -a ports=(109) fields=()
+read_ssh_ports() {
+    local -a fields=()
+    ssh_ports=(109); fresh_ports=0
     check_parent_dirs "$ssh_ports_file"
     if exists "$ssh_ports_file"; then
         [[ -f "$ssh_ports_file" && ! -L "$ssh_ports_file" ]] && owned "$ssh_ports_file" || conflict "$ssh_ports_file"
-        ports=()
-        while read -ra fields || (( ${#fields[@]} )); do ports+=("${fields[@]}"); done < "$ssh_ports_file"
+        ssh_ports=()
+        while read -ra fields || (( ${#fields[@]} )); do ssh_ports+=("${fields[@]}"); done < "$ssh_ports_file"
+    elif [[ ! -f "$unit_dir/$ssh_service" && ! -f "$target/menu.sh" ]] && ! exists "$wrapper"; then
+        ssh_ports=(109 143); fresh_ports=1
     fi
-    case "${ports[*]}" in 109|'109 143'|'143 109') ;; *) die "port tidak valid: $ssh_ports_file (gunakan 109 atau 109 143)" ;; esac
-    for port in "${ports[@]}"; do check_listener "$port" "$ssh_service" "${1:-0}"; done
+    case "${ssh_ports[*]}" in 109|'109 143'|'143 109') ;; *) die "port tidak valid: $ssh_ports_file (gunakan 109 atau 109 143)" ;; esac
+    ssh_ports_display=${ssh_ports[*]}
+}
+
+check_ssh_ports() {
+    local port
+    read_ssh_ports
+    for port in "${ssh_ports[@]}"; do check_listener "$port" "$ssh_service" "${1:-0}"; done
 }
 
 ssh_dependencies() {
@@ -41,6 +49,10 @@ ssh_dependencies() {
 }
 
 stage_ssh_outputs() {
+    if (( fresh_ports )); then
+        printf '109 143\n' > "$stage/ssh-ports.conf"
+        inputs+=("$stage/ssh-ports.conf"); outputs+=("$ssh_ports_file")
+    fi
     inputs+=("$stage/deployment/$ssh_service")
     outputs+=("$unit_dir/$ssh_service")
     if ! exists "$ssh_link"; then

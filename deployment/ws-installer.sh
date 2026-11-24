@@ -2,8 +2,22 @@
 # WS/WSS artifacts participate in the main installer transaction.
 
 select_ws_units() {
-    local unit file link
-    for unit in "$ws_service" "$proxy_service"; do
+    local unit file link key mode
+    local -a units=("$ws_service" "$proxy_service")
+    connect_enabled=0
+    if exists "$connect_key"; then
+        check_parent_dirs "$connect_key"
+        [[ -f "$connect_key" && ! -L "$connect_key" ]] && owned "$connect_key" || conflict "$connect_key"
+        mode=$(stat -c '%a' -- "$connect_key")
+        (( (8#$mode & 0077) == 0 )) || die "Beri izin 0600 pada $connect_key"
+        key=$(cat -- "$connect_key")
+        [[ "$key" =~ ^[a-f0-9]{48,128}$ ]] || die "Gunakan 48–128 karakter heksadesimal acak di $connect_key"
+        connect_enabled=1
+    fi
+    if (( connect_enabled )) || exists "$unit_dir/$connect_service" || exists "$unit_dir/multi-user.target.wants/$connect_service"; then
+        units+=("$connect_service")
+    fi
+    for unit in "${units[@]}"; do
         file="$unit_dir/$unit"; link="$unit_dir/multi-user.target.wants/$unit"
         check_parent_dirs "$file"; check_parent_dirs "$link"
         if exists "$file"; then
@@ -39,49 +53,16 @@ check_vendor_proxy() {
     esac
 }
 
-read_ws_domain() {
-    local line value= field mode found=0 pattern='^[[:space:]]*DOMAIN[[:space:]]*=[[:space:]]*([^[:space:]#]+)[[:space:]]*(#.*)?$'
-    [[ -r "$ws_config" && -f "$ws_config" && ! -L "$ws_config" ]] && owned "$ws_config" ||
-        die "domain belum dikonfigurasi; isi DOMAIN=nama.domain pada $ws_config (milik root)"
-    check_parent_dirs "$ws_config"
-    mode=$(stat -c '%a' -- "$ws_config")
-    (( (8#$mode & 0022) == 0 )) || conflict "$ws_config"
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        if [[ "$line" =~ $pattern ]]; then
-            field=${BASH_REMATCH[1]}
-            case "$field" in \"*\") field=${field:1:-1} ;; \'*\') field=${field:1:-1} ;; esac
-            value=$field; found=$((found + 1))
-        fi
-    done < "$ws_config"
-    local LC_ALL=C label
-    local -a labels=()
-    value=${value,,}
-    [[ $found == 1 && ${#value} -le 253 && "$value" == *.* && "$value" != .* && "$value" != *. &&
-       "$value" != *..* ]] || die "DOMAIN tidak valid di $ws_config; gunakan satu nama DNS tanpa skema atau port"
-    IFS=. read -ra labels <<< "$value"
-    for label in "${labels[@]}"; do
-        [[ "$label" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || die "DOMAIN tidak valid di $ws_config"
-    done
-    [[ ${labels[${#labels[@]}-1]} =~ [a-z] ]] || die 'DOMAIN harus nama DNS, bukan alamat IP'
-    ws_domain=$value
-}
-
 check_ws_tls() {
-    local real_cert real_key key_mode cert_pub key_pub
-    read_ws_domain
-    command -v openssl >/dev/null || die 'OpenSSL diperlukan untuk preflight TLS. Pasang openssl lalu jalankan --check lagi.'
-    real_cert=$(readlink -f -- "$ws_cert") && real_key=$(readlink -f -- "$ws_key") &&
-        [[ -f "$real_cert" && -r "$real_cert" && -s "$real_cert" && -f "$real_key" && -r "$real_key" && -s "$real_key" ]] ||
-        die "TLS belum lengkap: sediakan fullchain di $ws_cert dan private key di $ws_key, lalu ulangi --check"
-    owned "$real_cert" && owned "$real_key" || die 'Sertifikat dan private key harus milik root'
-    check_parent_dirs "$ws_cert"; check_parent_dirs "$ws_key"; check_parent_dirs "$real_cert"; check_parent_dirs "$real_key"
-    key_mode=$(stat -c '%a' -- "$real_key")
-    (( (8#$key_mode & 0077) == 0 )) || die "Private key tidak aman: beri izin 0600 atau 0400 pada $real_key"
-    openssl verify -verify_hostname "$ws_domain" -purpose sslserver -partial_chain -trusted "$real_cert" "$real_cert" >/dev/null 2>&1 ||
-        die 'Sertifikat TLS tidak berlaku atau tidak cocok dengan DOMAIN. Perbaiki fullchain sebelum instalasi.'
-    cert_pub=$(openssl x509 -in "$real_cert" -pubkey -noout 2>/dev/null) &&
-        key_pub=$(openssl pkey -in "$real_key" -passin pass: -pubout 2>/dev/null) &&
-        [[ -n "$cert_pub" && "$cert_pub" == "$key_pub" ]] || die 'Private key TLS tidak valid, terenkripsi, atau tidak cocok dengan sertifikat'
+    domain_file_safe
+    ws_domain=$requested_domain
+    if [[ -z "$ws_domain" ]]; then
+        ws_domain=$(configured_domain) || die "Siapkan DOMAIN di $ws_config atau jalankan instalasi interaktif dengan --set-domain."
+    fi
+    [[ -n $(domain_resolution "$ws_domain") ]] || die "DNS tidak menghasilkan alamat untuk $ws_domain"
+    command -v openssl >/dev/null || die 'OpenSSL diperlukan untuk preflight TLS. Pasang openssl lalu ulangi --check.'
+    check_parent_dirs "$ws_cert"; check_parent_dirs "$ws_key"
+    if ! choose_tls; then confirm_issuance; fi
     if exists "$ws_managed/relay.key"; then
         local token
         token=$(cat -- "$ws_managed/relay.key")
@@ -94,8 +75,17 @@ check_ws_tls() {
 
 ws_dependencies() {
     [[ -x "$haproxy_bin" ]] || packages+=(haproxy)
+    if [[ -n "$certbot_email" ]] && ! command -v certbot >/dev/null; then packages+=(certbot); fi
     "$python_bin" -IB -c 'import aiohttp' >/dev/null 2>&1 || packages+=(python3-aiohttp)
     return 0
+}
+
+tcp_conflict() {
+    local port="$1" reason="$2"
+    if [[ "$port" == 80 ]]; then
+        die "Benturan TCP 80: $reason. Untuk TLS gunakan PEM admin atau DNS-01 bila 80 tidak dapat dipakai ACME; HAProxy tetap memerlukan port 80 bebas."
+    fi
+    die "Benturan TCP $port: $reason"
 }
 
 check_listener() {
@@ -109,7 +99,7 @@ check_listener() {
             if [[ "$address" != *":$port" ]]; then continue; fi
             found=1
             [[ "$pid" =~ ^[1-9][0-9]*$ && "$tail" =~ pid=([0-9]+), ]] ||
-                die "Benturan TCP $port; listener bukan milik $unit (cek ss -ltnp sebagai root)."
+                tcp_conflict "$port" "listener bukan milik $unit (cek ss -ltnp sebagai root)"
             while [[ "$tail" =~ pid=([0-9]+), ]]; do
                 owner=${BASH_REMATCH[1]}; belongs=0
                 if [[ "$owner" == "$pid" ]]; then belongs=1
@@ -118,7 +108,7 @@ check_listener() {
                         if [[ "$cgroup" == "$group" ]]; then belongs=1; break; fi
                     done < "/proc/$owner/cgroup"
                 fi
-                (( belongs )) || die "Benturan TCP $port; listener memiliki PID di luar $unit."
+                (( belongs )) || tcp_conflict "$port" "listener memiliki PID di luar $unit"
                 tail=${tail#*"pid=$owner,"}
             done
         done <<< "$listeners"
@@ -129,7 +119,7 @@ check_listener() {
         for table in /proc/net/tcp /proc/net/tcp6; do
             [[ -r "$table" ]] || continue
             while read -r _ address _ state _; do
-                [[ "$state" != 0A || "$address" != *":$hex" ]] || die "Benturan TCP $port; pasang ss untuk mengidentifikasi listener."
+                [[ "$state" != 0A || "$address" != *":$hex" ]] || tcp_conflict "$port" "pasang ss untuk mengidentifikasi listener"
             done < "$table"
         done
     fi
@@ -141,6 +131,7 @@ check_ws_ports() {
     check_listener 443 "$proxy_service" "${1:-0}"
     check_listener 18080 "$ws_service" "${1:-0}"
     check_listener 18091 "$ssh_service" "${1:-0}"
+    if (( connect_enabled )) && (( ! ${1:-0} )); then check_listener 8443 "$connect_service"; fi
 }
 
 prepare_proxy_apt() {
@@ -189,7 +180,9 @@ stage_ws_config() {
         (umask 077; openssl rand -hex 32 > "$stage/ws/relay.key") || die 'gagal membuat kunci relay'
     fi
     printf '%s\n' "$ws_domain" > "$stage/ws/domain"
-    { cat -- "$ws_cert"; printf '\n'; cat -- "$ws_key"; printf '\n'; } > "$stage/ws/tls.pem"
+    install -m 0644 -- "$tls_source_cert" "$stage/ws/fullchain.pem"
+    install -m 0600 -- "$tls_source_key" "$stage/ws/privkey.pem"
+    { cat -- "$stage/ws/fullchain.pem"; printf '\n'; cat -- "$stage/ws/privkey.pem"; printf '\n'; } > "$stage/ws/tls.pem"
     render_proxy "$stage/ws/tls.pem" > "$stage/ws/verify.cfg"
     "$haproxy_bin" -c -f "$stage/ws/verify.cfg" > "$backup/haproxy-verify.log" 2>&1 ||
         die "konfigurasi HAProxy tidak valid; lihat $backup/haproxy-verify.log"
@@ -198,10 +191,13 @@ stage_ws_config() {
 
 stage_ws_outputs() {
     local unit name link
+    stage_domain_outputs
     for name in relay.key domain tls.pem haproxy.cfg; do
         inputs+=("$stage/ws/$name"); outputs+=("$ws_managed/$name")
     done
-    for unit in "$ws_service" "$proxy_service"; do
+    local -a units=("$ws_service" "$proxy_service")
+    if (( connect_enabled )); then units+=("$connect_service"); fi
+    for unit in "${units[@]}"; do
         inputs+=("$stage/deployment/$unit"); outputs+=("$unit_dir/$unit")
         link="$unit_dir/multi-user.target.wants/$unit"
         if ! exists "$link"; then
@@ -239,6 +235,14 @@ with socket.create_connection(("127.0.0.1", 18091), timeout=3) as probe:
     with probe.makefile("rb") as reply:
         sys.exit(0 if reply.readline(4) == b"OK\n" else 1)
 ' "$ws_managed/relay.key" >> "$backup/deployment.log" 2>&1 || die 'relay SSH gagal memvalidasi metadata internal'
+}
+
+activate_connect_unit() {
+    runtime_touched[$connect_service]=1
+    unit_action start "$connect_service" || die "gagal memulai $connect_service"
+    [[ $(unit_property "$connect_service" UnitFileState) == enabled && $(unit_property "$connect_service" ActiveState) == active ]] ||
+        die "$connect_service belum enabled/active"
+    check_listener 8443 "$connect_service" 1
 }
 
 activate_ws_units() {
