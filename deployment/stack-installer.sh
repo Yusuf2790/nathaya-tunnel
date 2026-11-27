@@ -124,8 +124,8 @@ check_stack_host() {
 
 validate_stack() {
     local d="$1" proto identity cert_pub key_pub
-    if ! run_stack_validator "$d/xray" -p "LoadCredential=config:$d/xray.json" \
-        /bin/sh -c 'exec /run/nathaya-stack-validator run -test -config "$CREDENTIALS_DIRECTORY/config"' >/dev/null 2>&1; then
+    if ! run_stack_validator "$d/xray" -p "LoadCredential=config.json:$d/xray.json" \
+        /bin/sh -c 'exec /run/nathaya-stack-validator run -test -format=json -config "$CREDENTIALS_DIRECTORY/config.json"'; then
         printf 'Konfigurasi Xray ditolak oleh binari yang disediakan.\n' >&2
         return 1
     fi

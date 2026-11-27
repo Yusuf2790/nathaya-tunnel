@@ -9,7 +9,13 @@ draw_service_status() {
     local width="$1" index state badge_width bot_index
     local divider_column inline_bots=0
     local -a names=(SSH XRAY DROPBEAR NGINX OPENVPN)
-    local -a units=(ssh xray dropbear nginx openvpn)
+    local -a states=(
+        "$(get_service_status ssh)"
+        "$(get_service_status nathaya-xray.service)"
+        "$(get_service_status nathaya-dropbear.service)"
+        "$(get_service_status nathaya-nginx.service)"
+        "$(get_service_status nathaya-openvpn-tcp.service nathaya-openvpn-udp.service)"
+    )
     local -a bots=("Bot Akses VPS" "Bot Notifikasi")
     local -a bot_states=("${TELEGRAM_MANAGEMENT_STATUS:-OFF}" "$(notification_bot_status)")
 
@@ -23,7 +29,7 @@ draw_service_status() {
     printf '\n'
     draw_section_title "SERVICE & BOT STATUS" "$width"
     for index in "${!names[@]}"; do
-        state=$(get_service_status "${units[index]}")
+        state=${states[index]}
         badge_width=5
         [[ "$state" == ON ]] && badge_width=4
         printf ' %-8s ' "${names[index]}"

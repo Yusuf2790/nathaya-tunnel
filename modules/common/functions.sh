@@ -120,13 +120,21 @@ except Exception:
 
 # ---------- Status service ----------
 get_service_status() {
-    local service="$1"
+    local service
 
-    if systemctl is-active --quiet "$service" 2>/dev/null; then
-        printf 'ON'
-    else
+    if (( $# == 0 )); then
         printf 'OFF'
+        return
     fi
+
+    for service in "$@"; do
+        if ! systemctl is-active --quiet "$service" 2>/dev/null; then
+            printf 'OFF'
+            return
+        fi
+    done
+
+    printf 'ON'
 }
 
 # ---------- Jumlah akun SSH ----------
@@ -159,7 +167,7 @@ refresh_system_info() {
     get_location_info "$PUBLIC_IP"
 
     SSH_STATUS=$(get_service_status ssh)
-    XRAY_STATUS=$(get_service_status xray)
+    XRAY_STATUS=$(get_service_status nathaya-xray.service)
 
     SSH_TOTAL=$(count_ssh_accounts)
 }

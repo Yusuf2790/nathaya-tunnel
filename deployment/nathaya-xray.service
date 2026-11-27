@@ -5,8 +5,8 @@ After=network.target
 [Service]
 Type=simple
 DynamicUser=yes
-LoadCredential=config:/etc/nathaya-tunnel/managed-stack/xray.json
-ExecStart=/usr/bin/env /opt/nathaya/bin/xray run -config %d/config
+LoadCredential=config.json:/etc/nathaya-tunnel/managed-stack/xray.json
+ExecStart=/usr/bin/env /opt/nathaya/bin/xray run -format=json -config %d/config.json
 NoNewPrivileges=yes
 ProtectHome=yes
 ProtectSystem=strict
