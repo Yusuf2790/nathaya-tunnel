@@ -6,11 +6,12 @@ ConditionPathExists=/etc/nathaya-tunnel/connect.key
 [Service]
 Type=notify
 DynamicUser=yes
+SupplementaryGroups=haproxy
+RuntimeDirectory=nathaya-connect
+RuntimeDirectoryMode=0750
 LoadCredential=relay:/etc/nathaya-tunnel/managed-ws/relay.key
 LoadCredential=domain:/etc/nathaya-tunnel/managed-ws/domain
 LoadCredential=proxy_auth:/etc/nathaya-tunnel/connect.key
-LoadCredential=certificate:/etc/nathaya-tunnel/tls/fullchain.pem
-LoadCredential=private_key:/etc/nathaya-tunnel/tls/privkey.pem
 ExecStart=/usr/bin/python3 -I /opt/nathaya/modules/ssh/connect_gateway.py
 NoNewPrivileges=yes
 ProtectSystem=strict

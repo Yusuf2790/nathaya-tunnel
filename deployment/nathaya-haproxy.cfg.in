@@ -13,6 +13,8 @@ defaults
     timeout server 30s
     timeout tunnel 1h
 
+@CONNECT_FRONTEND@
+
 frontend nathaya_tcp80
     mode tcp
     bind [::]:80 v4v6

@@ -268,13 +268,45 @@ misalnya dibuat dengan `openssl rand -hex 32` dan disimpan langsung ke file
 berizin ketat. Jalankan preflight dan installer. Untuk menonaktifkan, hapus
 file kunci dan jalankan installer lagi. Jangan membagikan kunci lewat log.
 
-Gunakan proksi HTTPS domain VPS port 8443, username proksi `nathaya`, dan
-password dari file tadi. Target CONNECT harus `DOMAIN:109`. Target ini hanya
-allowlist; gateway selalu meneruskan ke relay Nathaya, bukan ke alamat dari
-klien. Setelah CONNECT, login memakai akun SSH Nathaya biasa. Untuk uji NetMod,
-coba profil proksi **TLS ke proksi**, aktifkan autentikasi proksi, dan kosongkan
-Payload. Jika versi NetMod tidak mendukungnya, jangan kirim Basic auth melalui
-HTTP tanpa TLS. Lihat [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110.html#section-9.3.6).
+HAProxy menerminasi TLS di **8443**, lalu meneruskan CONNECT ke gateway lewat
+socket Unix privat. Gateway memerlukan metadata PROXY v2 dari UID HAProxy,
+mengabaikan header IP klien, dan selalu meneruskan ke relay Dropbear Nathaya.
+Tujuan satu-satunya adalah `DOMAIN:109`. Auth proksi Basic memakai username
+`nathaya` dengan password dari file kunci; login SSH di dalam tunnel tetap
+memakai akun Dropbear. CONNECT yang diterima mendapat **200**, lalu aliran SSH
+mentah. WebSocket di `/` tetap mendapat **101** dan membawa frame biner.
+
+**Hasil NetMod yang diketahui:** menurut laporan pengguna, SSH TLS langsung
+ke domain utama SG1 pada TCP 443 berhasil. Itu **bukan** CONNECT. Dukungan
+NetMod Android untuk pilihan proksi `http`, Basic auth, dan **TLS ke proksi**
+di 8443 belum terverifikasi. Uji di VPS uji, dengan sertifikat tetap divalidasi:
+
+1. Pilih proksi `http` dan periksa apakah versi NetMod punya pengaturan TLS
+   **untuk koneksi ke proksi**, bukan hanya TLS SSH. Jika tidak ada, jangan
+   masukkan kredensial proksi atau gunakan HTTP publik sebagai pengganti.
+2. Jika TLS ke proksi didukung, isi host proksi dengan domain VPS dan port
+   `8443`; isi tujuan SSH domain yang sama pada `109`. Aktifkan autentikasi
+   proksi Basic, masukkan kredensial proksi di pengaturan auth, dan gunakan
+   SSH biasa (tanpa TLS kedua atau WebSocket) di dalam tunnel. Coba Payload
+   kosong dulu agar klien yang membuat CONNECT.
+3. Jika perlu Payload manual dan NetMod menerapkannya **setelah TLS ke
+   proksi**, gunakan CONNECT standar berikut. Ganti hostname dengan domain
+   VPS sendiri. Akhiri header dengan baris kosong (CRLF); jangan tempelkan
+   password ke payload, log, atau tangkapan layar.
+
+~~~http
+CONNECT tunnel.example.com:109 HTTP/1.1
+Host: tunnel.example.com:109
+
+~~~
+
+4. Periksa hasil secara terpisah: TLS/hostname valid, CONNECT mendapat `200`
+   (password salah `407`, tujuan lain `403`), banner SSH muncul, akun SSH
+   autentikasi, lalu trafik berhasil diteruskan. Cek IP pada **Check User Login**
+   dan muat ulang setelah disconnect. Fixture lokal hanya menguji TLS, routing,
+   proxy auth, banner dan byte sintetis, bukan autentikasi SSH/NetMod.
+
+Format CONNECT: [RFC 9110 §9.3.6](https://www.rfc-editor.org/rfc/rfc9110.html#section-9.3.6).
 
 Supervisor mencatat IP peer listener, bukan header IP dari klien. Semua jalur
 memakai akun, host key, aturan akses, dan inventaris Check User Login yang sama.

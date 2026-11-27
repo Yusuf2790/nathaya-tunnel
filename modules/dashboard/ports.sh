@@ -44,7 +44,11 @@ show_port_info() {
     port_info_row nathaya-dropbear.service TCP 143 'SSH Nathaya'
     port_info_row nathaya-openvpn-tcp.service TCP 1194 OpenVPN
     port_info_row nathaya-openvpn-udp.service UDP 2200 OpenVPN
-    port_info_row nathaya-connect.service TCP 8443 'HTTPS CONNECT'
+    if systemctl is-active --quiet nathaya-connect.service 2>/dev/null && [[ -S /run/nathaya-connect/proxy.sock ]]; then
+        port_info_row nathaya-haproxy.service TCP 8443 'HTTPS CONNECT'
+    else
+        printf '  %-8s  %-3s  %-3s  %s\n' 8443 TCP OFF 'HTTPS CONNECT'
+    fi
     printf '\n  INTERNAL (loopback)\n'
     port_info_row nathaya-ws.service TCP 18080 'Gateway SSH WS'
     port_info_row nathaya-dropbear.service TCP 18091 'Relay SSH'

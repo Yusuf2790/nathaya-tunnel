@@ -37,6 +37,7 @@ set_paths() {
     ws_key="$base/etc/nathaya-tunnel/tls/privkey.pem"
     certbot_live="$base/etc/letsencrypt/live"
     connect_key="$base/etc/nathaya-tunnel/connect.key"
+    connect_socket="$base/run/nathaya-connect/proxy.sock"
     stack_config="$base/etc/nathaya-tunnel/managed-stack"
     stack_bins="$base/etc/nathaya-tunnel/bin"
     haproxy_bin=/usr/sbin/haproxy
@@ -107,8 +108,8 @@ validate_host() {
 
 validate_sources() {
     local f
-    for f in "${app_files[@]}" "${staged_deployment[@]}" deployment/nathaya-haproxy.cfg.in deployment/render-stack.py \
-        deployment/legacy/{nathaya-ws,nathaya-haproxy}.service; do
+    for f in "${app_files[@]}" "${staged_deployment[@]}" deployment/nathaya-haproxy.cfg.in deployment/nathaya-connect.cfg.in deployment/render-stack.py \
+        deployment/legacy/{nathaya-ws,nathaya-haproxy,nathaya-connect}.service; do
         [[ -f "$source_dir/$f" && ! -L "$source_dir/$f" && -r "$source_dir/$f" ]] ||
             die "file sumber hilang, bukan file biasa, atau tidak terbaca: $f"
     done
@@ -427,7 +428,7 @@ main() {
     local mode_install=install request_login=0 login_enabled=0 option ws_domain= vendor_fresh=0 badvpn_enabled=0
     local -a stack_units=() vendor_added=()
     local set_domain=0 use_certbot=0 requested_domain= certbot_email= tls_source_cert= tls_source_key= ssh_tls_sni=
-    local fresh_ports=0 ssh_ports_display= connect_enabled=0
+    local fresh_ports=0 ssh_ports_display= connect_enabled=0 connect_legacy=0
     local -a ssh_ports=()
     local -a packages=() managed_units=() staged_deployment=()
     local backup= stage= pending_temp= backup_count=0 deployment_started=0 units_touched=0 lock_fd

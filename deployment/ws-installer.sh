@@ -4,7 +4,7 @@
 select_ws_units() {
     local unit file link key mode
     local -a units=("$ws_service" "$proxy_service")
-    connect_enabled=0
+    connect_enabled=0; connect_legacy=0
     if exists "$connect_key"; then
         check_parent_dirs "$connect_key"
         [[ -f "$connect_key" && ! -L "$connect_key" ]] && owned "$connect_key" || conflict "$connect_key"
@@ -24,6 +24,9 @@ select_ws_units() {
             [[ -f "$file" && ! -L "$file" ]] && owned "$file" &&
                 { cmp -s -- "$file" "$source_dir/deployment/$unit" ||
                     cmp -s -- "$file" "$source_dir/deployment/legacy/$unit"; } || conflict "$file"
+            if [[ "$unit" == "$connect_service" ]] && cmp -s -- "$file" "$source_dir/deployment/legacy/$unit"; then
+                connect_legacy=1
+            fi
         fi
         if exists "$link"; then
             [[ -L "$link" && -f "$file" ]] && owned "$link" &&
@@ -92,24 +95,28 @@ tcp_conflict() {
 
 check_listener() {
     local port="$1" unit="$2" must_exist="${3:-0}" protocol="${4:-tcp}" pid=0 group listeners line address tail owner cgroup belongs found=0
-    local ss_proto=t net=tcp listen_state=0A
+    local ss_proto=t net=tcp listen_state=0A alternate="${5:-}" alt_pid=0 alt_group=
     if [[ "$protocol" == udp ]]; then ss_proto=u; net=udp; listen_state=07; fi
     if command -v ss >/dev/null; then
         listeners=$(ss -H "-l${ss_proto}np") || die 'tidak dapat membaca daftar listener dari ss'
         pid=$(unit_property "$unit" MainPID) || die "tidak dapat membaca PID $unit"
         group=$(unit_property "$unit" ControlGroup) || die "tidak dapat membaca cgroup $unit"
+        if [[ -n "$alternate" ]]; then
+            alt_pid=$(unit_property "$alternate" MainPID) || die "tidak dapat membaca PID $alternate"
+            alt_group=$(unit_property "$alternate" ControlGroup) || die "tidak dapat membaca cgroup $alternate"
+        fi
         while IFS= read -r line; do
             read -r _ _ _ address _ tail <<< "$line"
             if [[ "$address" != *":$port" ]]; then continue; fi
             found=1
-            [[ "$pid" =~ ^[1-9][0-9]*$ && "$tail" =~ pid=([0-9]+), ]] ||
+            [[ "$tail" =~ pid=([0-9]+), ]] ||
                 tcp_conflict "$port" "listener bukan milik $unit (cek ss -ltnp sebagai root)"
             while [[ "$tail" =~ pid=([0-9]+), ]]; do
                 owner=${BASH_REMATCH[1]}; belongs=0
-                if [[ "$owner" == "$pid" ]]; then belongs=1
-                elif [[ -n "$group" && -r "/proc/$owner/cgroup" ]]; then
+                if [[ "$owner" == "$pid" || "$owner" == "$alt_pid" ]]; then belongs=1
+                elif [[ -r "/proc/$owner/cgroup" ]]; then
                     while IFS=: read -r _ _ cgroup; do
-                        if [[ "$cgroup" == "$group" ]]; then belongs=1; break; fi
+                        if [[ -n "$cgroup" && ( "$cgroup" == "$group" || "$cgroup" == "$alt_group" ) ]]; then belongs=1; break; fi
                     done < "/proc/$owner/cgroup"
                 fi
                 (( belongs )) || tcp_conflict "$port" "listener memiliki PID di luar $unit"
@@ -136,7 +143,13 @@ check_ws_ports() {
     check_listener 8080 "$proxy_service" "${1:-0}"
     check_listener 18080 "$ws_service" "${1:-0}"
     check_listener 18091 "$ssh_service" "${1:-0}"
-    if (( connect_enabled )) && (( ! ${1:-0} )); then check_listener 8443 "$connect_service"; fi
+    if (( connect_enabled )); then
+        if (( connect_legacy && ! ${1:-0} )); then
+            check_listener 8443 "$proxy_service" 0 tcp "$connect_service"
+        else
+            check_listener 8443 "$proxy_service" "${1:-0}"
+        fi
+    fi
 }
 
 prepare_proxy_apt() {
@@ -181,7 +194,11 @@ finish_proxy_apt() {
 }
 
 render_proxy() {
-    local cert="$1" line token sni_route='# No dedicated SSH TLS SNI configured'
+    local cert="$1" line token connect_frontend='# HTTPS CONNECT disabled' sni_route='# No dedicated SSH TLS SNI configured'
+    if (( connect_enabled )); then
+        connect_frontend=$(cat -- "$source_dir/deployment/nathaya-connect.cfg.in") || return 1
+        connect_frontend=${connect_frontend//@CERT@/$cert}
+    fi
     if [[ -n "$ssh_tls_sni" ]]; then
         sni_route="use_backend nathaya_internal_tls_ssh if { req.ssl_sni -i $ssh_tls_sni }"
     fi
@@ -189,6 +206,7 @@ render_proxy() {
     while IFS= read -r line || [[ -n "$line" ]]; do
         line=${line//@DOMAIN@/$ws_domain}; line=${line//@CERT@/$cert}; line=${line//@TOKEN@/$token}
         line=${line//@SSH_SNI_ROUTE@/$sni_route}
+        line=${line//@CONNECT_FRONTEND@/$connect_frontend}
         printf '%s\n' "$line"
     done < "$source_dir/deployment/nathaya-haproxy.cfg.in"
 }
@@ -263,7 +281,13 @@ activate_connect_unit() {
     unit_action start "$connect_service" || die "gagal memulai $connect_service"
     [[ $(unit_property "$connect_service" UnitFileState) == enabled && $(unit_property "$connect_service" ActiveState) == active ]] ||
         die "$connect_service belum enabled/active"
-    check_listener 8443 "$connect_service" 1
+    check_connect_socket
+    check_listener 8443 "$proxy_service" 1
+}
+
+check_connect_socket() {
+    [[ -S "$connect_socket" && ! -L "$connect_socket" && $(stat -c '%a' -- "$connect_socket") == 660 ]] ||
+        die "Gateway CONNECT tidak membuat socket internal yang aman: $connect_socket"
 }
 
 check_raw_gateway_socket() {

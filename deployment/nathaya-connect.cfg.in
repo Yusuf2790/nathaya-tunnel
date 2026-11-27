@@ -1,0 +1,10 @@
+frontend nathaya_connect_tls
+    mode tcp
+    bind [::]:8443 v4v6 ssl crt @CERT@ alpn http/1.1
+    timeout client 15m
+    default_backend nathaya_connect_private
+
+backend nathaya_connect_private
+    mode tcp
+    timeout server 15m
+    server gateway unix@/run/nathaya-connect/proxy.sock send-proxy-v2

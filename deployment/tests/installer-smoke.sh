@@ -41,6 +41,10 @@ run_installer() (
     }
     check_listener() {
         [[ ! -e "$root/state/conflict-$1" ]] || die "Benturan TCP $1"
+        if [[ "$1" == 8443 ]]; then
+            [[ "$2" == "$proxy_service" ]] || die '8443 seharusnya milik HAProxy'
+            if [[ "${5:-}" == "$connect_service" ]]; then touch "$root/state/legacy-connect-seen"; fi
+        fi
         if [[ "${3:-0}" == 1 ]]; then
             [[ $(cat "$root/state/$2") == active ]] || die "TCP $1 tidak aktif"
         fi
@@ -58,6 +62,7 @@ run_installer() (
     }
     verify_relay() { :; }
     check_raw_gateway_socket() { :; }
+    check_connect_socket() { :; }
     issue_ws_certificate() { :; }
     stage_ws_config() {
         [[ ! -e "$root/state/bad-proxy-config" ]] || die 'konfigurasi HAProxy tidak valid'
@@ -235,6 +240,14 @@ printf '%064d\n' 7 > "$host/etc/nathaya-tunnel/connect.key"
 run_installer "$host" > "$work/explicit-ports.out"
 [[ $(cat "$host/etc/nathaya-tunnel/ssh-ports.conf") == 109 ]] || fail 'port admin tertimpa'
 [[ $(cat "$host/state/nathaya-connect.service") == active ]] || fail 'CONNECT opsional tidak aktif'
+# Simulate the exact previous unit and check migration allowance + rollback.
+cp "$repo/deployment/legacy/nathaya-connect.service" "$host/etc/systemd/system/nathaya-connect.service"
+touch "$host/state/fail-nathaya-connect.service"
+expect_failure "$host" 'Rollback deployment selesai'
+[[ -f "$host/state/legacy-connect-seen" ]] || fail 'listener CONNECT lama tidak dikenali'
+cmp -s "$host/etc/systemd/system/nathaya-connect.service" "$repo/deployment/legacy/nathaya-connect.service" || fail 'rollback tidak memulihkan unit CONNECT lama'
+run_installer "$host" > "$work/connect-migrated.out"
+cmp -s "$host/etc/systemd/system/nathaya-connect.service" "$repo/deployment/nathaya-connect.service" || fail 'unit CONNECT tidak dimigrasi'
 rm -- "$host/etc/nathaya-tunnel/connect.key"
 run_installer "$host" > "$work/connect-disabled.out"
 [[ $(cat "$host/state/nathaya-connect.service") == inactive ]] || fail 'CONNECT tanpa kunci masih aktif'

@@ -127,6 +127,7 @@ async def exercise(work, haproxy):
            .replace('mode 600 user haproxy group haproxy', 'mode 600')
            .replace('/run/nathaya-haproxy/', str(work) + '/')
            .replace('/run/nathaya-ws/', str(work) + '/')
+           .replace('@CONNECT_FRONTEND@', '# CONNECT disabled in this fixture')
            .replace('@SSH_SNI_ROUTE@', '')
            .replace('[::]:80 v4v6', f'127.0.0.1:{http}')
            .replace('[::]:443 v4v6', f'127.0.0.1:{https}')
