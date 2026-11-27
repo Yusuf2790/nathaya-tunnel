@@ -110,7 +110,8 @@ Instalasi standar memasang dan mengaktifkan `nathaya-dropbear.service`,
 
 | Mode klien | Port | Pengaturan |
 |---|---:|---|
-| SSH langsung (NetMod) | 109 dan 143 | Host domain VPS, SSH tanpa WebSocket. |
+| SSH langsung (NetMod) | 80, 109 dan 143 | Host domain VPS, SSH tanpa WebSocket. |
+| SSH melalui TLS (NetMod) | 443 | Host dan SNI domain VPS, verifikasi TLS aktif. |
 | WS (NoSSL) | 80 | Klien SSH-over-WebSocket standar, host domain VPS, path `/`, TLS mati. |
 | WSS | 443 | Klien SSH-over-WebSocket standar, host dan SNI domain VPS, path `/`, verifikasi TLS aktif. |
 | HTTPS CONNECT (opsional) | 8443 | Proksi TLS domain VPS, autentikasi Basic, tujuan tetap `DOMAIN:109`. Dukungan NetMod belum diuji. |
@@ -125,7 +126,7 @@ host yang valid diarahkan ke HTTPS; host asing dan endpoint WS yang salah ditola
 | Profil | Host dan port | Proksi | Payload | Keamanan |
 |---|---|---|---|---|
 | SSH TCP | Domain VPS, TCP 80 | `none` | kosong | `none` |
-| SSH melalui TLS | SNI SSH khusus, TCP 443 | `none` | kosong | SSL/TLS; verifikasi sertifikat aktif |
+| SSH melalui TLS | Domain VPS, TCP 443 | `none` | kosong | SSL/TLS; verifikasi sertifikat aktif |
 
 Kedua profil memakai username/password akun Dropbear Nathaya. Tidak perlu
 WebSocket, header HTTP, atau HTTPS CONNECT untuk profil ini. Di TCP 80, HAProxy
@@ -136,18 +137,20 @@ lebih lambat. HTTP yang diam selama seluruh jendela tidak bisa dibedakan dari
 SSH server-first dan dapat menerima banner SSH. Gunakan 109/143 jika klien
 SSH tidak bisa menunggu; gunakan HTTPS untuk klien web yang lambat memulai.
 
-**TCP 443 memerlukan SNI khusus** agar SSH server-first tidak berbenturan dengan
-HTTPS/WSS/gRPC. Buat satu nama DNS berbeda, misalnya `ssh.tunnel.example.com`,
-yang mengarah ke VPS yang sama. Simpan nama itu (satu baris, milik root) di
-`/etc/nathaya-tunnel/ssh-tls-sni.conf`. Sediakan satu sertifikat TLS yang valid
-untuk **domain web dan nama SSH** (SAN), jalankan `sudo bash install-dashboard.sh --check`,
-lalu installer. Saat menerbitkan sertifikat baru, installer meminta kedua nama
-ke Certbot bila SNI SSH dikonfigurasi. Pada NetMod gunakan nama khusus sebagai
-Host dan SNI bila ada kolom SNI. Tanpa file SNI atau jika NetMod tidak mengirim
-SNI itu, jalur 443 tetap HTTPS biasa; jangan menonaktifkan validasi TLS untuk
-memaksa koneksi. Input SSH biasa tanpa TLS juga bukan profil 443 ini.
+**TCP 443 memakai domain utama dan sertifikat yang sama.** Di NetMod, isi
+domain VPS sebagai Host dan sebagai SNI jika ada kolom SNI. Klien harus memakai
+TLS ke port 443. HAProxy meneruskan HTTP/2 berdasarkan ALPN dan memeriksa
+data awal setelah terminasi TLS untuk membedakan SSH dari HTTP/1.1. Klien
+SSH tanpa ALPN HTTP yang menunggu banner bisa menunggu hingga **5 detik**.
+HTTPS tanpa ALPN yang diam selama seluruh jendela juga bisa menerima banner
+SSH. HTTPS yang menegosiasikan HTTP/1.1 tetap diarahkan ke web jika belum
+mengirim data pada akhir jendela.
 
-HAProxy hanya meneruskan raw SSH dari port 80 atau TLS dengan SNI khusus ke
+Hostname tambahan di `/etc/nathaya-tunnel/ssh-tls-sni.conf` tetap opsional
+untuk profil lama dan merutekan SSH sejak awal melalui SNI. Jika dipakai,
+sertifikat juga harus mencakup nama tambahan itu.
+
+HAProxy meneruskan SSH dari port 80 dan SSH melalui TLS dari port 443 ke
 socket Unix internal. Alamat peer diteruskan melalui PROXY v2 dari proses
 HAProxy yang terverifikasi, lalu melalui relay Nathaya. Check User Login tetap
 mencatat IP asal setelah autentikasi SSH, bukan header pilihan klien.
@@ -172,7 +175,7 @@ OpenVPN memakai paket distro melalui APT. OpenVPN memerlukan `/dev/net/tun`.
 | Listener | Cakupan | Fungsi |
 |---|---|---|
 | TCP 80 | Publik / HAProxy | SSH TCP, SSH WS path `/`; HTTP biasa diarahkan ke HTTPS |
-| TCP 443 | Publik / HAProxy | SSH TLS (SNI khusus), SSH WSS path `/`, Xray WSS dan gRPC; tidak ada rute OpenVPN |
+| TCP 443 | Publik / HAProxy | SSH TLS di domain utama, SSH WSS path `/`, Xray WSS dan gRPC |
 | TCP 8080 | Publik / HAProxy | HTTP redirect; tidak menerima upgrade WebSocket |
 | TCP 109/143 | Publik / Dropbear | SSH langsung; instal ulang mempertahankan port admin Nathaya |
 | TCP 1194, UDP 2200 | Publik / OpenVPN | Listener terpisah dengan autentikasi sertifikat |

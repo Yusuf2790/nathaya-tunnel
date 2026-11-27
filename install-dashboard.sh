@@ -457,7 +457,7 @@ main() {
     if [[ "$mode_install" == check ]]; then
         printf 'Preflight OK. Dependensi yang perlu dipasang: %s. Login otomatis: %s.\n' \
             "${packages[*]:-tidak ada}" "$login_enabled"
-        printf 'Target: SSH %s, WS 80 dan WSS 443 (%s/).\n' "$ssh_ports_display" "$ws_domain"
+        printf 'Target: SSH %s, SSH TCP/WS 80 dan SSH TLS/WSS 443 (%s).\n' "$ssh_ports_display" "$ws_domain"
         if (( EUID != local_uid )); then printf 'Instalasi tetap harus dijalankan sebagai root.\n'; fi
         return 0
     fi
@@ -496,8 +496,8 @@ main() {
     printf 'Timer %s: enabled, active. Login otomatis: %s.\n' "$timer" "$login_enabled"
     printf 'Dropbear TCP %s, WS TCP 80, WSS TCP 443: enabled, active (%s/).\n' "$ssh_ports_display" "$ws_domain"
     printf 'SSH TCP 80: aktif melalui HAProxy (inspeksi hingga 5 detik).\n'
-    if [[ -n "$ssh_tls_sni" ]]; then printf 'SSH TLS 443: SNI %s.\n' "$ssh_tls_sni"
-    else printf 'SSH TLS 443: belum aktif (SNI khusus belum dikonfigurasi).\n'; fi
+    printf 'SSH TLS TCP 443: %s.\n' "$ws_domain"
+    if [[ -n "$ssh_tls_sni" ]]; then printf 'SNI SSH TLS tambahan: %s.\n' "$ssh_tls_sni"; fi
     if (( connect_enabled )); then printf 'HTTPS CONNECT TCP 8443: enabled, active.\n'; fi
     printf 'HAProxy HTTP TCP 8080; Nginx/Xray internal; OpenVPN TCP 1194 dan UDP 2200.\n'
     if (( badvpn_enabled )); then printf 'BadVPN TCP internal 7100/7200/7300 aktif.\n'; else printf 'BadVPN belum aktif (binari terverifikasi tidak disediakan).\n'; fi

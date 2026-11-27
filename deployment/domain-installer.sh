@@ -76,7 +76,7 @@ setup_domain() {
     done
     printf '\n  Hasil resolusi DNS:\n'
     while IFS= read -r answer; do printf '  - %s\n' "$answer"; done <<< "$dns"
-    printf '\n  TCP %s : SSH langsung\n  TCP 80  : WS /\n  TCP 443 : WSS /\n' "$ssh_ports_display"
+    printf '\n  TCP %s : SSH langsung\n  TCP 80  : SSH TCP dan WS /\n  TCP 443 : SSH TLS dan WSS /\n' "$ssh_ports_display"
     printf '  TCP 8080: HTTP redirect\n  TCP 1194 / UDP 2200: OpenVPN\n'
     if exists "$connect_key"; then printf '  TCP 8443: HTTPS CONNECT (opsional)\n'; fi
     while true; do

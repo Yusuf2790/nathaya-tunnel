@@ -34,7 +34,8 @@ frontend nathaya_tls_mux
     tcp-request content accept if { req.ssl_hello_type 1 }
     tcp-request content reject if WAIT_END
     @SSH_SNI_ROUTE@
-    default_backend nathaya_internal_tls_web
+    use_backend nathaya_internal_tls_web if { req.ssl_alpn -m str h2 }
+    default_backend nathaya_internal_tls_mixed
 
 backend nathaya_internal_http
     mode tcp
@@ -50,6 +51,26 @@ backend nathaya_internal_tls_ssh
     mode tcp
     timeout server 1h
     server ssh unix@/run/nathaya-haproxy/ssh-tls.sock send-proxy-v2
+
+backend nathaya_internal_tls_mixed
+    mode tcp
+    timeout server 1h
+    server mixed unix@/run/nathaya-haproxy/mixed-tls.sock send-proxy-v2
+
+frontend nathaya_tls_inspect
+    mode tcp
+    bind unix@/run/nathaya-haproxy/mixed-tls.sock mode 600 user haproxy group haproxy accept-proxy ssl crt @CERT@ alpn http/1.1
+    timeout client 1h
+    tcp-request inspect-delay 5s
+    acl raw_ssh req.payload(0,4) -m str SSH-
+    acl http_method req.payload(0,0) -m reg "^[A-Z]{3,16} "
+    acl http_request req.proto_http
+    acl http_alpn ssl_fc_alpn -i http/1.1
+    tcp-request content accept if raw_ssh or http_method or http_request
+    tcp-request content reject if WAIT_END { req.len gt 0 }
+    use_backend nathaya_ssh_raw if raw_ssh
+    use_backend nathaya_internal_http if http_method or http_request or http_alpn
+    default_backend nathaya_ssh_raw
 
 frontend nathaya_ssh_tls
     mode tcp
@@ -77,20 +98,23 @@ frontend nathaya_public
     acl method_get method GET
     acl method_post method POST
     acl web_only dst_port 8080
+    # On the private HTTP socket, PROXY v2 retains the original destination port.
+    acl secure_frontend ssl_fc
+    acl secure_frontend dst_port 443
     http-request deny deny_status 400 unless { hdr_cnt(host) eq 1 } allowed_host
     http-request deny deny_status 404 if upgrade_present web_only
     http-request deny deny_status 400 if upgrade_present !websocket
     http-request deny deny_status 400 if upgrade_present !websocket_conn
     http-request deny deny_status 400 if upgrade_present !method_get
     http-request deny deny_status 404 if upgrade_present !ssh_path !xray_ws
-    http-request deny deny_status 403 if upgrade_present xray_ws !{ ssl_fc }
-    http-request redirect prefix https://@DOMAIN@ code 308 if !{ ssl_fc } !upgrade_present
+    http-request deny deny_status 403 if upgrade_present xray_ws !secure_frontend
+    http-request redirect prefix https://@DOMAIN@ code 308 if !secure_frontend !upgrade_present
     http-request deny deny_status 404 if !upgrade_present !xray_grpc
     http-request deny deny_status 400 if !upgrade_present xray_grpc !grpc_type
     http-request deny deny_status 400 if !upgrade_present xray_grpc !method_post
     use_backend nathaya_gateway if upgrade_present ssh_path
-    use_backend nathaya_xray_ws if upgrade_present xray_ws { ssl_fc }
-    use_backend nathaya_xray_grpc if !upgrade_present xray_grpc { ssl_fc }
+    use_backend nathaya_xray_ws if upgrade_present xray_ws secure_frontend
+    use_backend nathaya_xray_grpc if !upgrade_present xray_grpc secure_frontend
 
 backend nathaya_gateway
     http-request del-header Forwarded

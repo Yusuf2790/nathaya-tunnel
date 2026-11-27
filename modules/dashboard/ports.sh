@@ -38,14 +38,7 @@ show_port_info() {
     printf '\n  PUBLIK (sesuai firewall VPS)\n'
     printf '  SSH admin: konfigurasi VPS\n'
     port_info_row nathaya-haproxy.service TCP 80 'SSH TCP, WS /, redirect'
-    port_info_row nathaya-haproxy.service TCP 443 'WSS /, Xray WSS/gRPC'
-    if [[ -r /etc/nathaya-tunnel/managed-ws/haproxy.cfg ]]; then
-        if grep -Fq 'use_backend nathaya_internal_tls_ssh if' /etc/nathaya-tunnel/managed-ws/haproxy.cfg; then
-            port_info_row nathaya-haproxy.service TCP 443 'SSH TLS (SNI khusus)'
-        else
-            printf '  SSH TLS 443: SNI belum dikonfigurasi.\n'
-        fi
-    fi
+    port_info_row nathaya-haproxy.service TCP 443 'SSH TLS, WSS /, Xray WSS/gRPC'
     port_info_row nathaya-haproxy.service TCP 8080 'HTTP redirect'
     port_info_row nathaya-dropbear.service TCP 109 'SSH Nathaya'
     port_info_row nathaya-dropbear.service TCP 143 'SSH Nathaya'

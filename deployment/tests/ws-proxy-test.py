@@ -21,7 +21,6 @@ SPEC = importlib.util.spec_from_file_location('ws_gateway', REPO / 'modules/ssh/
 gateway = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(gateway)
 DOMAIN = 'tunnel.example.test'
-SSH_SNI = 'ssh.tunnel.example.test'
 BANNER = b'SSH-2.0-NathayaFixture\r\n'
 TOKEN = 'a' * 64  # Fixture only.
 
@@ -45,7 +44,7 @@ async def h2_fixture(reader, writer):
 
 
 async def grpc_path(https, tls, path):
-    tls.set_alpn_protocols(['h2'])
+    tls.set_alpn_protocols(['http/1.1', 'h2'])
     reader, writer = await asyncio.open_connection('127.0.0.1', https, ssl=tls)
     try:
         assert writer.get_extra_info('ssl_object').selected_alpn_protocol() == 'h2'
@@ -76,7 +75,7 @@ async def grpc_path(https, tls, path):
 async def exercise(work, haproxy):
     cert, key, pem = (work / n for n in ('cert.pem', 'key.pem', 'tls.pem'))
     subprocess.run(['openssl', 'req', '-x509', '-nodes', '-newkey', 'rsa:2048', '-days', '1',
-                    '-subj', '/CN=' + DOMAIN, '-addext', f'subjectAltName=DNS:{DOMAIN},DNS:{SSH_SNI}',
+                    '-subj', '/CN=' + DOMAIN, '-addext', f'subjectAltName=DNS:{DOMAIN}',
                     '-keyout', str(key), '-out', str(cert)], check=True, capture_output=True)
     pem.write_bytes(cert.read_bytes() + key.read_bytes())
     captures = []
@@ -128,11 +127,12 @@ async def exercise(work, haproxy):
            .replace('mode 600 user haproxy group haproxy', 'mode 600')
            .replace('/run/nathaya-haproxy/', str(work) + '/')
            .replace('/run/nathaya-ws/', str(work) + '/')
-           .replace('@SSH_SNI_ROUTE@', f'use_backend nathaya_internal_tls_ssh if {{ req.ssl_sni -i {SSH_SNI} }}')
+           .replace('@SSH_SNI_ROUTE@', '')
            .replace('[::]:80 v4v6', f'127.0.0.1:{http}')
            .replace('[::]:443 v4v6', f'127.0.0.1:{https}')
            .replace('[::]:8080 v4v6', f'127.0.0.1:{extra_http}')
            .replace('dst_port 8080', f'dst_port {extra_http}')
+           .replace('dst_port 443', f'dst_port {https}')
            .replace('127.0.0.1:1010', f'127.0.0.1:{nginx.addresses[0][1]}')
            .replace('127.0.0.1:1013', f'127.0.0.1:{grpc_port}')
            .replace('127.0.0.1:18080', f'127.0.0.1:{gateway_port}')
@@ -177,17 +177,25 @@ async def exercise(work, haproxy):
 
         await ssh_exchange(http)  # Silent SSH, waits for server banner.
         await ssh_exchange(http, client_first=True)
-        await ssh_exchange(https, SSH_SNI)  # Validated hostname + TLS, SSH server-first.
-        # The web SNI must not select the SSH backend.
-        web_reader, web_writer = await asyncio.open_connection(
-            '127.0.0.1', https, ssl=ssl.create_default_context(cafile=str(cert)), server_hostname=DOMAIN)
-        try:
-            web_writer.write(f'GET / HTTP/1.1\r\nHost: {DOMAIN}\r\nConnection: close\r\n\r\n'.encode())
-            await web_writer.drain()
-            assert (await asyncio.wait_for(web_reader.readline(), 3)).startswith(b'HTTP/1.1 404 ')
-        finally:
-            web_writer.close()
-            await web_writer.wait_closed()
+        await ssh_exchange(https, DOMAIN)
+        await ssh_exchange(https, DOMAIN, client_first=True)
+        # Both HTTPS clients use the same domain as SSH. An idle HTTP/1.1
+        # client with ALPN should still reach the web even after inspection ends.
+        for alpn in ([], ['http/1.1']):
+            web_tls = ssl.create_default_context(cafile=str(cert))
+            web_tls.set_alpn_protocols(alpn)
+            web_reader, web_writer = await asyncio.open_connection(
+                '127.0.0.1', https, ssl=web_tls, server_hostname=DOMAIN)
+            try:
+                if alpn:
+                    assert web_writer.get_extra_info('ssl_object').selected_alpn_protocol() == 'http/1.1'
+                    await asyncio.sleep(5.2)
+                web_writer.write(f'GET / HTTP/1.1\r\nHost: {DOMAIN}\r\nConnection: close\r\n\r\n'.encode())
+                await web_writer.drain()
+                assert (await asyncio.wait_for(web_reader.readline(), 3)).startswith(b'HTTP/1.1 404 ')
+            finally:
+                web_writer.close()
+                await web_writer.wait_closed()
         slow_reader, slow_writer = await asyncio.open_connection('127.0.0.1', http)
         try:
             await asyncio.sleep(1)
@@ -230,7 +238,7 @@ async def exercise(work, haproxy):
                     await ws.send_bytes(b'fixture SSH bytes')
                     assert await ws.receive_bytes(timeout=3) == b'fixture SSH bytes'
             expected = f'NATHAYA1 {TOKEN} 127.0.0.1\n'.encode()
-            assert captures == [expected] * 5, captures
+            assert captures == [expected] * 6, captures
             rejected = [(f'ws://127.0.0.1:{http}/wrong', headers, 404),
                         (f'ws://127.0.0.1:{http}/ssh', headers, 404),  # Obsolete SSH path.
                         (f'ws://127.0.0.1:{extra_http}/', headers, 404),
@@ -246,7 +254,7 @@ async def exercise(work, haproxy):
                 else:
                     await ws.close()
                     raise AssertionError('Invalid WebSocket request accepted')
-            assert captures == [expected] * 5
+            assert captures == [expected] * 6
         for name in ('vless-grpc', 'vmess-grpc', 'trojan-grpc', 'ss-grpc'):
             path = '/' + name + '/Tun'
             assert await grpc_path(https, tls, path) == path.encode()
