@@ -1,0 +1,21 @@
+[Unit]
+Description=Nathaya WebSocket to SSH gateway
+After=network.target
+
+[Service]
+Type=notify
+DynamicUser=yes
+LoadCredential=relay:/etc/nathaya-tunnel/managed-ws/relay.key
+LoadCredential=domain:/etc/nathaya-tunnel/managed-ws/domain
+ExecStart=/usr/bin/python3 -I /opt/nathaya/modules/ssh/ws_gateway.py
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_UNIX AF_INET
+CapabilityBoundingSet=
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target

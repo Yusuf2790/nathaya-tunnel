@@ -5,6 +5,9 @@ After=network.target
 [Service]
 Type=notify
 DynamicUser=yes
+SupplementaryGroups=haproxy
+RuntimeDirectory=nathaya-ws
+RuntimeDirectoryMode=0750
 LoadCredential=relay:/etc/nathaya-tunnel/managed-ws/relay.key
 LoadCredential=domain:/etc/nathaya-tunnel/managed-ws/domain
 ExecStart=/usr/bin/python3 -I /opt/nathaya/modules/ssh/ws_gateway.py

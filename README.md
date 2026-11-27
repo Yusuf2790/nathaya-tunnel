@@ -120,6 +120,45 @@ Instalasi baru tanpa konfigurasi port menyimpan `109 143` di
 instalasi lama tanpa file itu tetap memakai 109. HTTP biasa di port 80 untuk
 host yang valid diarahkan ke HTTPS; host asing dan endpoint WS yang salah ditolak.
 
+### NetMod tanpa proksi atau payload
+
+| Profil | Host dan port | Proksi | Payload | Keamanan |
+|---|---|---|---|---|
+| SSH TCP | Domain VPS, TCP 80 | `none` | kosong | `none` |
+| SSH melalui TLS | SNI SSH khusus, TCP 443 | `none` | kosong | SSL/TLS; verifikasi sertifikat aktif |
+
+Kedua profil memakai username/password akun Dropbear Nathaya. Tidak perlu
+WebSocket, header HTTP, atau HTTPS CONNECT untuk profil ini. Di TCP 80, HAProxy
+mengenali awalan SSH maupun HTTP. Klien SSH yang menunggu banner dilayani
+setelah paling lama jendela inspeksi **5 detik**. HTTP yang sudah mengirim
+metode dalam jendela itu tetap dirutekan sebagai HTTP, meski header menyusul
+lebih lambat. HTTP yang diam selama seluruh jendela tidak bisa dibedakan dari
+SSH server-first dan dapat menerima banner SSH. Gunakan 109/143 jika klien
+SSH tidak bisa menunggu; gunakan HTTPS untuk klien web yang lambat memulai.
+
+**TCP 443 memerlukan SNI khusus** agar SSH server-first tidak berbenturan dengan
+HTTPS/WSS/gRPC. Buat satu nama DNS berbeda, misalnya `ssh.tunnel.example.com`,
+yang mengarah ke VPS yang sama. Simpan nama itu (satu baris, milik root) di
+`/etc/nathaya-tunnel/ssh-tls-sni.conf`. Sediakan satu sertifikat TLS yang valid
+untuk **domain web dan nama SSH** (SAN), jalankan `sudo bash install-dashboard.sh --check`,
+lalu installer. Saat menerbitkan sertifikat baru, installer meminta kedua nama
+ke Certbot bila SNI SSH dikonfigurasi. Pada NetMod gunakan nama khusus sebagai
+Host dan SNI bila ada kolom SNI. Tanpa file SNI atau jika NetMod tidak mengirim
+SNI itu, jalur 443 tetap HTTPS biasa; jangan menonaktifkan validasi TLS untuk
+memaksa koneksi. Input SSH biasa tanpa TLS juga bukan profil 443 ini.
+
+HAProxy hanya meneruskan raw SSH dari port 80 atau TLS dengan SNI khusus ke
+socket Unix internal. Alamat peer diteruskan melalui PROXY v2 dari proses
+HAProxy yang terverifikasi, lalu melalui relay Nathaya. Check User Login tetap
+mencatat IP asal setelah autentikasi SSH, bukan header pilihan klien.
+Rujukan multiplex: [manual HAProxy](https://docs.haproxy.org/2.4/configuration.html).
+
+Untuk verifikasi di VPS uji, pisahkan **banner/handshake**, **login**, dan
+**trafik yang diteruskan**. Uji kedua profil NetMod sampai autentikasi dan
+trafik, muat ulang Check User Login sebelum dan sesudah disconnect, lalu
+regresikan SSH 109/143, WS/WSS di `/`, HTTP biasa dan Xray. Tes lokal memakai
+backend SSH tiruan untuk banner dan byte, bukan autentikasi Dropbear/NetMod.
+
 ### Stack tambahan: Nginx, Xray, OpenVPN, BadVPN
 
 Sebelum preflight, sediakan **Xray-core Linux amd64 dari rilis resmi** di
@@ -132,8 +171,8 @@ OpenVPN memakai paket distro melalui APT. OpenVPN memerlukan `/dev/net/tun`.
 
 | Listener | Cakupan | Fungsi |
 |---|---|---|
-| TCP 80 | Publik / HAProxy | SSH WS path `/`; HTTP biasa diarahkan ke HTTPS |
-| TCP 443 | Publik / HAProxy | SSH WSS path `/`, Xray WSS dan gRPC; tidak ada rute OpenVPN |
+| TCP 80 | Publik / HAProxy | SSH TCP, SSH WS path `/`; HTTP biasa diarahkan ke HTTPS |
+| TCP 443 | Publik / HAProxy | SSH TLS (SNI khusus), SSH WSS path `/`, Xray WSS dan gRPC; tidak ada rute OpenVPN |
 | TCP 8080 | Publik / HAProxy | HTTP redirect; tidak menerima upgrade WebSocket |
 | TCP 109/143 | Publik / Dropbear | SSH langsung; instal ulang mempertahankan port admin Nathaya |
 | TCP 1194, UDP 2200 | Publik / OpenVPN | Listener terpisah dengan autentikasi sertifikat |

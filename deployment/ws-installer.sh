@@ -22,7 +22,8 @@ select_ws_units() {
         check_parent_dirs "$file"; check_parent_dirs "$link"
         if exists "$file"; then
             [[ -f "$file" && ! -L "$file" ]] && owned "$file" &&
-                cmp -s -- "$file" "$source_dir/deployment/$unit" || conflict "$file"
+                { cmp -s -- "$file" "$source_dir/deployment/$unit" ||
+                    cmp -s -- "$file" "$source_dir/deployment/legacy/$unit"; } || conflict "$file"
         fi
         if exists "$link"; then
             [[ -L "$link" && -f "$file" ]] && owned "$link" &&
@@ -59,6 +60,7 @@ check_ws_tls() {
     if [[ -z "$ws_domain" ]]; then
         ws_domain=$(configured_domain) || die "Siapkan DOMAIN di $ws_config atau jalankan instalasi interaktif dengan --set-domain."
     fi
+    read_ssh_tls_sni
     [[ -n $(domain_resolution "$ws_domain") ]] || die "DNS tidak menghasilkan alamat untuk $ws_domain"
     command -v openssl >/dev/null || die 'OpenSSL diperlukan untuk preflight TLS. Pasang openssl lalu ulangi --check.'
     check_parent_dirs "$ws_cert"; check_parent_dirs "$ws_key"
@@ -179,10 +181,14 @@ finish_proxy_apt() {
 }
 
 render_proxy() {
-    local cert="$1" line token
+    local cert="$1" line token sni_route='# No dedicated SSH TLS SNI configured'
+    if [[ -n "$ssh_tls_sni" ]]; then
+        sni_route="use_backend nathaya_internal_tls_ssh if { req.ssl_sni -i $ssh_tls_sni }"
+    fi
     token=$(cat -- "$stage/ws/relay.key")
     while IFS= read -r line || [[ -n "$line" ]]; do
         line=${line//@DOMAIN@/$ws_domain}; line=${line//@CERT@/$cert}; line=${line//@TOKEN@/$token}
+        line=${line//@SSH_SNI_ROUTE@/$sni_route}
         printf '%s\n' "$line"
     done < "$source_dir/deployment/nathaya-haproxy.cfg.in"
 }
@@ -260,6 +266,11 @@ activate_connect_unit() {
     check_listener 8443 "$connect_service" 1
 }
 
+check_raw_gateway_socket() {
+    [[ -S "$ws_raw_socket" && ! -L "$ws_raw_socket" && $(stat -c '%a' -- "$ws_raw_socket") == 660 ]] ||
+        die "Gateway tidak membuat socket relay SSH internal yang aman: $ws_raw_socket"
+}
+
 activate_ws_units() {
     local unit
     for unit in "$ws_service" "$proxy_service"; do
@@ -272,4 +283,5 @@ activate_ws_units() {
     check_listener 80 "$proxy_service" 1
     check_listener 443 "$proxy_service" 1
     check_listener 18080 "$ws_service" 1
+    check_raw_gateway_socket
 }

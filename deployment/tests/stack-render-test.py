@@ -27,7 +27,8 @@ with tempfile.TemporaryDirectory() as temp:
     nginx = (path / 'nginx.conf').read_text()
     proxy = (ROOT / 'deployment/nathaya-haproxy.cfg.in').read_text()
     assert 'acl ssh_path path -m str /\n' in proxy
-    assert 'default_backend' not in proxy
+    http_frontend = proxy.split('frontend nathaya_public', 1)[1].split('backend nathaya_gateway', 1)[0]
+    assert 'default_backend' not in http_frontend
     for protocol, ws, grpc, ws_port, grpc_port in EXPECTED:
         assert all(inbounds[port]['listen'] == '127.0.0.1' for port in (ws_port, grpc_port))
         assert inbounds[ws_port]['protocol'] == protocol == inbounds[grpc_port]['protocol']

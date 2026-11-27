@@ -85,6 +85,21 @@ setup_domain() {
     done
 }
 
+read_ssh_tls_sni() {
+    ssh_tls_sni=
+    check_parent_dirs "$ssh_tls_sni_file"
+    if ! exists "$ssh_tls_sni_file"; then return 0; fi
+    [[ -f "$ssh_tls_sni_file" && ! -L "$ssh_tls_sni_file" ]] && owned "$ssh_tls_sni_file" || conflict "$ssh_tls_sni_file"
+    local mode
+    mode=$(stat -c '%a' -- "$ssh_tls_sni_file")
+    (( (8#$mode & 0022) == 0 )) || conflict "$ssh_tls_sni_file"
+    ssh_tls_sni=$(cat -- "$ssh_tls_sni_file")
+    ssh_tls_sni=${ssh_tls_sni,,}
+    valid_domain "$ssh_tls_sni" && [[ "$ssh_tls_sni" != "$ws_domain" ]] ||
+        die "SNI SSH harus satu hostname DNS yang berbeda dari $ws_domain ($ssh_tls_sni_file)."
+    [[ -n $(domain_resolution "$ssh_tls_sni") ]] || die "DNS belum menghasilkan alamat untuk $ssh_tls_sni"
+}
+
 valid_tls_pair() {
     local cert key mode cert_pub key_pub
     cert=$(readlink -f -- "$1") && key=$(readlink -f -- "$2") &&
@@ -93,6 +108,9 @@ valid_tls_pair() {
     mode=$(stat -c '%a' -- "$key") || return 1
     (( (8#$mode & 0077) == 0 )) || return 1
     openssl verify -verify_hostname "$ws_domain" -purpose sslserver -partial_chain -trusted "$cert" "$cert" >/dev/null 2>&1 || return 1
+    if [[ -n "${ssh_tls_sni:-}" ]]; then
+        openssl verify -verify_hostname "$ssh_tls_sni" -purpose sslserver -partial_chain -trusted "$cert" "$cert" >/dev/null 2>&1 || return 1
+    fi
     cert_pub=$(openssl x509 -in "$cert" -pubkey -noout 2>/dev/null) &&
         key_pub=$(openssl pkey -in "$key" -passin pass: -pubout 2>/dev/null) &&
         [[ -n "$cert_pub" && "$cert_pub" == "$key_pub" ]] || return 1
@@ -112,7 +130,7 @@ choose_tls() {
 }
 
 missing_tls() {
-    die "TLS belum siap untuk $ws_domain. Sediakan $ws_cert dan $ws_key atau lineage Certbot yang valid. Jika TCP 80 tidak bebas/terjangkau, terbitkan via DNS-01 (plugin/kredensial dikelola admin). Installer tidak menghentikan layanan lain."
+    die "TLS belum siap untuk $ws_domain${ssh_tls_sni:+ dan SNI SSH $ssh_tls_sni}. Sediakan $ws_cert dan $ws_key atau lineage Certbot yang valid. Jika TCP 80 tidak bebas/terjangkau, terbitkan via DNS-01 (plugin/kredensial dikelola admin). Installer tidak menghentikan layanan lain."
 }
 
 confirm_issuance() {
@@ -135,8 +153,10 @@ issue_ws_certificate() {
     # Recheck immediately; no service is stopped to free the challenge port.
     check_listener 80 "$proxy_service"
     [[ ! -f "$unit_dir/$proxy_service" ]] || missing_tls
+    local -a domains=(-d "$ws_domain")
+    if [[ -n "$ssh_tls_sni" ]]; then domains+=(-d "$ssh_tls_sni"); fi
     certbot certonly --standalone --non-interactive --agree-tos --email "$certbot_email" \
-        --cert-name "nathaya-$ws_domain" -d "$ws_domain" > "$backup/certbot.log" 2>&1 ||
+        --cert-name "nathaya-$ws_domain" "${domains[@]}" > "$backup/certbot.log" 2>&1 ||
         die "Penerbitan Let’s Encrypt gagal; cek DNS/akses publik TCP 80 dan $backup/certbot.log"
     choose_tls || missing_tls
 }

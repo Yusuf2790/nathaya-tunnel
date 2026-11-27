@@ -2,12 +2,15 @@
 """Internal RFC 6455 binary WebSocket relay; HAProxy is the only public frontend."""
 
 import asyncio
+import grp
 import ipaddress
 import os
 from pathlib import Path
+import pwd
 import re
 import secrets
 import socket
+import struct
 
 from aiohttp import web, WSMsgType
 
@@ -94,17 +97,86 @@ def build_app(token, domain, upstream_port=18091):
     return app
 
 
+PROXY_MAGIC = b'\r\n\r\n\x00\r\nQUIT\n'
+
+
+async def proxy_source(reader):
+    signature, version, family, size = struct.unpack('!12sBBH', await reader.readexactly(16))
+    address_length = {0x11: 4, 0x21: 16}.get(family)
+    if (signature != PROXY_MAGIC or version != 0x21 or address_length is None
+            or not 2 * address_length + 4 <= size <= 512):
+        raise ValueError('Invalid PROXY v2 TCP header')
+    addresses = await reader.readexactly(size)
+    return str(ipaddress.ip_address(addresses[:address_length]))
+
+
+def raw_handler(token, trusted_uid, upstream_port=18091):
+    slots = asyncio.Semaphore(128)
+
+    async def handle(reader, client):
+        target = None
+        tasks = []
+        try:
+            sock = client.get_extra_info('socket')
+            if sock is None or sock.family != socket.AF_UNIX or slots.locked():
+                return
+            _, uid, _ = struct.unpack('iII', sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            if uid != trusted_uid:
+                return
+            async with slots:
+                source = await asyncio.wait_for(proxy_source(reader), 3)
+                incoming, target = await asyncio.wait_for(asyncio.open_connection('127.0.0.1', upstream_port), 3)
+                target.write(f'NATHAYA1 {token} {source}\n'.encode('ascii'))
+                await asyncio.wait_for(target.drain(), 3)
+                if await asyncio.wait_for(incoming.readexactly(3), 3) != b'OK\n':
+                    return
+
+                async def pipe(source_stream, destination):
+                    while data := await source_stream.read(32768):
+                        destination.write(data)
+                        await asyncio.wait_for(destination.drain(), 30)
+
+                tasks = [asyncio.create_task(pipe(reader, target)), asyncio.create_task(pipe(incoming, client))]
+                await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        except (OSError, ValueError, asyncio.IncompleteReadError, asyncio.TimeoutError):
+            pass
+        finally:
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            if target is not None:
+                target.close()
+            client.close()
+
+    return handle
+
+
 async def main():
-    runner = web.AppRunner(build_app(*credentials()), access_log=None)
+    token, domain = credentials()
+    proxy = pwd.getpwnam('haproxy')
+    proxy_group = grp.getgrnam('haproxy').gr_gid
+    runtime = Path('/run/nathaya-ws')
+    os.chown(runtime, -1, proxy_group)
+    path = runtime / 'raw.sock'
+    runner = web.AppRunner(build_app(token, domain), access_log=None)
     await runner.setup()
+    server = None
     try:
         await web.TCPSite(runner, '127.0.0.1', 18080).start()
+        server = await asyncio.start_unix_server(raw_handler(token, proxy.pw_uid), path=str(path))
+        os.chown(path, -1, proxy_group)
+        path.chmod(0o660)
         if addr := os.environ.get('NOTIFY_SOCKET'):
             with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as notifier:
                 notifier.connect('\0' + addr[1:] if addr.startswith('@') else addr)
                 notifier.sendall(b'READY=1')
         await asyncio.Future()
     finally:
+        if server is not None:
+            server.close()
+            await server.wait_closed()
+            path.unlink(missing_ok=True)
         await runner.cleanup()
 
 

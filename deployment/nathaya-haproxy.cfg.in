@@ -13,9 +13,58 @@ defaults
     timeout server 30s
     timeout tunnel 1h
 
-frontend nathaya_public
+frontend nathaya_tcp80
+    mode tcp
     bind [::]:80 v4v6
-    bind [::]:443 v4v6 ssl crt @CERT@ alpn h2,http/1.1
+    timeout client 1h
+    tcp-request inspect-delay 5s
+    acl raw_ssh req.payload(0,4) -m str SSH-
+    acl http_method req.payload(0,0) -m reg "^[A-Z]{3,16} "
+    acl http_request req.proto_http
+    tcp-request content accept if raw_ssh or http_method or http_request
+    tcp-request content reject if WAIT_END { req.len gt 0 }
+    use_backend nathaya_internal_http if http_method or http_request
+    default_backend nathaya_ssh_raw
+
+frontend nathaya_tls_mux
+    mode tcp
+    bind [::]:443 v4v6
+    timeout client 1h
+    tcp-request inspect-delay 5s
+    tcp-request content accept if { req.ssl_hello_type 1 }
+    tcp-request content reject if WAIT_END
+    @SSH_SNI_ROUTE@
+    default_backend nathaya_internal_tls_web
+
+backend nathaya_internal_http
+    mode tcp
+    timeout server 1h
+    server http unix@/run/nathaya-haproxy/http.sock send-proxy-v2
+
+backend nathaya_internal_tls_web
+    mode tcp
+    timeout server 1h
+    server web unix@/run/nathaya-haproxy/web-tls.sock send-proxy-v2
+
+backend nathaya_internal_tls_ssh
+    mode tcp
+    timeout server 1h
+    server ssh unix@/run/nathaya-haproxy/ssh-tls.sock send-proxy-v2
+
+frontend nathaya_ssh_tls
+    mode tcp
+    bind unix@/run/nathaya-haproxy/ssh-tls.sock mode 600 user haproxy group haproxy accept-proxy ssl crt @CERT@
+    timeout client 1h
+    default_backend nathaya_ssh_raw
+
+backend nathaya_ssh_raw
+    mode tcp
+    timeout server 1h
+    server relay unix@/run/nathaya-ws/raw.sock send-proxy-v2
+
+frontend nathaya_public
+    bind unix@/run/nathaya-haproxy/http.sock mode 600 user haproxy group haproxy accept-proxy
+    bind unix@/run/nathaya-haproxy/web-tls.sock mode 600 user haproxy group haproxy accept-proxy ssl crt @CERT@ alpn h2,http/1.1
     bind [::]:8080 v4v6
     acl allowed_host hdr(host) -i @DOMAIN@ @DOMAIN@:80 @DOMAIN@:443 @DOMAIN@:8080
     acl upgrade_present hdr(Upgrade) -m found

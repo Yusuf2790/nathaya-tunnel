@@ -31,6 +31,8 @@ set_paths() {
     ws_config="$base/etc/nathaya-tunnel/config.conf"
     ws_managed="$base/etc/nathaya-tunnel/managed-ws"
     ws_runtime="$base/run/nathaya-ssh"
+    ws_raw_socket="$base/run/nathaya-ws/raw.sock"
+    ssh_tls_sni_file="$base/etc/nathaya-tunnel/ssh-tls-sni.conf"
     ws_cert="$base/etc/nathaya-tunnel/tls/fullchain.pem"
     ws_key="$base/etc/nathaya-tunnel/tls/privkey.pem"
     certbot_live="$base/etc/letsencrypt/live"
@@ -105,7 +107,8 @@ validate_host() {
 
 validate_sources() {
     local f
-    for f in "${app_files[@]}" "${staged_deployment[@]}" deployment/nathaya-haproxy.cfg.in deployment/render-stack.py; do
+    for f in "${app_files[@]}" "${staged_deployment[@]}" deployment/nathaya-haproxy.cfg.in deployment/render-stack.py \
+        deployment/legacy/{nathaya-ws,nathaya-haproxy}.service; do
         [[ -f "$source_dir/$f" && ! -L "$source_dir/$f" && -r "$source_dir/$f" ]] ||
             die "file sumber hilang, bukan file biasa, atau tidak terbaca: $f"
     done
@@ -423,7 +426,7 @@ deploy() {
 main() {
     local mode_install=install request_login=0 login_enabled=0 option ws_domain= vendor_fresh=0 badvpn_enabled=0
     local -a stack_units=() vendor_added=()
-    local set_domain=0 use_certbot=0 requested_domain= certbot_email= tls_source_cert= tls_source_key=
+    local set_domain=0 use_certbot=0 requested_domain= certbot_email= tls_source_cert= tls_source_key= ssh_tls_sni=
     local fresh_ports=0 ssh_ports_display= connect_enabled=0
     local -a ssh_ports=()
     local -a packages=() managed_units=() staged_deployment=()
@@ -492,6 +495,9 @@ main() {
     printf 'Dashboard terpasang: %s. Jalankan menu.\n' "$target"
     printf 'Timer %s: enabled, active. Login otomatis: %s.\n' "$timer" "$login_enabled"
     printf 'Dropbear TCP %s, WS TCP 80, WSS TCP 443: enabled, active (%s/).\n' "$ssh_ports_display" "$ws_domain"
+    printf 'SSH TCP 80: aktif melalui HAProxy (inspeksi hingga 5 detik).\n'
+    if [[ -n "$ssh_tls_sni" ]]; then printf 'SSH TLS 443: SNI %s.\n' "$ssh_tls_sni"
+    else printf 'SSH TLS 443: belum aktif (SNI khusus belum dikonfigurasi).\n'; fi
     if (( connect_enabled )); then printf 'HTTPS CONNECT TCP 8443: enabled, active.\n'; fi
     printf 'HAProxy HTTP TCP 8080; Nginx/Xray internal; OpenVPN TCP 1194 dan UDP 2200.\n'
     if (( badvpn_enabled )); then printf 'BadVPN TCP internal 7100/7200/7300 aktif.\n'; else printf 'BadVPN belum aktif (binari terverifikasi tidak disediakan).\n'; fi

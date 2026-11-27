@@ -57,6 +57,7 @@ run_installer() (
         chmod 0644 "$stage/stack/nginx.conf"
     }
     verify_relay() { :; }
+    check_raw_gateway_socket() { :; }
     issue_ws_certificate() { :; }
     stage_ws_config() {
         [[ ! -e "$root/state/bad-proxy-config" ]] || die 'konfigurasi HAProxy tidak valid'

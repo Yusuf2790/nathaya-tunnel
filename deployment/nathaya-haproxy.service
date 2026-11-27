@@ -5,6 +5,7 @@ Requires=nathaya-ws.service
 
 [Service]
 Type=notify
+RuntimeDirectory=nathaya-haproxy
 ExecStart=/usr/sbin/haproxy -Ws -f /etc/nathaya-tunnel/managed-ws/haproxy.cfg
 NoNewPrivileges=yes
 PrivateTmp=yes
