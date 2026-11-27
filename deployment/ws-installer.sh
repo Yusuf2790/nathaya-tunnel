@@ -68,8 +68,8 @@ check_ws_tls() {
         token=$(cat -- "$ws_managed/relay.key")
         [[ "$token" =~ ^[a-f0-9]{64}$ ]] || conflict "$ws_managed/relay.key"
     fi
-    if [[ ! -x "$haproxy_bin" ]] && exists "$apt_policy"; then
-        die "HAProxy belum terpasang dan $apt_policy sudah ada; instal HAProxy dengan unit distro nonaktif, lalu ulangi --check"
+    if exists "$apt_policy" && { [[ ! -x "$haproxy_bin" || ! -x /usr/sbin/nginx || ! -x /usr/sbin/openvpn ]]; }; then
+        die "$apt_policy dikelola admin; siapkan paket haproxy/nginx/openvpn tanpa mengaktifkan unit distro yang tidak diperlukan, lalu ulangi --check"
     fi
 }
 
@@ -89,9 +89,11 @@ tcp_conflict() {
 }
 
 check_listener() {
-    local port="$1" unit="$2" must_exist="${3:-0}" pid=0 group listeners line address tail owner cgroup belongs found=0
+    local port="$1" unit="$2" must_exist="${3:-0}" protocol="${4:-tcp}" pid=0 group listeners line address tail owner cgroup belongs found=0
+    local ss_proto=t net=tcp listen_state=0A
+    if [[ "$protocol" == udp ]]; then ss_proto=u; net=udp; listen_state=07; fi
     if command -v ss >/dev/null; then
-        listeners=$(ss -H -ltnp) || die 'tidak dapat membaca daftar listener dari ss'
+        listeners=$(ss -H "-l${ss_proto}np") || die 'tidak dapat membaca daftar listener dari ss'
         pid=$(unit_property "$unit" MainPID) || die "tidak dapat membaca PID $unit"
         group=$(unit_property "$unit" ControlGroup) || die "tidak dapat membaca cgroup $unit"
         while IFS= read -r line; do
@@ -114,48 +116,61 @@ check_listener() {
         done <<< "$listeners"
     else
         local table hex state
-        [[ -r /proc/net/tcp ]] || die 'tidak dapat memeriksa listener; pasang iproute2 lalu ulangi --check'
+        [[ -r /proc/net/$net ]] || die 'tidak dapat memeriksa listener; pasang iproute2 lalu ulangi --check'
         printf -v hex '%04X' "$port"
-        for table in /proc/net/tcp /proc/net/tcp6; do
+        for table in "/proc/net/$net" "/proc/net/${net}6"; do
             [[ -r "$table" ]] || continue
             while read -r _ address _ state _; do
-                [[ "$state" != 0A || "$address" != *":$hex" ]] || tcp_conflict "$port" "pasang ss untuk mengidentifikasi listener"
+                [[ "$state" != "$listen_state" || "$address" != *":$hex" ]] || tcp_conflict "$port" "pasang ss untuk mengidentifikasi listener"
             done < "$table"
         done
     fi
-    (( !must_exist || found )) || die "TCP $port tidak aktif untuk $unit"
+    (( !must_exist || found )) || die "${protocol^^} $port tidak aktif untuk $unit"
 }
 
 check_ws_ports() {
     check_listener 80 "$proxy_service" "${1:-0}"
     check_listener 443 "$proxy_service" "${1:-0}"
+    check_listener 8080 "$proxy_service" "${1:-0}"
     check_listener 18080 "$ws_service" "${1:-0}"
     check_listener 18091 "$ssh_service" "${1:-0}"
     if (( connect_enabled )) && (( ! ${1:-0} )); then check_listener 8443 "$connect_service"; fi
 }
 
 prepare_proxy_apt() {
-    local package
-    for package in "${packages[@]}"; do [[ "$package" != haproxy ]] || break; done
-    [[ ${package:-} == haproxy ]] || return 0
-    vendor_fresh=1
+    local package state enabled
+    vendor_added=()
+    for package in "${packages[@]}"; do
+        case "$package" in haproxy|nginx|openvpn) ;; *) continue ;; esac
+        state=$(unit_property "$package.service" ActiveState) || die "status unit distro $package tidak tersedia"
+        enabled=$(unit_property "$package.service" UnitFileState) || die "enablement unit distro $package tidak tersedia"
+        case "$state:$enabled" in inactive:|inactive:not-found) vendor_added+=("$package.service") ;;
+            *) die "unit distro $package sudah dikelola; selesaikan paket secara manual sebelum instalasi" ;;
+        esac
+    done
+    (( ${#vendor_added[@]} )) || return 0
     cat > "$stage/policy-proxy" <<'POLICY'
 #!/bin/sh
 for arg do
-    case "${arg##*/}" in haproxy|haproxy.service) exit 101 ;; esac
+    case "${arg##*/}" in haproxy|haproxy.service|nginx|nginx.service|openvpn|openvpn.service|openvpn-*@*|openvpn@*) exit 101 ;; esac
 done
 exit 0
 POLICY
     chmod 0755 "$stage/policy-proxy"
     ln -s -- "$stage/policy-proxy" "$apt_policy" || die "tidak dapat memasang guard APT sementara: $apt_policy"
+    vendor_fresh=1
 }
 
 finish_proxy_apt() {
-    local rc=0
+    local rc=0 unit enabled state
     if (( !vendor_fresh )); then return 0; fi
-    if [[ -x "$haproxy_bin" ]]; then
-        systemctl --system disable --now haproxy.service >> "$backup/apt.log" 2>&1 || rc=1
-    fi
+    for unit in "${vendor_added[@]}"; do
+        enabled=$(unit_property "$unit" UnitFileState) || { rc=1; continue; }
+        state=$(unit_property "$unit" ActiveState) || { rc=1; continue; }
+        case "$state:$enabled" in inactive:|inactive:not-found|inactive:disabled|inactive:masked) ;;
+            *) systemctl --system disable --now "$unit" >> "$backup/apt.log" 2>&1 || rc=1 ;;
+        esac
+    done
     if [[ -L "$apt_policy" && $(readlink -- "$apt_policy") == "$stage/policy-proxy" ]]; then
         rm -- "$apt_policy" || return 1
     fi

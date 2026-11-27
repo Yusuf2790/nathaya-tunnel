@@ -41,7 +41,7 @@ def build_app(token, domain, upstream_port=18091):
 
     async def relay(request):
         source = source_ip(request, token, domain)
-        if request.raw_path != '/ssh':
+        if request.raw_path != '/':
             raise web.HTTPNotFound()
         ws = web.WebSocketResponse(heartbeat=30, max_msg_size=262144, compress=False)
         if request.headers.get('Sec-WebSocket-Version') != '13' or not ws.can_prepare(request).ok:
@@ -90,7 +90,7 @@ def build_app(token, domain, upstream_port=18091):
             return ws
 
     app = web.Application()
-    app.router.add_get('/ssh', relay, allow_head=False)
+    app.router.add_get('/', relay, allow_head=False)
     return app
 
 

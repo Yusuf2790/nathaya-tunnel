@@ -45,6 +45,17 @@ run_installer() (
             [[ $(cat "$root/state/$2") == active ]] || die "TCP $1 tidak aktif"
         fi
     }
+    verified_stack_binary() { :; }
+    check_stack_host() { :; }
+    stage_stack() {
+        mkdir "$stage/stack"
+        local f
+        for f in xray-credentials.json ca.key ca.crt server.key server.crt client.key client.crt tls-crypt.key \
+            xray.json nginx.conf openvpn-{tcp,udp}.conf client-{tcp,udp}.ovpn xray; do
+            printf 'fixture\n' > "$stage/stack/$f"
+        done
+        chmod 0644 "$stage/stack/nginx.conf"
+    }
     verify_relay() { :; }
     issue_ws_certificate() { :; }
     stage_ws_config() {
@@ -151,7 +162,8 @@ run_installer "$host" > "$work/install"
    -L "$host/etc/systemd/system/timers.target.wants/nathaya-traffic.timer" &&
    $(cat "$host/state/nathaya-traffic.timer") == active ]] || fail 'instalasi fresh'
 [[ $(cat "$host/etc/nathaya-tunnel/ssh-ports.conf") == "109 143" ]] || fail 'port SSH fresh bukan 109/143'
-for unit in nathaya-dropbear.service nathaya-ws.service nathaya-haproxy.service; do
+for unit in nathaya-dropbear.service nathaya-ws.service nathaya-haproxy.service \
+    nathaya-nginx.service nathaya-xray.service nathaya-openvpn-tcp.service nathaya-openvpn-udp.service; do
     [[ $(cat "$host/state/$unit") == active ]] || fail "layanan wajib tidak aktif: $unit"
 done
 grep -Fxq 'update' "$host/state/apt" || fail 'APT update tidak dipanggil'
@@ -187,6 +199,11 @@ host=$(fixture ws-preflight)
 touch "$host/state/want-package" "$host/state/conflict-80"
 expect_failure "$host" 'Benturan TCP 80'
 rm "$host/state/conflict-80"
+for port in 8080 1010 10005 1194 2200; do
+    touch "$host/state/conflict-$port"
+    expect_failure "$host" "Benturan TCP $port"
+    rm "$host/state/conflict-$port"
+done
 touch "$host/state/conflict-143"
 expect_failure "$host" 'Benturan TCP 143'
 rm "$host/state/conflict-143"

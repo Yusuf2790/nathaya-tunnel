@@ -1,0 +1,18 @@
+[Unit]
+Description=Nathaya internal Xray HTTP transports
+After=network.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+RuntimeDirectory=nathaya-nginx
+ExecStart=/usr/sbin/nginx -p /run/nathaya-nginx/ -c /etc/nathaya-tunnel/managed-stack/nginx.conf -g "daemon off;"
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target

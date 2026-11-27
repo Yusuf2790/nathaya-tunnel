@@ -1,0 +1,14 @@
+[Unit]
+Description=Nathaya OpenVPN UDP 2200
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/openvpn --config /etc/nathaya-tunnel/managed-stack/openvpn-udp.conf
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target

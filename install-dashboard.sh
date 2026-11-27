@@ -10,7 +10,8 @@ connect_service=nathaya-connect.service
 app_files=(
     menu.sh
     modules/common/{functions,telegram,ui}.sh
-    modules/dashboard/{dashboard.sh,traffic.sh,traffic.py}
+    modules/dashboard/{dashboard.sh,traffic.sh,traffic.py,ports.sh}
+    modules/stack/badvpn.py
     modules/menu/{domain,main,set_domain,ssh}.sh
     modules/ssh/{backend,ws_gateway,connect_gateway}.py
 )
@@ -34,6 +35,8 @@ set_paths() {
     ws_key="$base/etc/nathaya-tunnel/tls/privkey.pem"
     certbot_live="$base/etc/letsencrypt/live"
     connect_key="$base/etc/nathaya-tunnel/connect.key"
+    stack_config="$base/etc/nathaya-tunnel/managed-stack"
+    stack_bins="$base/etc/nathaya-tunnel/bin"
     haproxy_bin=/usr/sbin/haproxy
     apt_policy="$base/usr/sbin/policy-rc.d"
     os_release="$base/etc/os-release"
@@ -102,7 +105,7 @@ validate_host() {
 
 validate_sources() {
     local f
-    for f in "${app_files[@]}" "${staged_deployment[@]}" deployment/nathaya-haproxy.cfg.in; do
+    for f in "${app_files[@]}" "${staged_deployment[@]}" deployment/nathaya-haproxy.cfg.in deployment/render-stack.py; do
         [[ -f "$source_dir/$f" && ! -L "$source_dir/$f" && -r "$source_dir/$f" ]] ||
             die "file sumber hilang, bukan file biasa, atau tidak terbaca: $f"
     done
@@ -138,6 +141,8 @@ source "$source_dir/deployment/ssh-installer.sh" || exit 1
 source "$source_dir/deployment/ws-installer.sh" || exit 1
 # shellcheck source=deployment/domain-installer.sh
 source "$source_dir/deployment/domain-installer.sh" || exit 1
+# shellcheck source=deployment/stack-installer.sh
+source "$source_dir/deployment/stack-installer.sh" || exit 1
 
 check_conflicts() {
     local f dst existing=0 have_app_files=0
@@ -187,10 +192,13 @@ check_conflicts() {
     fi
     (( !have_app_files || existing )) || conflict "$target"
     select_ssh_module
+    select_stack
     select_ws_units
     check_unit_conflicts
     check_ssh_ports
     check_ws_ports
+    check_stack_ports
+    check_stack_host
     check_vendor_proxy
     check_ws_tls
 
@@ -216,6 +224,7 @@ missing_dependencies() {
     if ! command -v tput >/dev/null || ! command -v clear >/dev/null; then packages+=(ncurses-bin); fi
     ssh_dependencies
     ws_dependencies
+    stack_dependencies
     return 0
 }
 
@@ -366,6 +375,7 @@ deploy() {
     fi
     stage_ssh_outputs
     stage_ws_outputs
+    stage_stack_outputs
     if ! exists "$timer_link"; then
         # Symlink WantedBy=timers.target; hanya symlink ini yang diubah untuk enablement.
         ln -s -- "../$timer" "$stage/timer-link" || die 'tidak dapat menyiapkan symlink timer'
@@ -381,7 +391,7 @@ deploy() {
     fi
     deployment_started=1
     units_touched=1
-    for unit in "$connect_service" "$proxy_service" "$ws_service" "$timer"; do
+    for unit in "$connect_service" "$proxy_service" "$ws_service" "${stack_units[@]}" "$timer"; do
         if [[ ${prior_active[$unit]:-inactive} == active ]]; then
             runtime_touched[$unit]=1
             unit_action stop "$unit" || die "gagal menghentikan $unit sebelum deployment"
@@ -393,7 +403,8 @@ deploy() {
     unit_action start "$timer" || die "gagal memulai $timer"
     [[ $(unit_property "$timer" UnitFileState) == enabled ]] || die "$timer belum aktif saat boot (enabled)"
     [[ $(unit_property "$timer" ActiveState) == active ]] || die "$timer tidak berjalan (active)"
-    # Keep existing direct SSH running until the gateway and HAProxy are ready.
+    # Keep direct SSH running while validating the replacement frontends.
+    activate_stack
     activate_ws_units
     if (( restart_ssh )); then
         runtime_touched[$ssh_service]=1
@@ -410,7 +421,8 @@ deploy() {
 }
 
 main() {
-    local mode_install=install request_login=0 login_enabled=0 option ws_domain= vendor_fresh=0
+    local mode_install=install request_login=0 login_enabled=0 option ws_domain= vendor_fresh=0 badvpn_enabled=0
+    local -a stack_units=() vendor_added=()
     local set_domain=0 use_certbot=0 requested_domain= certbot_email= tls_source_cert= tls_source_key=
     local fresh_ports=0 ssh_ports_display= connect_enabled=0
     local -a ssh_ports=()
@@ -442,7 +454,7 @@ main() {
     if [[ "$mode_install" == check ]]; then
         printf 'Preflight OK. Dependensi yang perlu dipasang: %s. Login otomatis: %s.\n' \
             "${packages[*]:-tidak ada}" "$login_enabled"
-        printf 'Target: SSH %s, WS 80 dan WSS 443 (%s/ssh).\n' "$ssh_ports_display" "$ws_domain"
+        printf 'Target: SSH %s, WS 80 dan WSS 443 (%s/).\n' "$ssh_ports_display" "$ws_domain"
         if (( EUID != local_uid )); then printf 'Instalasi tetap harus dijalankan sebagai root.\n'; fi
         return 0
     fi
@@ -475,11 +487,15 @@ main() {
     check_conflicts
     issue_ws_certificate
     stage_ws_config
+    stage_stack
     deploy
     printf 'Dashboard terpasang: %s. Jalankan menu.\n' "$target"
     printf 'Timer %s: enabled, active. Login otomatis: %s.\n' "$timer" "$login_enabled"
-    printf 'Dropbear TCP %s, WS TCP 80, WSS TCP 443: enabled, active (%s/ssh).\n' "$ssh_ports_display" "$ws_domain"
+    printf 'Dropbear TCP %s, WS TCP 80, WSS TCP 443: enabled, active (%s/).\n' "$ssh_ports_display" "$ws_domain"
     if (( connect_enabled )); then printf 'HTTPS CONNECT TCP 8443: enabled, active.\n'; fi
+    printf 'HAProxy HTTP TCP 8080; Nginx/Xray internal; OpenVPN TCP 1194 dan UDP 2200.\n'
+    if (( badvpn_enabled )); then printf 'BadVPN TCP internal 7100/7200/7300 aktif.\n'; else printf 'BadVPN belum aktif (binari terverifikasi tidak disediakan).\n'; fi
+    printf 'UDP Custom: belum diimplementasikan.\n'
     printf 'Log/backup (akses root): %s\n' "$backup"
     exit 0  # Jalankan EXIT trap selagi variabel transaksi masih dalam lingkup main.
 }

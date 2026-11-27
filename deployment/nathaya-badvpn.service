@@ -1,0 +1,15 @@
+[Unit]
+Description=Nathaya internal BadVPN UDP gateways
+After=network.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+ExecStart=/usr/bin/python3 -I /opt/nathaya/modules/stack/badvpn.py
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target

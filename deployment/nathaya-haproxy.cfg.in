@@ -15,21 +15,33 @@ defaults
 
 frontend nathaya_public
     bind [::]:80 v4v6
-    bind [::]:443 v4v6 ssl crt @CERT@ alpn http/1.1
-    acl allowed_host hdr(host) -i @DOMAIN@ @DOMAIN@:80 @DOMAIN@:443
+    bind [::]:443 v4v6 ssl crt @CERT@ alpn h2,http/1.1
+    bind [::]:8080 v4v6
+    acl allowed_host hdr(host) -i @DOMAIN@ @DOMAIN@:80 @DOMAIN@:443 @DOMAIN@:8080
     acl upgrade_present hdr(Upgrade) -m found
     acl websocket hdr(Upgrade) -i websocket
     acl websocket_conn hdr(Connection) -m reg -i (^|,)[[:space:]]*upgrade[[:space:]]*(,|$)
-    acl ssh_path path -m str /ssh
-    acl ssh_method method GET
+    acl ssh_path path -m str /
+    acl xray_ws path -m str /vless /vmess /trojan-ws /ss-ws
+    acl xray_grpc path_beg /vless-grpc/ /vmess-grpc/ /trojan-grpc/ /ss-grpc/
+    acl grpc_type hdr(Content-Type) -m beg -i application/grpc
+    acl method_get method GET
+    acl method_post method POST
+    acl web_only dst_port 8080
     http-request deny deny_status 400 unless { hdr_cnt(host) eq 1 } allowed_host
-    http-request deny deny_status 404 if upgrade_present !ssh_path
+    http-request deny deny_status 404 if upgrade_present web_only
     http-request deny deny_status 400 if upgrade_present !websocket
     http-request deny deny_status 400 if upgrade_present !websocket_conn
-    http-request deny deny_status 400 if upgrade_present !ssh_method
+    http-request deny deny_status 400 if upgrade_present !method_get
+    http-request deny deny_status 404 if upgrade_present !ssh_path !xray_ws
+    http-request deny deny_status 403 if upgrade_present xray_ws !{ ssl_fc }
     http-request redirect prefix https://@DOMAIN@ code 308 if !{ ssl_fc } !upgrade_present
-    http-request deny deny_status 404 unless upgrade_present
-    default_backend nathaya_gateway
+    http-request deny deny_status 404 if !upgrade_present !xray_grpc
+    http-request deny deny_status 400 if !upgrade_present xray_grpc !grpc_type
+    http-request deny deny_status 400 if !upgrade_present xray_grpc !method_post
+    use_backend nathaya_gateway if upgrade_present ssh_path
+    use_backend nathaya_xray_ws if upgrade_present xray_ws { ssl_fc }
+    use_backend nathaya_xray_grpc if !upgrade_present xray_grpc { ssl_fc }
 
 backend nathaya_gateway
     http-request del-header Forwarded
@@ -38,3 +50,16 @@ backend nathaya_gateway
     http-request set-header X-Nathaya-Source-IP %[src]
     http-request set-header X-Nathaya-Relay-Auth @TOKEN@
     server ws_gateway 127.0.0.1:18080
+
+backend nathaya_xray_ws
+    http-request del-header Forwarded
+    http-request del-header X-Real-IP
+    http-request set-header X-Forwarded-For %[src]
+    server nginx_ws 127.0.0.1:1010
+
+backend nathaya_xray_grpc
+    timeout server 1h
+    http-request del-header Forwarded
+    http-request del-header X-Real-IP
+    http-request set-header X-Forwarded-For %[src]
+    server nginx_grpc 127.0.0.1:1013 proto h2

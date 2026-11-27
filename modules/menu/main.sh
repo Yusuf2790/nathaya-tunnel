@@ -20,6 +20,7 @@ show_features_menu() {
     draw_menu_item 1 "Monitoring Trafik"
     draw_menu_item 2 "Status Layanan"
     draw_menu_item 3 "Menu Domain"
+    draw_menu_item 4 "Informasi Port"
     draw_submenu_navigation
     draw_box_bottom "$width"
 }

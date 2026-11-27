@@ -111,14 +111,76 @@ Instalasi standar memasang dan mengaktifkan `nathaya-dropbear.service`,
 | Mode klien | Port | Pengaturan |
 |---|---:|---|
 | SSH langsung (NetMod) | 109 dan 143 | Host domain VPS, SSH tanpa WebSocket. |
-| WS (NoSSL) | 80 | Klien SSH-over-WebSocket standar, host domain VPS, path `/ssh`, TLS mati. |
-| WSS | 443 | Klien SSH-over-WebSocket standar, host dan SNI domain VPS, path `/ssh`, verifikasi TLS aktif. |
+| WS (NoSSL) | 80 | Klien SSH-over-WebSocket standar, host domain VPS, path `/`, TLS mati. |
+| WSS | 443 | Klien SSH-over-WebSocket standar, host dan SNI domain VPS, path `/`, verifikasi TLS aktif. |
 | HTTPS CONNECT (opsional) | 8443 | Proksi TLS domain VPS, autentikasi Basic, tujuan tetap `DOMAIN:109`. Dukungan NetMod belum diuji. |
 
 Instalasi baru tanpa konfigurasi port menyimpan `109 143` di
 `/etc/nathaya-tunnel/ssh-ports.conf`. Instal ulang mempertahankan pilihan admin;
 instalasi lama tanpa file itu tetap memakai 109. HTTP biasa di port 80 untuk
 host yang valid diarahkan ke HTTPS; host asing dan endpoint WS yang salah ditolak.
+
+### Stack tambahan: Nginx, Xray, OpenVPN, BadVPN
+
+Sebelum preflight, sediakan **Xray-core Linux amd64 dari rilis resmi** di
+`/etc/nathaya-tunnel/bin/xray` dan digest SHA-256 terverifikasi pada
+`/etc/nathaya-tunnel/bin/xray.sha256` (64 digit heksadesimal saja). Cocokkan
+rilis dengan kanal resmi XTLS; checksum yang dibuat dari unduhan tidak
+tepercaya bukan bukti asal. File dan direktori harus milik root. Installer
+tidak mengunduh atau menjalankan skrip pemasangan pihak ketiga. Nginx dan
+OpenVPN memakai paket distro melalui APT. OpenVPN memerlukan `/dev/net/tun`.
+
+| Listener | Cakupan | Fungsi |
+|---|---|---|
+| TCP 80 | Publik / HAProxy | SSH WS path `/`; HTTP biasa diarahkan ke HTTPS |
+| TCP 443 | Publik / HAProxy | SSH WSS path `/`, Xray WSS dan gRPC; tidak ada rute OpenVPN |
+| TCP 8080 | Publik / HAProxy | HTTP redirect; tidak menerima upgrade WebSocket |
+| TCP 109/143 | Publik / Dropbear | SSH langsung; instal ulang mempertahankan port admin Nathaya |
+| TCP 1194, UDP 2200 | Publik / OpenVPN | Listener terpisah dengan autentikasi sertifikat |
+| TCP 8443 | Publik bila diaktifkan | HTTPS CONNECT terautentikasi dengan tujuan tetap |
+| TCP 1010/1013 | Loopback / Nginx | Backend Xray WS / gRPC h2c |
+| TCP 10001–10008 | Loopback / Xray | Inbound sesuai tabel rute di bawah |
+| TCP 18080/18091 | Loopback | Gateway dan relay SSH |
+| TCP 7100/7200/7300 | Loopback bila dipasang | BadVPN `udpgw` |
+| HTTPS 81, UDP Custom | Belum aktif | Tidak ada listener atau profil klien |
+
+**Features → Informasi Port** memeriksa unit dan socket, bukan sekadar daftar
+port. Status ON bukan bukti autentikasi atau trafik berhasil. SSH admin tetap
+menggunakan konfigurasi VPS yang sudah ada. Rute dipetakan dari spesifikasi
+port; tidak ada file konfigurasi Alrescha79 yang ditemukan di repo ini.
+
+| Protokol | Path WSS (443) | Backend WS | serviceName gRPC (443) | Backend gRPC |
+|---|---|---:|---|---:|
+| VLESS | `/vless` | 10001 | `vless-grpc` | 10005 |
+| VMess | `/vmess` | 10002 | `vmess-grpc` | 10006 |
+| Trojan | `/trojan-ws` | 10003 | `trojan-grpc` | 10007 |
+| Shadowsocks | `/ss-ws` | 10004 | `ss-grpc` | 10008 |
+
+Aktifkan TLS, verifikasi sertifikat, dan gunakan domain Nathaya sebagai
+host/SNI pada klien Xray. Upgrade WS Xray melalui HTTP tanpa TLS ditolak.
+VLESS memakai enkripsi transport TLS; Shadowsocks memakai `aes-256-gcm`.
+Kredensial awal ada di `/etc/nathaya-tunnel/managed-stack/xray-credentials.json`
+(akses root). Simpan dan distribusikan secara aman; installer tidak merotasi
+kredensial tersebut saat upgrade atau membuat akun SSH baru untuknya.
+
+Profil OpenVPN `client-tcp.ovpn` dan `client-udp.ovpn` tersedia di direktori
+`managed-stack` yang sama. Profil memeriksa CA serta nama sertifikat server.
+Profil awal mengandung private key klien; jangan distribusikan sebagai profil
+umum. Installer tidak mengubah firewall, IP forwarding, atau NAT; untuk akses
+keluar VPS admin perlu menyiapkan routing dan kebijakan jaringan. Tidak ada
+sambungan OpenVPN melalui port 443.
+
+BadVPN bersifat opsional. Sediakan binari `badvpn-udpgw` amd64 dari sumber
+terverifikasi dan `badvpn-udpgw.sha256` di direktori binari yang sama. Gunakan
+klien yang mendukung protokol BadVPN udpgw melalui SSH port-forward yang
+sudah terautentikasi; tidak ada autentikasi BadVPN terpisah atau port UDP
+publik BadVPN. UDP yang tersedia untuk koneksi VPN adalah OpenVPN UDP 2200
+(paket distro, autentikasi sertifikat, klien OpenVPN). UDP Custom belum
+tersedia; jangan menyamakan dengan OpenVPN atau BadVPN.
+
+Rujukan: [Xray-core](https://github.com/XTLS/Xray-core/releases),
+[Nginx gRPC](https://nginx.org/en/docs/http/ngx_http_grpc_module.html), dan
+[manual OpenVPN](https://openvpn.net/community-docs/community-articles/openvpn-2-6-manual/).
 
 ### Setup domain dan sertifikat
 
@@ -287,6 +349,7 @@ password ditandai tidak tersedia. Akun Linux lama tidak dimigrasikan otomatis.
 ```bash
 bash -n install-dashboard.sh && bash -n deployment/ssh-installer.sh
 bash -n deployment/ws-installer.sh && bash -n deployment/domain-installer.sh
+bash -n deployment/stack-installer.sh && bash -n modules/dashboard/ports.sh
 bash -n deployment/tests/installer-smoke.sh
 bash -n modules/menu/ssh.sh && bash -n modules/common/telegram.sh
 bash -n deployment/tests/ssh-menu-smoke.sh
@@ -294,8 +357,9 @@ git diff --check
 bash deployment/tests/installer-smoke.sh
 bash deployment/tests/ssh-menu-smoke.sh
 bash deployment/tests/domain-tls-test.sh  # fixture OpenSSL, tanpa systemd
+python3 -B deployment/tests/stack-render-test.py
 python3 -B deployment/tests/connect-gateway-test.py
-python3 -B deployment/tests/ws-proxy-test.py  # haproxy, openssl, aiohttp; port lokal sementara
+python3 -B deployment/tests/ws-proxy-test.py  # haproxy, openssl, aiohttp, h2; port lokal sementara
 python3 -B deployment/tests/ssh-menu-pty-test.py  # memerlukan PTY
 python3 -B deployment/tests/ssh-backend-test.py  # memerlukan cryptography
 ```
@@ -323,7 +387,7 @@ Di Ubuntu 22.04 **disposabel**, buat akun member dan trial, lalu dari klien uji:
    locked: tanggal tersimpan sesuai hasil, password tetap, dan akun locked
    tetap ditolak. Uji `n` dan Ctrl+C tanpa perubahan data.
 
-VMESS, VLESS, TROJAN, Bot Akses VPS, dan Set Banner masih belum tersedia.
+Menu manajemen akun VMESS/VLESS/TROJAN, Bot Akses VPS, dan Set Banner masih belum tersedia.
 
 ## Pengujian installer
 

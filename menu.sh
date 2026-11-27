@@ -11,6 +11,7 @@ source "$NATHAYA_BASE/modules/common/ui.sh"
 source "$NATHAYA_BASE/modules/common/functions.sh"
 source "$NATHAYA_BASE/modules/dashboard/dashboard.sh"
 source "$NATHAYA_BASE/modules/dashboard/traffic.sh"
+source "$NATHAYA_BASE/modules/dashboard/ports.sh"
 source "$NATHAYA_BASE/modules/menu/main.sh"
 source "$NATHAYA_BASE/modules/menu/ssh.sh"
 source "$NATHAYA_BASE/modules/menu/domain.sh"
@@ -81,6 +82,7 @@ features_menu_loop() {
                 wait_submenu_navigation
                 ;;
             3) domain_menu_loop ;;
+            4) show_port_info ;;
             z) return 0 ;;
             x|exit|keluar) return "$DASHBOARD_EXIT" ;;
             *) printf '\n  Pilihan tidak valid.\n'; sleep 1 ;;
